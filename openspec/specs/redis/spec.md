@@ -4,39 +4,48 @@
 
 The `redis` capability gives a sandboxed handler a synchronous key/value client
 (`redis.get/set/del/incr/expire`) for caches, counters, sessions, and short-lived state
-against Redis (or a Redis-compatible store). Because the connection is **operator-supplied**
-in `config.redis`, `redis` follows the trusted-connection model shared with `db`/`mail`: it
-connects to whatever host the config names with no SSRF guard, so internal Redis instances
+against Redis (or a Redis-compatible store). The connection is **operator-bound**: the
+request enables the capability by naming a logical resource in `config.io.redis`, and the
+operator's resource definition — never the request — supplies the URL and credentials, so
+`redis` follows the trusted-connection model shared with `db`/`mail`: it connects to
+whatever host the operator bound with no SSRF guard, so internal Redis instances
 work by design. It is opt-in per request, keeps **strings in / strings out** (the script owns
 (de)serialization), throws a tagged error on failure, and meters every op into
 `meta.redis_requests`. Source of truth: `src/kv.rs`, `src/js/redis.js`, `docs/07-redis.md`.
 
 ## Requirements
 
-### Requirement: Opt-in injection via config.redis
+### Requirement: Opt-in injection via config.io.redis
 
-The `redis` global SHALL be injected only when the request supplies a `config.redis` block;
-otherwise the `redis` global SHALL NOT exist in the handler scope.
+The `redis` global SHALL be injected only when the request names at least one operator-bound
+logical resource in `config.io.redis`; otherwise the `redis` global SHALL NOT exist in the
+handler scope. The request SHALL carry no connection URL or credentials — only logical
+resource names.
 
-#### Scenario: Capability absent without config
+#### Scenario: Capability absent without a named resource
 
-- **WHEN** a request omits `config.redis`
+- **WHEN** a request names no resource in `config.io.redis`
 - **THEN** the handler observes `typeof redis === "undefined"`
 
-#### Scenario: Capability present with config
+#### Scenario: Capability present with a named resource
 
-- **WHEN** a request supplies a `config.redis` with a `url`
+- **WHEN** a request's `config.io.redis` names an operator-bound resource (whose definition supplies the `url`)
 - **THEN** the handler can call `redis.get/set/del/incr/expire`
 
-### Requirement: Trusted operator-supplied connection
+#### Scenario: Unknown resource name is rejected
 
-The system SHALL connect to the host named in `config.redis.url` without an SSRF or
-private-IP guard, applying the configured connect/command `timeout_ms` (default 5000) as the
-read and write timeout.
+- **WHEN** `config.io.redis` names a resource the operator has not bound (for this caller)
+- **THEN** the request is rejected with `RESOURCE_NOT_FOUND` and the handler does not run
+
+### Requirement: Trusted operator-bound connection
+
+The system SHALL connect to the host named in the resource definition's `url` without an SSRF
+or private-IP guard, applying the definition's connect/command `timeout_ms` (default 5000) as
+the read and write timeout.
 
 #### Scenario: Internal host is reached
 
-- **WHEN** `config.redis.url` names a private or internal Redis host
+- **WHEN** the resource definition's `url` names a private or internal Redis host
 - **THEN** the connection is made without an SSRF block (the trusted-connection model)
 
 #### Scenario: Unreachable Redis fails the request
@@ -46,12 +55,12 @@ read and write timeout.
 
 ### Requirement: TLS via rediss:// URL
 
-The system SHALL establish a TLS connection when `config.redis.url` uses the `rediss://`
-scheme, validated against the system's public certificate authorities.
+The system SHALL establish a TLS connection when the resource definition's `url` uses the
+`rediss://` scheme, validated against the system's public certificate authorities.
 
 #### Scenario: TLS connection over rediss://
 
-- **WHEN** `config.redis.url` begins with `rediss://`
+- **WHEN** the resource definition's `url` begins with `rediss://`
 - **THEN** the client connects over TLS validated against the usual public CAs
 
 ### Requirement: Key/value operation surface

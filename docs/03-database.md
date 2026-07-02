@@ -12,7 +12,8 @@ A database is a giant, super-organized **spreadsheet** that remembers things for
 
 The **keys** to your database (host, password, …) live with the grown-up who runs the
 server — the **operator** — never in your request. They give the database a nickname
-like `orders-db` in the server's `config.json`:
+like `orders-db` in the config of the key-keeper helper (`fabricd`, the egress sidecar
+that does the actual connecting):
 
 ```json
 {

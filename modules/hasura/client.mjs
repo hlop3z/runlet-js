@@ -7,7 +7,8 @@
 //      part naive `api` code misses because it only checks `res.status`.
 //
 // Operator config (kept out of the handler — see docs/09-sys.md and docs/02-api.md):
-//   - config.api.allowed_hosts          must include the Hasura host (api is SSRF-guarded).
+//   - config.allowed_hosts              must include the Hasura host (api is SSRF-guarded;
+//                                       no `config.io` entry needed — `api` is in-engine).
 //   - config.sys.env.HASURA_ENDPOINT    e.g. "https://hasura.internal"
 //   - config.sys.env.HASURA_ADMIN_SECRET  (optional; omit when forwarding a user JWT)
 //   - config.modules_dir                must point at the folder holding this file, so

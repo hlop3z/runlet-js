@@ -4,9 +4,11 @@
 
 The `mongo` capability gives a handler a document-database client inside the QuickJS
 sandbox: `mongo.find`/`find_one`/`insert_one`/`insert_many`/`update_one`/`update_many`/
-`delete_one`/`delete_many`/`count`/`aggregate`. The connection is **operator-supplied** in
-`config.mongo`, so this capability is trusted (it connects to whatever host the config
-names, with no SSRF guard) — the same trust model as `db`/`mail`, and unlike the
+`delete_one`/`delete_many`/`count`/`aggregate`. The connection is **operator-bound**: the
+request enables the capability by naming a logical resource in `config.io.mongo`, and the
+operator's resource definition — never the request — supplies the endpoint and credentials,
+so this capability is trusted (it connects to whatever host the operator bound, with no
+SSRF guard) — the same trust model as `db`/`mail`, and unlike the
 script-controlled `api` capability. It is admitted as a first-class capability (not routed
 over `api`) per the capability-admission gate in `docs-sys/rfc.md` §3.5: a trusted internal
 target, document type-fidelity that JSON-over-HTTP would lose, and a fit to the bounded
@@ -18,51 +20,58 @@ mongo-error taxonomy, and metering. Source of truth: `src/mongo.rs`, `src/js/mon
 
 ## Requirements
 
-### Requirement: Opt-in via config.mongo
+### Requirement: Opt-in via config.io.mongo
 
-The `mongo` global SHALL exist only when the request supplies a `config.mongo` block; absent
-that block the global is undefined.
+The `mongo` global SHALL exist only when the request names at least one operator-bound
+logical resource in `config.io.mongo`; absent such an entry the global is undefined. The
+request SHALL carry no connection endpoint or credentials for the capability — only logical
+resource names.
 
-#### Scenario: Config present injects the global
+#### Scenario: Named resource injects the global
 
-- **WHEN** a request includes a `config.mongo` block and the handler references `mongo`
+- **WHEN** a request's `config.io.mongo` names an operator-bound resource and the handler references `mongo`
 - **THEN** `mongo` is a defined object exposing `find`, `find_one`, `insert_one`, `insert_many`, `update_one`, `update_many`, `delete_one`, `delete_many`, `count`, and `aggregate`
 
-#### Scenario: Config absent leaves the global undefined
+#### Scenario: No named resource leaves the global undefined
 
-- **WHEN** a request has no `config.mongo` block
+- **WHEN** a request names no resource in `config.io.mongo`
 - **THEN** `typeof mongo === "undefined"` inside the handler
 
-### Requirement: Trusted operator-supplied connection (no SSRF guard)
+#### Scenario: Unknown resource name is rejected
 
-The capability SHALL connect to the host/port named in `config.mongo` without any
-private/internal IP block or host allowlist, because the connection target is
-operator-supplied rather than script-controlled.
+- **WHEN** `config.io.mongo` names a resource the operator has not bound (for this caller)
+- **THEN** the request is rejected with `RESOURCE_NOT_FOUND` and the handler does not run
+
+### Requirement: Trusted operator-bound connection (no SSRF guard)
+
+The capability SHALL connect to the host/port in the operator's resource definition resolved
+from the logical name, without any private/internal IP block or host allowlist, because the
+connection target is operator-supplied rather than script- or caller-controlled.
 
 #### Scenario: Connects to operator-named host
 
-- **WHEN** `config.mongo` names an internal or private-network host
+- **WHEN** the resolved resource definition names an internal or private-network host
 - **THEN** the capability attempts the connection without rejecting it as a private/internal address
 
-#### Scenario: Connection config fields
+#### Scenario: Resource definition fields
 
-- **WHEN** `config.mongo` is provided
+- **WHEN** the operator defines a `mongo` resource
 - **THEN** it accepts `host`, `port` (default 27017), `username`, `password`, `database`, `auth_source` (default `admin`), `tls` (default false), `ca_cert` (optional PEM path), `op_timeout_ms` (default 5000), and `max_docs` (default 1000)
 
 ### Requirement: TLS reusing the shared provider
 
-The capability SHALL connect over TLS when `config.mongo.tls` is true, reusing the
-process-wide `aws-lc-rs` rustls provider, and SHALL accept an optional `ca_cert` PEM path
-for a self-hosted database with a private certificate authority.
+The capability SHALL connect over TLS when the resource definition sets `tls` true, reusing
+the process-wide `aws-lc-rs` rustls provider, and SHALL accept an optional `ca_cert` PEM
+path for a self-hosted database with a private certificate authority.
 
 #### Scenario: TLS connection
 
-- **WHEN** `config.mongo.tls` is true
+- **WHEN** the resource definition sets `tls` true
 - **THEN** the connection to the database is established over TLS using the shared crypto provider
 
 #### Scenario: Custom CA certificate
 
-- **WHEN** `config.mongo.tls` is true and `config.mongo.ca_cert` names a PEM file
+- **WHEN** the resource definition sets `tls` true and its `ca_cert` names a PEM file
 - **THEN** that CA is used to verify the server certificate; omitting `ca_cert` relies on the bundled webpki roots
 
 ### Requirement: Read operations
@@ -175,7 +184,7 @@ fail with a retryable `MONGO_TIMEOUT`, freeing the blocking thread.
 #### Scenario: Server-side operation timeout applied
 
 - **WHEN** an operation is issued
-- **THEN** the per-request `op_timeout_ms` is applied as the operation's server-side max time
+- **THEN** the resource's `op_timeout_ms` is applied as the operation's server-side max time
 
 #### Scenario: Hung operation bounded by the deadline
 

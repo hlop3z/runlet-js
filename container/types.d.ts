@@ -16,11 +16,16 @@
  * (No `/// <reference>` or `// @ts-check` needed; the tsconfig wires it up.)
  *
  * @remarks
- * **Capabilities are opt-in.** `api`, `db`, `mail`, and `s3` exist **only** when
- * the matching config block (`config.api` / `config.db` / `config.mail` /
- * `config.s3`) is present in the request — otherwise the global is `undefined`
- * (e.g. `typeof mail === "undefined"`). They are declared here as always-present
- * for convenient autocomplete; guard with `typeof` if a capability is optional.
+ * **Capabilities are opt-in.** The driver-backed capabilities (`db`, `mongo`,
+ * `mail`, `redis`, `amq`, `auth`) exist **only** when the request names a
+ * logical resource for them in `config.io` (e.g. `"io": { "db": ["main-pg"] }`).
+ * The name refers to an operator-defined resource resolved by the egress
+ * sidecar — the request never carries endpoints or credentials. The in-engine
+ * capabilities keep their own config: `api` exists when `config.allowed_hosts`
+ * is non-empty, `s3` when `config.s3` is present. Otherwise the global is
+ * `undefined` (e.g. `typeof mail === "undefined"`). They are declared here as
+ * always-present for convenient autocomplete; guard with `typeof` if a
+ * capability is optional.
  * `json`, `$`, `Decimal`, and `$sys.crypto` / `$sys.date` are pure and **always**
  * available; `$sys.env` / `$sys.secrets` populate only when `config.sys` is set.
  *
@@ -146,7 +151,7 @@ declare const $: DecimalFactory;
 declare const Decimal: DecimalFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `api` — SSRF-guarded HTTP client (present when `config.api` is set)
+// `api` — SSRF-guarded HTTP client (present when `config.allowed_hosts` is set)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Request/response header map. */
@@ -188,7 +193,7 @@ interface ApiTransportError {
 
 /**
  * HTTP client whose targets are **script-controlled**, so it is SSRF-guarded:
- * only `http`/`https`, the host must be in `config.api.allowed_hosts`, and
+ * only `http`/`https`, the host must be in `config.allowed_hosts`, and
  * private/internal IPs are blocked (re-validated across redirects).
  */
 interface HttpClient {
@@ -223,11 +228,11 @@ interface HttpClient {
   delete<T = any>(url: string, headers?: HttpHeaders): ApiResponse<T>;
 }
 
-/** HTTP client. Present only when `config.api` is supplied. */
+/** HTTP client. Present only when `config.allowed_hosts` is non-empty. */
 declare const api: HttpClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `db` — Postgres / CockroachDB (present when `config.db` is set)
+// `db` — Postgres / CockroachDB (present when `config.io.db` names a resource)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -242,7 +247,7 @@ interface DbRow {
   [column: string]: DbValue;
 }
 
-/** Result of a `db.query` / `db.execute` call. */
+/** Result of a `db.query` call. */
 interface DbResult {
   /** Column names, in selection order. */
   columns: string[];
@@ -254,10 +259,19 @@ interface DbResult {
   truncated: boolean;
 }
 
+/** Result of a `db.execute` call. */
+interface DbExecResult {
+  /** Number of rows the statement inserted, updated, or deleted. */
+  rows_affected: number;
+}
+
 /**
- * SQL client over an **operator-supplied** connection (`config.db`), so it is
- * trusted — no SSRF guard. Parameters are bound with `$1`, `$2`, … (never string
- * interpolation). `query` and `execute` are equivalent; use the name that reads best.
+ * SQL client over an **operator-defined** logical resource named in
+ * `config.io.db`, so it is trusted — no SSRF guard. The connection and
+ * credentials are resolved operator-side (the egress sidecar); the request only
+ * names the resource. Parameters are bound with `$1`, `$2`, … (never string
+ * interpolation). Use `query` for statements that return rows and `execute`
+ * for writes — they return different shapes.
  */
 interface Db {
   /**
@@ -266,10 +280,10 @@ interface Db {
    */
   query(sql: string, params?: unknown[]): DbResult;
   /**
-   * Runs a SQL statement (typically a write) and returns the result.
-   * @example db.execute("UPDATE users SET seen = now() WHERE id = $1", [ctx.id]);
+   * Runs a SQL statement (typically a write) and returns the affected-row count.
+   * @example db.execute("UPDATE users SET seen = now() WHERE id = $1", [ctx.id]); // { rows_affected: 1 }
    */
-  execute(sql: string, params?: unknown[]): DbResult;
+  execute(sql: string, params?: unknown[]): DbExecResult;
   /** Begins a transaction. */
   begin(): void;
   /** Commits the current transaction. */
@@ -278,11 +292,11 @@ interface Db {
   rollback(): void;
 }
 
-/** SQL client. Present only when `config.db` is supplied. */
+/** SQL client. Present only when `config.io.db` names a resource. */
 declare const db: Db;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `mongo` — document database (present when `config.mongo` is set)
+// `mongo` — document database (present when `config.io.mongo` names a resource)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** A document, keyed by field name. */
@@ -339,8 +353,9 @@ interface MongoDeleteResult {
 }
 
 /**
- * Document-database client over an **operator-supplied** connection (`config.mongo`),
- * so it is trusted — no SSRF guard. Synchronous (no `await`), like `db`. **Type fidelity:**
+ * Document-database client over an **operator-defined** logical resource named in
+ * `config.io.mongo` (connection + credentials resolved operator-side), so it is
+ * trusted — no SSRF guard. Synchronous (no `await`), like `db`. **Type fidelity:**
  * values that don't fit a JS number exactly come back as **strings** — `Int64` and
  * `Decimal128` as strings, `ObjectId` as its hex string, `Date` as RFC 3339, `Binary` as
  * base64; `Int32`/`Double` are numbers. Filters/updates/pipelines are passed as data (never
@@ -387,16 +402,16 @@ interface Mongo {
   delete_many(collection: string, filter: MongoDoc): MongoDeleteResult;
 }
 
-/** Document-database client. Present only when `config.mongo` is supplied. */
+/** Document-database client. Present only when `config.io.mongo` names a resource. */
 declare const mongo: Mongo;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `mail` — SMTP send (present when `config.mail` is set)
+// `mail` — SMTP send (present when `config.io.mail` names a resource)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Options for {@link Mail.send}. A single address or a list is accepted. */
 interface MailOptions {
-  /** Sender address. Defaults to `config.mail.from` if omitted. */
+  /** Sender address. Defaults to the mail resource's configured `from` if omitted. */
   from?: string;
   /** Recipient(s). */
   to?: string | string[];
@@ -423,7 +438,8 @@ interface MailResult {
 }
 
 /**
- * SMTP mailer over an **operator-supplied** relay (`config.mail`), so it is
+ * SMTP mailer over an **operator-defined** logical resource named in
+ * `config.io.mail` (relay + credentials resolved operator-side), so it is
  * trusted — no SSRF guard. Throws on a send failure.
  */
 interface Mail {
@@ -434,7 +450,7 @@ interface Mail {
   send(opts: MailOptions): MailResult;
 }
 
-/** SMTP mailer. Present only when `config.mail` is supplied. */
+/** SMTP mailer. Present only when `config.io.mail` names a resource. */
 declare const mail: Mail;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -555,7 +571,7 @@ interface S3 {
 declare const s3: S3;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `redis` — key/value store (present when `config.redis` is set)
+// `redis` — key/value store (present when `config.io.redis` names a resource)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Options for {@link Redis.set}. */
@@ -565,8 +581,9 @@ interface RedisSetOptions {
 }
 
 /**
- * Redis key/value helper for `config.redis` (trusted, operator-supplied — no SSRF
- * guard). **Strings in / strings out**: serialize objects yourself (`JSON.stringify`).
+ * Redis key/value helper over the **operator-defined** logical resource named in
+ * `config.io.redis` (trusted, resolved operator-side — no SSRF guard).
+ * **Strings in / strings out**: serialize objects yourself (`JSON.stringify`).
  * All calls are synchronous (no `await`), like `db`. A failure to reach Redis throws a
  * retryable `REDIS_CONNECTION` capability error.
  */
@@ -583,11 +600,11 @@ interface Redis {
   expire(key: string, seconds: number): boolean;
 }
 
-/** Redis helper. Present only when `config.redis` is supplied. */
+/** Redis helper. Present only when `config.io.redis` names a resource. */
 declare const redis: Redis;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `amq` — messaging producer: RabbitMQ or NATS (present when `config.amq` is set)
+// `amq` — messaging producer: RabbitMQ or NATS (present when `config.io.amq` names a resource)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -598,33 +615,34 @@ declare const redis: Redis;
 type AmqMessage = [routingKey: string, payload: unknown];
 
 /**
- * Messaging **producer** for `config.amq` (trusted, operator-supplied — no SSRF guard).
- * The backend is `config.amq.backend`: `"rabbitmq"` (default) or `"nats"`. **Producer-side
+ * Messaging **producer** over the **operator-defined** logical resource named in
+ * `config.io.amq` (trusted, resolved operator-side — no SSRF guard). The backend is the
+ * resource's configured `backend`: `"rabbitmq"` (default) or `"nats"`. **Producer-side
  * only** — publish on both backends, request-reply on `nats`; there is no subscribe/consume.
  * Synchronous; each call is one op against `max_ops`. A broker outage throws a retryable
- * `AMQ_CONNECTION`; a batch larger than `config.amq.max_batch` throws `AMQ_BATCH_TOO_LARGE`.
+ * `AMQ_CONNECTION`; a batch larger than the resource's `max_batch` throws `AMQ_BATCH_TOO_LARGE`.
  */
 interface Amq {
   /**
    * Publishes a batch and returns the number published. `routingKey` is the RabbitMQ queue
-   * name (default exchange; override via `config.amq.exchange`) or the NATS subject.
+   * name (default exchange; override via the resource's `exchange`) or the NATS subject.
    * @example amq.send([["user.created", { id: 1 }], ["user.created", { id: 2 }]]); // → 2
    */
   send(messages: AmqMessage[]): number;
   /**
    * **NATS backend only.** Publishes a request to `subject` and returns the reply's parsed
-   * JSON body, bounded by `config.amq.request_timeout_ms`. Throws `AMQ_UNSUPPORTED` on the
-   * RabbitMQ backend and a retryable `AMQ_TIMEOUT` when no reply arrives in time.
+   * JSON body, bounded by the resource's `request_timeout_ms`. Throws `AMQ_UNSUPPORTED` on
+   * the RabbitMQ backend and a retryable `AMQ_TIMEOUT` when no reply arrives in time.
    * @example const pong = amq.request("service.ping", { hi: true });
    */
   request<T = any>(subject: string, payload?: unknown): T;
 }
 
-/** Messaging producer. Present only when `config.amq` is supplied. */
+/** Messaging producer. Present only when `config.io.amq` names a resource. */
 declare const amq: Amq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `auth` — OIDC/IAM identity (present when `config.auth` is set)
+// `auth` — OIDC/IAM identity (present when `config.io.auth` names a resource)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** A valid token's resolved identity claims (`sub`, `email`, `name`, …). */
@@ -644,10 +662,12 @@ interface AuthIntrospection {
 }
 
 /**
- * OIDC/IAM identity over an **operator-supplied** issuer (`config.auth`), so it is
+ * OIDC/IAM identity over the **operator-defined** logical resource named in
+ * `config.io.auth` (the issuer + credentials are resolved operator-side), so it is
  * trusted — no SSRF guard. Validation is delegated to the IAM (a `userinfo`
  * round-trip), so there is no local JWT/JWKS crypto. Endpoints are auto-discovered
- * from `{issuer}/.well-known/openid-configuration` unless overridden in config.
+ * from `{issuer}/.well-known/openid-configuration` unless overridden in the
+ * resource's config.
  *
  * **Hybrid errors:** a token-validity outcome is the caller's business flow, so an
  * invalid/expired/insufficient-scope token comes back **in-band** (`{ ok: false }`)
@@ -664,13 +684,13 @@ interface Auth {
    */
   user_info(token: string): AuthUserInfo;
   /**
-   * RFC 7662 token introspection. Needs `config.auth.client_id` / `client_secret`.
+   * RFC 7662 token introspection. Needs the auth resource's `client_id` / `client_secret`.
    * @example const r = auth.introspect(ctx.token); if (!r.claims.active) { ... }
    */
   introspect(token: string): AuthIntrospection;
 }
 
-/** OIDC/IAM identity helper. Present only when `config.auth` is supplied. */
+/** OIDC/IAM identity helper. Present only when `config.io.auth` names a resource. */
 declare const auth: Auth;
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -6,13 +6,14 @@
 database. If `db` is a spreadsheet of rows, `mongo` is a **folder of little JSON files** you
 can search, add to, change, and delete.
 
-> Like `db` and `mail`, the connection is **operator-supplied** — it lives in the server's
-> `config.json`, not your request, so it's trusted (it connects to exactly the host the
-> operator named, no SSRF guard). All calls are **synchronous** (no `await`).
+> Like `db` and `mail`, the connection is **operator-supplied** — it lives in the egress
+> sidecar's (`fabricd`) config, not your request, so it's trusted (it connects to exactly
+> the host the operator named, no SSRF guard). All calls are **synchronous** (no `await`).
 
 ## Turn it on first 🔑
 
-The operator gives the connection a nickname like `shop-docs` in the server's `config.json`:
+The operator gives the connection a nickname like `shop-docs` in the egress sidecar's
+(`fabricd`) config:
 
 ```json
 {

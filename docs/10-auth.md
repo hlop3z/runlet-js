@@ -12,7 +12,7 @@ is the one true judge of whether a token is good.
 ## Turn it on first 🔑
 
 Your identity server's address (and any app secret) lives with the **operator** in the
-server's `config.json`, under a nickname like `idp`:
+egress sidecar's (`fabricd`) config, under a nickname like `idp`:
 
 ```json
 {

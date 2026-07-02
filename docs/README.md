@@ -60,9 +60,11 @@ little `config` to your message. That keeps things safe.
 | `$sys.env` / `.secrets` | Settings + use-only secrets | `config.sys`                  |
 
 The database/mail/redis/etc. **nicknames** point at resources the grown-up (operator)
-set up in the server's `config.json` `resources` — the keys and passwords live there,
-never in your request. You just ask by nickname (e.g. `config.io.db: ["orders-db"]`).
-`api` (`allowed_hosts`) and `s3` keep their settings in the request.
+set up in the `resources` config of **`fabricd`** — a little key-keeper helper that runs
+next to jsbox and does the actual connecting. The keys and passwords live there, never in
+your request and never in the robot's box. You just ask by nickname (e.g.
+`config.io.db: ["orders-db"]`). `api` (`allowed_hosts`) and `s3` keep their settings in
+the request.
 
 (`$` — exact decimal math — and **`$sys.crypto` / `$sys.date`** are the exceptions:
 they're **always on**, no config. Only `$sys.env` / `$sys.secrets` need `config.sys`.)
@@ -83,6 +85,10 @@ For builders and operators (a bit more advanced):
   [`openspec/specs/`](../openspec/specs/) (capabilities, execution, resilience, registries,
   observability). Browse with `openspec list --specs` / `openspec show <name>`.
 - **Design notes (rationale)** — the architecture deep-dives, the "why": [resilience](design/resilience.md)
-  (timeouts, bulkheads, circuit breaker), [pooled capabilities](design/pooled-capabilities.md)
+  (timeouts, bulkheads, circuit breaker), [resource egress](design/resource-egress.md)
+  (the `fabricd` sidecar and why credentials never enter the box),
+  [network fabric](design/network-fabric.md) (remote `fabricd` over QUIC),
+  [multitenant trust](design/multitenant-trust.md) (trusted-identity mode),
+  [pooled capabilities](design/pooled-capabilities.md)
   (PgBouncer), [script registry](design/script-registry.md), and
   [injectable modules](design/injectable-modules.md).

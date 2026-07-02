@@ -4,8 +4,10 @@
 
 The `db` capability gives a handler a `PostgreSQL`/`CockroachDB` client inside the QuickJS
 sandbox: parameterized `db.query`/`db.execute` and explicit `db.begin`/`commit`/`rollback`
-transactions. The connection is **operator-supplied** in `config.db`, so this capability is
-trusted (it connects to whatever host the config names, with no SSRF guard) — unlike the
+transactions. The connection is **operator-bound**: the request enables the capability by
+naming a logical resource in `config.io.db`, and the operator's resource definition — never
+the request — supplies the endpoint and credentials, so this capability is trusted (it
+connects to whatever host the operator bound, with no SSRF guard) — unlike the
 script-controlled `api` capability. This spec defines opt-in, the JS surface, the
 Postgres→JSON type-mapping rule, result limits, the client-side query deadline, the
 db-error taxonomy, and metering. Source of truth: `src/db.rs`, `src/js/db.js`,
@@ -13,35 +15,41 @@ db-error taxonomy, and metering. Source of truth: `src/db.rs`, `src/js/db.js`,
 
 ## Requirements
 
-### Requirement: Opt-in via config.db
+### Requirement: Opt-in via config.io.db
 
-The `db` global SHALL exist only when the request supplies a `config.db` block; absent that
-block the global is undefined.
+The `db` global SHALL exist only when the request names at least one operator-bound logical
+resource in `config.io.db`; absent such an entry the global is undefined. The request SHALL
+carry no connection endpoint or credentials for the capability — only logical resource names.
 
-#### Scenario: Config present injects the global
+#### Scenario: Named resource injects the global
 
-- **WHEN** a request includes a `config.db` block and the handler references `db`
+- **WHEN** a request's `config.io.db` names an operator-bound resource and the handler references `db`
 - **THEN** `db` is a defined object exposing `query`, `execute`, `begin`, `commit`, and `rollback`
 
-#### Scenario: Config absent leaves the global undefined
+#### Scenario: No named resource leaves the global undefined
 
-- **WHEN** a request has no `config.db` block
+- **WHEN** a request names no resource in `config.io.db`
 - **THEN** `typeof db === "undefined"` inside the handler
 
-### Requirement: Trusted operator-supplied connection (no SSRF guard)
+#### Scenario: Unknown resource name is rejected
 
-The capability SHALL connect to the host/port named in `config.db` without any private/internal
-IP block or host allowlist, because the connection target is operator-supplied rather than
-script-controlled.
+- **WHEN** `config.io.db` names a resource the operator has not bound (for this caller)
+- **THEN** the request is rejected with `RESOURCE_NOT_FOUND` and the handler does not run
+
+### Requirement: Trusted operator-bound connection (no SSRF guard)
+
+The capability SHALL connect to the host/port in the operator's resource definition resolved
+from the logical name, without any private/internal IP block or host allowlist, because the
+connection target is operator-supplied rather than script- or caller-controlled.
 
 #### Scenario: Connects to operator-named host
 
-- **WHEN** `config.db` names an internal or private-network host
+- **WHEN** the resolved resource definition names an internal or private-network host
 - **THEN** the capability attempts the connection without rejecting it as a private/internal address
 
-#### Scenario: Connection config fields
+#### Scenario: Resource definition fields
 
-- **WHEN** `config.db` is provided
+- **WHEN** the operator defines a `db` resource
 - **THEN** it accepts `host`, `port` (default 5432), `user`, `password`, `database`, `ssl` (default false), `statement_timeout_ms` (default 5000), and `max_rows` (default 1000)
 
 ### Requirement: Parameterized query and execute
@@ -126,7 +134,7 @@ retryable `DB_TIMEOUT`.
 #### Scenario: Server-side statement timeout applied
 
 - **WHEN** a connection is established for a request
-- **THEN** the per-request `statement_timeout_ms` is applied as a session `SET statement_timeout`
+- **THEN** the resource's `statement_timeout_ms` is applied as a session `SET statement_timeout`
 
 #### Scenario: Hung query bounded by the deadline
 

@@ -5,7 +5,9 @@
 The `auth` capability lets a handler verify a caller-supplied OIDC bearer token against an
 operator-named identity provider (IAM) and read the resulting claims. It exposes
 `auth.user_info(token)` (OIDC userinfo) and `auth.introspect(token)` (RFC 7662). Token
-validation is delegated entirely to the IAM — there is no local JWT/JWKS/crypto. The trust
+validation is delegated entirely to the IAM — there is no local JWT/JWKS/crypto. The request
+enables the capability by naming a logical resource in `config.io.auth`; the issuer and any
+client credentials come from the operator's resource definition, never the request. The trust
 model mirrors `db`/`mail` (operator-supplied issuer, not script-controlled), and the
 error surface is hybrid: an invalid/expired caller token returns in-band, while infra
 failures throw a tagged capability error. Rationale: `src/auth.rs`, `src/js/auth.js`,
@@ -13,30 +15,38 @@ failures throw a tagged capability error. Rationale: `src/auth.rs`, `src/js/auth
 
 ## Requirements
 
-### Requirement: Opt-in injection via config.auth
+### Requirement: Opt-in injection via config.io.auth
 
-The `auth` global SHALL exist only when the request supplies a `config.auth` block; with no
-such block the global is absent (`typeof auth === "undefined"`).
+The `auth` global SHALL exist only when the request names at least one operator-bound logical
+resource in `config.io.auth`; with no such entry the global is absent
+(`typeof auth === "undefined"`). The request SHALL carry no issuer, endpoint, or client
+credentials — only logical resource names.
 
-#### Scenario: Config present
+#### Scenario: Named resource present
 
-- **WHEN** a request includes `config.auth` with an `issuer`
+- **WHEN** a request's `config.io.auth` names an operator-bound resource (whose definition supplies the `issuer`)
 - **THEN** the handler can call `auth.user_info` / `auth.introspect`
 
-#### Scenario: Config absent
+#### Scenario: No named resource
 
-- **WHEN** a request omits `config.auth`
+- **WHEN** a request names no resource in `config.io.auth`
 - **THEN** `typeof auth` is `"undefined"` and no IAM client is created
 
-### Requirement: Trusted operator-supplied target (no SSRF guard)
+#### Scenario: Unknown resource name is rejected
 
-The issuer and endpoints SHALL be taken from operator-supplied `config.auth` (matching the
-`db`/`mail` trust model), so no SSRF / private-IP block is applied; the caller's token is
-placed verbatim into the `Authorization` header toward the operator-named host.
+- **WHEN** `config.io.auth` names a resource the operator has not bound (for this caller)
+- **THEN** the request is rejected with `RESOURCE_NOT_FOUND` and the handler does not run
+
+### Requirement: Trusted operator-bound target (no SSRF guard)
+
+The issuer and endpoints SHALL be taken from the operator's resource definition resolved from
+the logical name (matching the `db`/`mail` trust model), so no SSRF / private-IP block is
+applied; the caller's token is placed verbatim into the `Authorization` header toward the
+operator-named host.
 
 #### Scenario: Issuer is operator-controlled
 
-- **WHEN** `config.auth.issuer` names an internal or private host
+- **WHEN** the resource definition's `issuer` names an internal or private host
 - **THEN** the request is allowed (no private-IP block), because the host is operator-supplied, not script-controlled
 
 ### Requirement: Endpoint resolution via OIDC discovery with explicit overrides

@@ -126,6 +126,8 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `SCRIPT_XOR_KEY`    | no    | caller | Request has both `script` and `key`, or neither — send exactly one. |
 | `SCRIPT_NOT_FOUND`  | no    | caller | The `key` isn't in the server's script registry (404).              |
 | `MALFORMED_REQUEST` | no    | caller | Body isn't valid JSON, has wrong field types, or is too large.      |
+| `RESOURCE_NOT_FOUND` | no   | caller | A `config.io` nickname the operator never set up (or not for your tenant) (400). |
+| `RESOURCE_KIND_MISMATCH` | no | caller | The nickname exists but is a different kind (asked for `db`, it's `redis`) (400). |
 
 ### The engine (`type: "runtime"`)
 
@@ -139,6 +141,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `MALFORMED_RESPONSE`   | no    | developer | Returned something that isn't a `json(...)` answer.                                            |
 | `OVERLOADED`           | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (429).                                    |
 | `PARTITION_OVERLOADED` | yes   | caller    | This partition key hit its concurrency share (per-partition fairness) — back off, retry (429). |
+| `EGRESS_UNAVAILABLE`   | yes   | operator  | The request named a driver resource but the egress sidecar (`fabricd`) isn't configured or reachable (503).    |
 | `INTERNAL`             | yes   | operator  | The robot's own fault (rare) — a 500.                                                          |
 
 ### Your script (`type: "script"`)
@@ -207,7 +210,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `code`                | retry | owner     | When                                      |
 | --------------------- | ----- | --------- | ----------------------------------------- |
 | `AMQ_CONNECTION`      | yes   | operator  | Couldn't reach the broker.                |
-| `AMQ_BATCH_TOO_LARGE` | no    | developer | Batch bigger than `config.amq.max_batch`. |
+| `AMQ_BATCH_TOO_LARGE` | no    | developer | Batch bigger than the amq resource's `max_batch`. |
 | `AMQ_OP_LIMIT`        | no    | developer | Hit `max_ops`.                            |
 | `AMQ_ERROR`           | yes   | operator  | Publish/protocol error (fallback).        |
 
@@ -233,10 +236,10 @@ parts hidden from you.
 
 ## The extra-detail switch — `error_debug` 🔍
 
-By default the robot includes a `debug` box (a stack trace + the raw error text), because
-`/execute` is meant to run as an **internal** service. If it's ever put somewhere public,
-the operator sets `error_debug: false` and the `debug` box disappears — but `code`,
-`owner`, `details`, and the safe `message` stay, so programs still get what they need. The
-raw text is never lost: it's always in the server logs under the `trace_id`.
+By default the `debug` box (a stack trace + the raw error text) is **hidden** — secure by
+default, since the raw text can name internal hosts. On a purely internal service the
+operator can set `error_debug: true` to get that detail inline. Either way `code`,
+`owner`, `details`, and the safe `message` are always there, so programs still get what
+they need. The raw text is never lost: it's always in the server logs under the `trace_id`.
 
 **Next:** [Back to the guide →](README.md)

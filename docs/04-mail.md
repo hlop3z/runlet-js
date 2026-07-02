@@ -6,8 +6,8 @@
 
 ## Turn it on first 🔑
 
-Your mail server details (host, password, …) live with the **operator** in the server's
-`config.json`, under a nickname like `team-mail`:
+Your mail server details (host, password, …) live with the **operator** in the egress
+sidecar's (`fabricd`) config, under a nickname like `team-mail`:
 
 ```json
 {
@@ -46,8 +46,7 @@ Then your request asks for it by nickname with `config.io.mail` — no passwords
 | `max_recipients` | Most people one email may go to                            | `50`         |
 | `timeout_ms`     | How long to wait before giving up                          | `10000`      |
 
-No nickname in `config.io.mail` → `mail` is turned off. (`config.mail.from` below means
-the `from` set in the operator's `team-mail` resource.)
+No nickname in `config.io.mail` → `mail` is turned off.
 
 > **Which `tls`?** Most servers use `"starttls"` (port 587). Some older ones use
 > `"wrapper"` (port 465). Use `"none"` only for local testing with no security.

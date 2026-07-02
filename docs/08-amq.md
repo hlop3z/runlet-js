@@ -16,8 +16,8 @@ This is great for slow or background jobs — "send a welcome email", "resize th
 
 ## Turn it on first 🔑
 
-The address of your broker lives with the **operator** in the server's `config.json`,
-under a nickname like `events`:
+The address of your broker lives with the **operator** in the egress sidecar's
+(`fabricd`) config, under a nickname like `events`:
 
 ```json
 {
@@ -113,7 +113,7 @@ function handler(ctx) {
 }
 ```
 
-- It waits up to `config.amq.request_timeout_ms` (default 5000). No reply in time → a
+- It waits up to the resource's `request_timeout_ms` (default 5000). No reply in time → a
   retryable `AMQ_TIMEOUT` error.
 - On the **RabbitMQ** backend there's no request-reply, so calling it throws `AMQ_UNSUPPORTED`.
 - There's still **no subscribe/consume** — `amq` only ever sends.
@@ -124,7 +124,7 @@ The whole `amq.send([...])` call opens **one** connection and publishes every me
 then closes. That's why it's list-always: batching is the whole point. It also counts as
 **one** operation against your `max_ops` budget, no matter how many messages are in it.
 
-To stop a runaway batch, there's `config.amq.max_batch` (default 100). Send more than
+To stop a runaway batch, there's the resource's `max_batch` (default 100). Send more than
 that in a single call and you get an `AMQ_BATCH_TOO_LARGE` error.
 
 ## When something goes wrong

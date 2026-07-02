@@ -12,8 +12,8 @@ counters, caches, sessions, and "remember this for a minute" jobs.
 
 ## Turn it on first 🔑
 
-The address of your Redis lives with the **operator** in the server's `config.json`,
-under a nickname like `cache`:
+The address of your Redis lives with the **operator** in the egress sidecar's
+(`fabricd`) config, under a nickname like `cache`:
 
 ```json
 {

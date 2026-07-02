@@ -5,9 +5,11 @@
 The `amq` capability is the system's **messaging** capability: it exposes a message producer to
 the `QuickJS` sandbox so a handler can publish messages to a broker. It supports two operator-
 selected backends — `RabbitMQ` (the default) and subject-based messaging (`NATS`) — chosen by
-`config.amq.backend`. Subject-based messaging is admitted as a *backend of this capability*, not a
-new top-level capability, per the capability-admission gate in `docs-sys/rfc.md` §3.5. It follows
-the trusted-connection model of `db`/`mail`: the broker is operator-supplied in `config.amq`, so
+the resource definition's `backend`. Subject-based messaging is admitted as a *backend of this
+capability*, not a new top-level capability, per the capability-admission gate in
+`docs-sys/rfc.md` §3.5. It follows the trusted-connection model of `db`/`mail`: the request
+enables the capability by naming a logical resource in `config.io.amq`, and the broker
+endpoint/credentials come from the operator's resource definition — never the request — so
 there is no SSRF guard. It is **producer-side only** — publish for both backends, plus request-
 reply for the `NATS` backend; **subscribe / streaming consumption is explicitly out of scope** (it
 does not fit the bounded single-execution model). The JS surface is `amq.send(...)` (publish a
@@ -16,73 +18,80 @@ message count and payload bytes. Rationale: `src/amq.rs`, `src/js/amq.js`, and `
 
 ## Requirements
 
-### Requirement: Opt-in via config.amq
+### Requirement: Opt-in via config.io.amq
 
-The `amq` global SHALL be injected only when the request supplies a `config.amq` block; otherwise
-it does not exist in the sandbox.
+The `amq` global SHALL be injected only when the request names at least one operator-bound
+logical resource in `config.io.amq`; otherwise it does not exist in the sandbox. The request
+SHALL carry no broker endpoint or credentials — only logical resource names.
 
-#### Scenario: Capability present with config
+#### Scenario: Capability present with a named resource
 
-- **WHEN** a request supplies a `config.amq` block
+- **WHEN** a request's `config.io.amq` names an operator-bound resource
 - **THEN** the handler can reference the `amq` global and call `amq.send(...)`
 
-#### Scenario: Capability absent without config
+#### Scenario: Capability absent without a named resource
 
-- **WHEN** a request omits `config.amq`
+- **WHEN** a request names no resource in `config.io.amq`
 - **THEN** `typeof amq === "undefined"` inside the handler
+
+#### Scenario: Unknown resource name is rejected
+
+- **WHEN** `config.io.amq` names a resource the operator has not bound (for this caller)
+- **THEN** the request is rejected with `RESOURCE_NOT_FOUND` and the handler does not run
 
 ### Requirement: Backend selection
 
-The capability SHALL select its messaging backend from `config.amq.backend`, one of `rabbitmq`
-(default) or `nats`. The selected backend determines how connection fields are interpreted and
-which operations are available, but the JS surface for publishing (`amq.send`) is identical across
-backends.
+The capability SHALL select its messaging backend from the resource definition's `backend`, one
+of `rabbitmq` (default) or `nats`. The selected backend determines how connection fields are
+interpreted and which operations are available, but the JS surface for publishing (`amq.send`)
+is identical across backends.
 
 #### Scenario: Default backend
 
-- **WHEN** `config.amq` omits `backend`
+- **WHEN** the resource definition omits `backend`
 - **THEN** the `rabbitmq` backend is used
 
 #### Scenario: NATS backend selected
 
-- **WHEN** `config.amq.backend` is `nats`
+- **WHEN** the resource definition's `backend` is `nats`
 - **THEN** the subject-based-messaging backend is used and routing keys are interpreted as subjects
 
 #### Scenario: Unknown backend rejected
 
-- **WHEN** `config.amq.backend` is a value other than `rabbitmq` or `nats`
-- **THEN** the request is rejected before execution as a malformed request
+- **WHEN** an operator resource definition declares a `backend` other than `rabbitmq` or `nats`
+- **THEN** the definition is rejected as invalid configuration and no request can use it
 
-### Requirement: Trusted operator-supplied broker connection
+### Requirement: Trusted operator-bound broker connection
 
-The broker connection SHALL be taken from operator-supplied `config.amq` (`host`, `port`,
-`username`, `password`, `vhost`, `exchange`) with no SSRF / private-IP guard, because the target is
-operator-controlled rather than script-controlled.
+The broker connection SHALL be taken from the operator's resource definition resolved from the
+logical name (`host`, `port`, `username`, `password`, `vhost`, `exchange`) with no SSRF /
+private-IP guard, because the target is operator-controlled rather than script- or
+caller-controlled.
 
 #### Scenario: Connects to the configured broker
 
-- **WHEN** `config.amq` names a host, port, and credentials
+- **WHEN** the resource definition names a host, port, and credentials
 - **THEN** `amq.send` opens a connection to exactly that broker and authenticates with the supplied credentials, with no host allowlist or private-IP block applied
 
 #### Scenario: Defaults applied to omitted fields
 
-- **WHEN** `config.amq` omits `port`, `username`, `password`, `vhost`, or `exchange`
+- **WHEN** the resource definition omits `port`, `username`, `password`, `vhost`, or `exchange`
 - **THEN** the defaults `5672`, `guest`, `guest`, `/`, and `""` (the default exchange) are used respectively
 
 ### Requirement: TLS via amqps
 
-The capability SHALL connect over TLS (`amqps://`) when `config.amq.tls` is true, reusing the
-`aws-lc-rs` rustls provider, and SHALL accept an optional `ca_cert` PEM path for a self-hosted
-broker with a private certificate authority.
+The capability SHALL connect over TLS (`amqps://`) when the resource definition sets `tls` true,
+reusing the `aws-lc-rs` rustls provider, and SHALL accept an optional `ca_cert` PEM path for a
+self-hosted broker with a private certificate authority.
 
 #### Scenario: TLS connection
 
-- **WHEN** `config.amq.tls` is true
+- **WHEN** the resource definition sets `tls` true
 - **THEN** the connection to the broker is established over TLS
 
 #### Scenario: Custom CA certificate
 
-- **WHEN** `config.amq.tls` is true and `config.amq.ca_cert` names a PEM file
+- **WHEN** the resource definition sets `tls` true and its `ca_cert` names a PEM file
 - **THEN** that CA is used to verify the broker certificate; omitting `ca_cert` relies on the bundled webpki roots
 
 ### Requirement: Batch publish via amq.send
@@ -110,11 +119,11 @@ routing key (the queue name under the default exchange).
 
 ### Requirement: NATS backend connection and publish
 
-When `config.amq.backend` is `nats`, the capability SHALL connect to the operator-supplied
-`host`/`port` (default port `4222`), optionally authenticating with `username`/`password` or a
-`token`, optionally over TLS, and SHALL publish each `amq.send` pair as a message whose routing key
-is the NATS **subject** and whose body is the payload's JSON bytes. The `exchange` and `vhost`
-fields do not apply to the `nats` backend.
+When the resource definition's `backend` is `nats`, the capability SHALL connect to the
+definition's `host`/`port` (default port `4222`), optionally authenticating with
+`username`/`password` or a `token`, optionally over TLS, and SHALL publish each `amq.send` pair
+as a message whose routing key is the NATS **subject** and whose body is the payload's JSON
+bytes. The `exchange` and `vhost` fields do not apply to the `nats` backend.
 
 #### Scenario: NATS publish via amq.send
 
@@ -123,14 +132,15 @@ fields do not apply to the `nats` backend.
 
 #### Scenario: NATS default port and auth
 
-- **WHEN** `config.amq` omits `port` under the `nats` backend
+- **WHEN** the resource definition omits `port` under the `nats` backend
 - **THEN** port `4222` is used, and `username`/`password` or `token` (when supplied) authenticate the connection
 
 ### Requirement: NATS request-reply via amq.request
 
-When `config.amq.backend` is `nats`, the capability SHALL expose `amq.request(subject, payload)`
-that publishes a request to `subject` and returns the first reply's JSON body, bounded by
-`config.amq.request_timeout_ms` (default 5000). On any other backend `amq.request` SHALL fail with
+When the resource definition's `backend` is `nats`, the capability SHALL expose
+`amq.request(subject, payload)` that publishes a request to `subject` and returns the first
+reply's JSON body, bounded by the definition's `request_timeout_ms` (default 5000). On any
+other backend `amq.request` SHALL fail with
 a non-retryable `AMQ_UNSUPPORTED` error owned by the developer.
 
 #### Scenario: Request-reply returns the reply body
@@ -160,7 +170,7 @@ backend, because an open-ended subscription does not fit the bounded single-exec
 
 ### Requirement: Batch size cap
 
-The capability SHALL reject a single `send` whose message count exceeds `config.amq.max_batch`
+The capability SHALL reject a single `send` whose message count exceeds the resource definition's `max_batch`
 (default 100) with a non-retryable `AMQ_BATCH_TOO_LARGE` error owned by the developer.
 
 #### Scenario: Over-limit batch
