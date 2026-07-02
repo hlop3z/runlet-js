@@ -7,7 +7,9 @@ each managing its own server so the only variable is the thing under test:
   1. Circuit breaker (Tier 3) — A/B against a DEAD, hanging database. The breaker is a
      *connect* breaker, so its value shows when connects time out (5s each), not when
      they are refused instantly. Target 192.0.2.1:5432 (RFC-5737 TEST-NET) black-holes
-     the TCP SYN, so every connect pays the full 5s connect-timeout.
+     the TCP SYN, so every connect pays the full 5s connect-timeout. The breaker lives in
+     `fabricd` now (it owns the driver connections), so each variant runs the two-process
+     topology: `fabricd` (dead-db resource + `db_breaker_threshold`) over a UDS + the box.
        A (off):  db_breaker_threshold = 0  — every request waits ~5s on connect.
        B (on):   db_breaker_threshold = 3  — after 3 fails the breaker opens and the
                  rest fast-fail DB_CIRCUIT_OPEN in ~ms.
@@ -15,15 +17,17 @@ each managing its own server so the only variable is the thing under test:
      and stops burning spawn_blocking threads on the connect timeout.
 
   2. ES-module overhead — per-request latency of three handler shapes on one normally
-     configured server: a classic script, an `export default` module, and a module that
-     `import`s a registry module. Quantifies the cost of module compile/eval per request.
+     configured server (no `fabricd` — deterministic handlers need no egress): a classic
+     script, an `export default` module, and a module that `import`s a registry module.
+     Quantifies the cost of module compile/eval per request.
 
-Run it INSIDE the jsbox-dev container (it needs the binary + docker-network DB):
-  docker exec -e JSBOX_BIN=/ctarget/debug/jsbox -e DEAD_DB_HOST=192.0.2.1 \
-      jsbox-dev sh -c "cd /src && python3 stress_breaker_esm.py"
+Run it INSIDE the dev container (it needs the binaries + a UDS-capable filesystem):
+  docker exec -e RUNLET_BIN=/ctarget/debug/runlet -e FABRICD_BIN=/ctarget/debug/fabricd \
+      -e DEAD_DB_HOST=192.0.2.1 jsbox-dev sh -c "cd /src && python3 stress_breaker_esm.py"
 
-Env knobs (optional): JSBOX_BIN, DEAD_DB_HOST/PORT, BREAKER_CONCURRENCY, BREAKER_DURATION,
-ESM_REQUESTS, ESM_CONCURRENCY, MODULES_DIR. NOT pass/fail — prints a comparison + verdict.
+Env knobs (optional): RUNLET_BIN, FABRICD_BIN, DEAD_DB_HOST/PORT, BREAKER_CONCURRENCY,
+BREAKER_DURATION, ESM_REQUESTS, ESM_CONCURRENCY, MODULES_DIR. NOT pass/fail — prints a
+comparison + verdict.
 """
 
 import concurrent.futures
@@ -34,8 +38,9 @@ import time
 import urllib.error
 import urllib.request
 
-BASE_URL = os.environ.get("JSBOX_URL", "http://127.0.0.1:3000")
-JSBOX_BIN = os.environ.get("JSBOX_BIN", "")
+BASE_URL = os.environ.get("RUNLET_URL", "http://127.0.0.1:3000")
+RUNLET_BIN = os.environ.get("RUNLET_BIN", "")
+FABRICD_BIN = os.environ.get("FABRICD_BIN", "")
 DEAD_HOST = os.environ.get("DEAD_DB_HOST", "192.0.2.1")
 DEAD_PORT = int(os.environ.get("DEAD_DB_PORT", "5432"))
 BREAKER_CONCURRENCY = int(os.environ.get("BREAKER_CONCURRENCY", "16"))
@@ -47,7 +52,10 @@ MODULES_DIR = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "modules"),
 )
 
+# The dead-db operator resource — lives in fabricd's `resources` table; the request only
+# names it via `config.io`.
 DEAD_DB = {
+    "kind": "db",
     "host": DEAD_HOST,
     "port": DEAD_PORT,
     "user": "x",
@@ -57,7 +65,7 @@ DEAD_DB = {
 }
 DEAD_QUERY = {
     "script": "function handler(ctx){ db.query('SELECT 1'); return json('ok', null); }",
-    "config": {"db": DEAD_DB},
+    "config": {"io": {"db": ["dead-db"]}},
 }
 TRIVIAL = {"script": "function handler(ctx){ return json(1, null); }"}
 
@@ -108,28 +116,65 @@ def _wait_for_server(up: bool, tries: int = 40) -> bool:
     return False
 
 
-def start_server(config: dict) -> subprocess.Popen:
+def _binaries() -> tuple:
+    """Resolve the (runlet, fabricd) binary paths, building both once when not given via env
+    (two concurrent `cargo run`s would race on the target/ build lock)."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    if not (RUNLET_BIN and FABRICD_BIN):
+        subprocess.run(
+            ["cargo", "build", "--quiet", "-p", "runlet", "-p", "fabricd"],
+            cwd=repo, check=True,
+        )
+    bindir = os.path.join(repo, "target", "debug")
+    return (
+        RUNLET_BIN or os.path.join(bindir, "runlet"),
+        FABRICD_BIN or os.path.join(bindir, "fabricd"),
+    )
+
+
+def start_stack(box_config: dict, fabricd_config: dict | None) -> list:
+    """Start `fabricd` (when the experiment needs db egress) over a UDS, then the box pointed
+    at that socket. Returns the started processes (stop with `stop_stack`)."""
     repo = os.path.dirname(os.path.abspath(__file__))
     run_dir = os.path.join(repo, ".stress-run")
     os.makedirs(run_dir, exist_ok=True)
+    runlet_bin, fabricd_bin = _binaries()
+    procs = []
+    if fabricd_config is not None:
+        socket = os.path.join(run_dir, "fabricd.sock")
+        if os.path.exists(socket):
+            os.remove(socket)
+        with open(os.path.join(run_dir, "fabricd.json"), "w", encoding="utf-8") as fh:
+            json.dump({"socket": socket, **fabricd_config}, fh)
+        procs.append(subprocess.Popen(
+            [fabricd_bin], cwd=run_dir,
+            env={**os.environ, "FABRICD_CONFIG": os.path.join(run_dir, "fabricd.json")},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        for _ in range(40):  # wait for fabricd to bind before starting the box
+            if os.path.exists(socket):
+                break
+            time.sleep(0.25)
+        box_config = {**box_config, "fabricd_socket": socket}
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
-        json.dump(config, fh)
-    cmd = [JSBOX_BIN] if JSBOX_BIN else ["cargo", "run", "--quiet"]
-    proc = subprocess.Popen(
-        cmd, cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+        json.dump(box_config, fh)
+    procs.append(subprocess.Popen(
+        [runlet_bin], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ))
     if not _wait_for_server(up=True):
-        proc.terminate()
+        stop_stack(procs)
         raise RuntimeError("server failed to start")
-    return proc
+    return procs
 
 
-def stop_server(proc: subprocess.Popen):
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+def stop_stack(procs: list):
+    for proc in reversed(procs):  # box first, then fabricd
+        proc.terminate()
+    for proc in reversed(procs):
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
     _wait_for_server(up=False)
 
 
@@ -170,22 +215,23 @@ def breaker_experiment(label: str, threshold: int) -> dict:
     # Bulkhead == concurrency so NO request is shed as 429 — every request acquires a permit
     # and the only variable is the connect path (slow dead-connect vs fast breaker-open). A
     # low bulkhead would flood the metrics with instant 429s and mask the breaker.
-    engine = {
-        "max_concurrent_executions": BREAKER_CONCURRENCY,
-        "db_breaker_threshold": threshold,
-    }
-    config = {
+    box = {
         "debug": True,
         "server": {"host": "127.0.0.1", "port": 3000},
-        "engine": engine,
+        "engine": {"max_concurrent_executions": BREAKER_CONCURRENCY},
+    }
+    # The breaker knob is fabricd config now — it owns the driver connections.
+    fabricd_cfg = {
+        "db_breaker_threshold": threshold,
+        "resources": {"dead-db": DEAD_DB},
     }
     print(f"  [{label}] starting (db_breaker_threshold={threshold}) ...")
-    proc = start_server(config)
+    procs = start_stack(box, fabricd_cfg)
     try:
         time.sleep(1)
         return _run_dead_db_load(BREAKER_CONCURRENCY, BREAKER_DURATION)
     finally:
-        stop_server(proc)
+        stop_stack(procs)
 
 
 def report_breaker(a: dict, b: dict):
@@ -270,7 +316,7 @@ def esm_experiment() -> dict:
         "engine": {},
     }
     print(f"  [ESM] starting (modules_dir={MODULES_DIR}) ...")
-    proc = start_server(config)
+    procs = start_stack(config, None)  # deterministic handlers — no fabricd needed
     out = {}
     try:
         time.sleep(1)
@@ -280,7 +326,7 @@ def esm_experiment() -> dict:
             _bench_shape(body, 50, 1)  # warm up
             out[name] = _bench_shape(body, ESM_REQUESTS, 1)
     finally:
-        stop_server(proc)
+        stop_stack(procs)
     return out
 
 

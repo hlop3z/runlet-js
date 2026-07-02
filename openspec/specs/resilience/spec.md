@@ -12,18 +12,18 @@ Operator deployment guidance: `docs/deployment.md`.
 
 ### Requirement: Statement-timeout clamp (Tier 0)
 
-The system SHALL clamp a per-request `config.db.statement_timeout_ms` to the operator ceiling
-`max_statement_timeout_ms`, so jsbox never issues an unbounded `SET`.
+The system SHALL clamp a db resource definition's `statement_timeout_ms` to the operator ceiling
+`max_statement_timeout_ms` when the resource is resolved, so jsbox never issues an unbounded `SET`.
 
-#### Scenario: Request value clamped
+#### Scenario: Resource value clamped
 
-- **WHEN** `max_statement_timeout_ms` is set and a request asks for a larger (or `0`/unlimited) `statement_timeout_ms`
+- **WHEN** `max_statement_timeout_ms` is set and a resolved db resource carries a larger (or `0`/unlimited) `statement_timeout_ms`
 - **THEN** the effective value is clamped to the ceiling and a long query is killed at the ceiling
 
 #### Scenario: Ceiling disabled
 
 - **WHEN** `max_statement_timeout_ms` is `0`
-- **THEN** no operator ceiling is applied and the request value is used as-is
+- **THEN** no operator ceiling is applied and the resource's value is used as-is
 
 ### Requirement: Concurrency bulkhead (Tier 1)
 

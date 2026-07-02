@@ -37,9 +37,6 @@ const AUTO_CONCURRENCY_FACTOR: usize = 16;
 /// Enough that distinct keys rarely collide while keeping the semaphore array small.
 const DEFAULT_PARTITION_BUCKETS: usize = 256;
 
-/// Default `db` circuit-breaker cool-down (ms) when `db_breaker_cooldown_ms` is `0`.
-const DEFAULT_BREAKER_COOLDOWN_MS: u64 = 5000;
-
 /// JS engine sandbox limits.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default)]
@@ -85,20 +82,6 @@ pub struct EngineConfig {
     /// Number of hashed partition buckets, used only when per-partition fairness is on.
     /// More buckets = fewer key collisions, more semaphores. `0` = default 256.
     pub partition_buckets: usize,
-    /// Operator ceiling (ms) for the `db` `statement_timeout`. `0` = no ceiling. A
-    /// per-request `config.db.statement_timeout_ms` is clamped to this, and a request
-    /// value of `0` ("unlimited") becomes this ceiling — so jsbox never issues an
-    /// unbounded `SET`. The robust, pooler-proof ceiling is still a server-side role
-    /// default; this is defense in depth (see `docs/design/resilience.md`).
-    pub max_statement_timeout_ms: u64,
-    /// Circuit breaker (Tier 5/3): consecutive `db` connect failures (per `host:port`)
-    /// that trip the breaker open. `0` = off. While open, `db` requests to that target
-    /// fast-fail `DB_CIRCUIT_OPEN` (retryable) instead of waiting on the connect timeout
-    /// to a dead database (see `docs/design/resilience.md`).
-    pub db_breaker_threshold: u32,
-    /// How long (ms) the `db` circuit breaker stays open before allowing a half-open
-    /// probe. Used only when `db_breaker_threshold > 0`. `0` = default 5000.
-    pub db_breaker_cooldown_ms: u64,
     /// Whether a request may use the `allowed_hosts: ["*"]` wildcard for the `api` client.
     /// Default `false`: a `*` is ignored (matches nothing), so a request must name each host
     /// explicitly. `*` is dangerous because it removes the host allowlist and leaves only the
@@ -146,11 +129,8 @@ impl Default for EngineConfig {
             max_ops: 1500,                   // safe cap for API workloads
             max_output_size: 0,              // 0 = off (bounded by memory_limit)
             max_concurrent_executions: 0,    // 0 = auto: pool_size * AUTO_CONCURRENCY_FACTOR
-            max_statement_timeout_ms: 0,     // 0 = no operator ceiling (opt-in)
             max_concurrent_per_partition: 0, // 0 = per-partition fairness off (opt-in)
             partition_buckets: 0,            // 0 = default DEFAULT_PARTITION_BUCKETS
-            db_breaker_threshold: 0,         // 0 = circuit breaker off (opt-in)
-            db_breaker_cooldown_ms: 0,       // 0 = default DEFAULT_BREAKER_COOLDOWN_MS
             allow_wildcard_hosts: false,     // `*` in allowed_hosts ignored unless opted in
         }
     }
@@ -183,17 +163,6 @@ impl EngineConfig {
             self.partition_buckets
         } else {
             DEFAULT_PARTITION_BUCKETS
-        }
-    }
-
-    /// Resolves the `db` circuit-breaker cool-down: the configured value, or
-    /// `DEFAULT_BREAKER_COOLDOWN_MS` when left at `0`.
-    #[must_use]
-    pub const fn resolved_breaker_cooldown_ms(&self) -> u64 {
-        if self.db_breaker_cooldown_ms > 0 {
-            self.db_breaker_cooldown_ms
-        } else {
-            DEFAULT_BREAKER_COOLDOWN_MS
         }
     }
 

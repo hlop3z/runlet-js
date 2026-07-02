@@ -47,17 +47,18 @@ Tier 0 has two parts:
   role/database default — `ALTER ROLE app SET statement_timeout = '30s'`. It is applied to
   every backend at connection start, so it survives PgBouncer transaction mode and every
   pooler, and no client can escape it. This is the authoritative floor.
-- **jsbox clamp (code, defense-in-depth):** `engine.max_statement_timeout_ms` (`0` = off). A
-  per-request `config.db.statement_timeout_ms` is clamped to it, and a request value of `0`
-  ("unlimited") becomes the ceiling. This guarantees jsbox never _sends_ an unbounded `SET`,
-  which fully bounds direct connections and session-mode pooling. Behind a transaction-mode
-  pooler the `SET` is best-effort, so the clamp there is belt-and-suspenders to the operator
-  role default — not a replacement.
+- **jsbox clamp (code, defense-in-depth):** `fabricd`'s `max_statement_timeout_ms` (`0` =
+  off). A `db` resource's `statement_timeout_ms` is clamped to it when the resource is
+  resolved, and a resource value of `0` ("unlimited") becomes the ceiling. This guarantees
+  jsbox never _sends_ an unbounded `SET`, which fully bounds direct connections and
+  session-mode pooling. Behind a transaction-mode pooler the `SET` is best-effort, so the
+  clamp there is belt-and-suspenders to the operator role default — not a replacement.
 
-The per-request `config.db` is set by the _trusted_ caller of `/execute`, not by the
-sandboxed script (a script cannot set `statement_timeout`). The clamp is defense in depth: it
-lets the operator _running runlet_ guarantee a ceiling no caller can exceed, which matters as
-the platform moves toward customer-authored scripts and multi-tenancy.
+The `statement_timeout_ms` lives on the operator-defined resource (in `fabricd`'s
+`resources` table), not in the request — the sandboxed script cannot set it, and the caller
+of `/execute` only names a resource. The clamp is defense in depth: it lets the operator
+running the egress daemon guarantee a ceiling no resource definition can exceed, which
+matters as the platform moves toward customer-authored scripts and multi-tenancy.
 
 ### Tier 1 — bulkhead
 
@@ -108,20 +109,26 @@ Tiers 1–2 keep a single hung query from cascading, but a database that is _dow
 is still a slow-path tax: every request pays the 5 s connect timeout on a `spawn_blocking`
 thread before failing, and N concurrent requests bury the recovering target under a
 thundering herd of reconnects. Tier 3 short-circuits that. A breaker keyed per **target**
-(`host:port`, operator-supplied in `config.db`, so the key set is small and bounded) counts
-consecutive connect failures; at `db_breaker_threshold` it trips **open** and fast-fails
-subsequent calls to that target with a retryable `capability/db/DB_CIRCUIT_OPEN` (no connect
-attempted, no timeout wait) for `db_breaker_cooldown_ms`. After the cool-down a single
-request probes (**half-open**): success closes the breaker, failure re-opens it — the
-`allow()` check re-arms the open window so only one caller probes while the rest keep
-fast-failing. State is a mutex-guarded map that **fails open** on lock poisoning (a breaker
-bug must never wedge the service). Opt-in via `db_breaker_threshold` (0 = off, the default).
-Implementation: `src/breaker.rs`, gated in `db::connect_through_breaker`.
+(`host:port`, operator-supplied in the `db` resource definitions, so the key set is small
+and bounded) counts consecutive connect failures; at `db_breaker_threshold` it trips
+**open** and fast-fails subsequent calls to that target with a retryable
+`capability/db/DB_CIRCUIT_OPEN` (no connect attempted, no timeout wait) for
+`db_breaker_cooldown_ms`. After the cool-down a single request probes (**half-open**):
+success closes the breaker, failure re-opens it — the `allow()` check re-arms the open
+window so only one caller probes while the rest keep fast-failing. State is a mutex-guarded
+map that **fails open** on lock poisoning (a breaker bug must never wedge the service).
+Opt-in via `db_breaker_threshold` in **`fabricd`'s config** (0 = off, the default) — the
+daemon owns the driver connections, so it owns the connect breaker, built once per daemon
+so trip state accumulates across the one-request sessions. Trips are exposed as
+`fabricd_db_breaker_trips_total` on the daemon's opt-in `metrics_listen` scrape endpoint
+(the counter is daemon-scoped, so it can't ride the per-session `Drain` metrics — and the
+box-side `runlet_db_breaker_trips_total` stays a zero placeholder). Implementation:
+`fabric-wire/src/breaker.rs`, gated in the `db` backend's connect path.
 
 This is deliberately a _connect_ breaker, not a per-query latency breaker — the failure it
 targets is a dead/unreachable target, where Tier 2's deadline already bounds a _slow_ live
-query. It is per-pod like the bulkhead: each replica learns the target's health
-independently, the right granularity since connect failures are observed locally.
+query. It is per-daemon like the bulkhead is per-pod: each `fabricd` learns the target's
+health independently, the right granularity since connect failures are observed locally.
 
 Measured with `stress_breaker_esm.py` (16 concurrent against a black-holed DB whose TCP SYN
 is dropped so every connect pays the 5 s timeout; bulkhead sized to concurrency so the

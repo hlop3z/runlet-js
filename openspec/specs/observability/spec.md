@@ -39,7 +39,12 @@ process-wide counters and live gauges. All emitted series use the `runlet_` name
 #### Scenario: Circuit-breaker and bulkhead signals
 
 - **WHEN** the metrics are scraped
-- **THEN** `runlet_db_breaker_trips_total` reports cumulative breaker opens and `runlet_bulkhead_permits_available` / `runlet_bulkhead_permits_total` report live and configured capacity
+- **THEN** `runlet_db_breaker_trips_total` reports cumulative breaker opens observed by the server (`0` when the breaker runs in the egress broker — the series stays present) and `runlet_bulkhead_permits_available` / `runlet_bulkhead_permits_total` report live and configured capacity
+
+#### Scenario: Egress-broker counters (opt-in)
+
+- **WHEN** the egress broker is configured with a metrics bind address and scraped over plaintext HTTP `GET /metrics`
+- **THEN** it reports its daemon-scoped counters in Prometheus text exposition — cumulative db breaker opens (`fabricd_db_breaker_trips_total`) and cumulative client-auth rejections (`fabricd_auth_failures_total`) — and with no bind address configured it opens no listener
 
 #### Scenario: Latency histograms
 

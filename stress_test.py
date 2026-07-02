@@ -13,8 +13,12 @@ latency + stays responsive, while A queues on the DB and tail latency climbs.
 The harness manages the server lifecycle itself (one variant at a time), so the only
 variable is the config. It is NOT pass/fail — it prints a comparison and a verdict.
 
+The `db` capability is brokered by `fabricd` now, so each variant runs the two-process
+topology: `fabricd` (the db resource + the Tier 0 `max_statement_timeout_ms` ceiling) over
+a UDS + the box (bulkhead/fairness knobs).
+
 Env knobs (all optional):
-  JSBOX_BIN     path to the jsbox binary (default: cargo run from a temp dir)
+  RUNLET_BIN/FABRICD_BIN   binary paths (default: cargo build once, run from target/debug)
   PGBOUNCER_HOST/PGBOUNCER_PORT   db target (default localhost:6432)
   STRESS_CONCURRENCY  concurrent workers (default 40)
   STRESS_DURATION     load seconds per variant (default 8)
@@ -29,15 +33,20 @@ import time
 import urllib.error
 import urllib.request
 
-BASE_URL = os.environ.get("JSBOX_URL", "http://127.0.0.1:3000")
-JSBOX_BIN = os.environ.get("JSBOX_BIN", "")
+BASE_URL = os.environ.get("RUNLET_URL", "http://127.0.0.1:3000")
+RUNLET_BIN = os.environ.get("RUNLET_BIN", "")
+FABRICD_BIN = os.environ.get("FABRICD_BIN", "")
 PGB_HOST = os.environ.get("PGBOUNCER_HOST", "localhost")
 PGB_PORT = int(os.environ.get("PGBOUNCER_PORT", "6432"))
 CONCURRENCY = int(os.environ.get("STRESS_CONCURRENCY", "40"))
 DURATION = float(os.environ.get("STRESS_DURATION", "8"))
 SLEEP_S = float(os.environ.get("STRESS_SLEEP", "2"))
 
-DB_CONFIG = {
+# The db operator resource — lives in fabricd's `resources` table; the requests only name
+# it via `config.io`. `statement_timeout_ms: 0` asks for "unlimited" so the Tier 0 ceiling
+# (fabricd's `max_statement_timeout_ms`, the B variant) is what bounds the slow query.
+DB_RESOURCE = {
+    "kind": "db",
     "host": PGB_HOST,
     "port": PGB_PORT,
     "user": "test",
@@ -45,6 +54,7 @@ DB_CONFIG = {
     "database": "testdb",
     "statement_timeout_ms": 0,
 }
+DB_IO = {"io": {"db": ["stress-db"]}}
 
 # The load: a slow DB query (simulates a degraded database / saturated pool). Each
 # request holds a connection for SLEEP_S server-side.
@@ -52,7 +62,7 @@ DB_CONFIG = {
 # (variant B) the noisy partition sheds on its own cap and the good one keeps its share.
 WORK_BODY = {
     "script": f"function handler(ctx) {{ db.query('SELECT pg_sleep({SLEEP_S})'); return json('ok', null); }}",
-    "config": {"db": DB_CONFIG},
+    "config": DB_IO,
     "partition": "noisy",
 }
 TRIVIAL_BODY = {"script": "function handler(ctx) { return json(1, null); }"}
@@ -60,7 +70,7 @@ TRIVIAL_BODY = {"script": "function handler(ctx) { return json(1, null); }"}
 # measure noisy-neighbor impact (does the slow-query flood drag down a good request?).
 VICTIM_BODY = {
     "script": "function handler(ctx) { var r = db.query('SELECT 1 AS ok'); return json(r.rows[0].ok, null); }",
-    "config": {"db": DB_CONFIG},
+    "config": DB_IO,
     "partition": "good",
 }
 
@@ -105,34 +115,73 @@ def _wait_for_server(up: bool, tries: int = 40) -> bool:
     return False
 
 
-def start_server(engine_overrides: dict) -> subprocess.Popen:
-    """Start jsbox with the given engine config overrides; wait until healthy."""
+def _binaries() -> tuple:
+    """Resolve the (runlet, fabricd) binary paths, building both once when not given via env
+    (two concurrent `cargo run`s would race on the target/ build lock)."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    if not (RUNLET_BIN and FABRICD_BIN):
+        subprocess.run(
+            ["cargo", "build", "--quiet", "-p", "runlet", "-p", "fabricd"],
+            cwd=repo, check=True,
+        )
+    bindir = os.path.join(repo, "target", "debug")
+    return (
+        RUNLET_BIN or os.path.join(bindir, "runlet"),
+        FABRICD_BIN or os.path.join(bindir, "fabricd"),
+    )
+
+
+def start_stack(engine_overrides: dict, ceiling_ms: int) -> list:
+    """Start `fabricd` (the db resource + the Tier 0 ceiling) over a UDS, then the box with
+    the given engine overrides pointed at that socket. Returns the started processes."""
     repo = os.path.dirname(os.path.abspath(__file__))
     run_dir = os.path.join(repo, ".stress-run")
     os.makedirs(run_dir, exist_ok=True)
-    config = {
+    runlet_bin, fabricd_bin = _binaries()
+    socket = os.path.join(run_dir, "fabricd.sock")
+    if os.path.exists(socket):
+        os.remove(socket)
+    fabricd_cfg = {
+        "socket": socket,
+        "max_statement_timeout_ms": ceiling_ms,
+        "resources": {"stress-db": DB_RESOURCE},
+    }
+    with open(os.path.join(run_dir, "fabricd.json"), "w", encoding="utf-8") as fh:
+        json.dump(fabricd_cfg, fh)
+    box_cfg = {
         "debug": True,
         "server": {"host": "127.0.0.1", "port": 3000},
         "engine": engine_overrides,
+        "fabricd_socket": socket,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
-        json.dump(config, fh)
-    cmd = [JSBOX_BIN] if JSBOX_BIN else ["cargo", "run", "--quiet"]
-    proc = subprocess.Popen(
-        cmd, cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+        json.dump(box_cfg, fh)
+    procs = [subprocess.Popen(
+        [fabricd_bin], cwd=run_dir,
+        env={**os.environ, "FABRICD_CONFIG": os.path.join(run_dir, "fabricd.json")},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )]
+    for _ in range(40):  # wait for fabricd to bind before starting the box
+        if os.path.exists(socket):
+            break
+        time.sleep(0.25)
+    procs.append(subprocess.Popen(
+        [runlet_bin], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ))
     if not _wait_for_server(up=True):
-        proc.terminate()
+        stop_stack(procs)
         raise RuntimeError("server failed to start")
-    return proc
+    return procs
 
 
-def stop_server(proc: subprocess.Popen):
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+def stop_stack(procs: list):
+    for proc in reversed(procs):  # box first, then fabricd
+        proc.terminate()
+    for proc in reversed(procs):
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
     _wait_for_server(up=False)
 
 
@@ -270,14 +319,14 @@ def report(a: dict, b: dict):
 # -- Main ---------------------------------------------------------------------
 
 
-def experiment(label: str, engine: dict) -> dict:
-    print(f"  [{label}] starting server: {engine}")
-    proc = start_server(engine)
+def experiment(label: str, engine: dict, ceiling_ms: int) -> dict:
+    print(f"  [{label}] starting stack: engine={engine} max_statement_timeout_ms={ceiling_ms}")
+    procs = start_stack(engine, ceiling_ms)
     try:
         time.sleep(1)  # settle
         return run_load(CONCURRENCY, DURATION)
     finally:
-        stop_server(proc)
+        stop_stack(procs)
 
 
 def main():
@@ -287,17 +336,12 @@ def main():
         )
         raise SystemExit(1)
     # A: bulkhead effectively off, no statement_timeout ceiling.
-    a = experiment(
-        "A baseline", {"max_concurrent_executions": 1000, "max_statement_timeout_ms": 0}
-    )
-    # B: Tier 1 bulkhead + Tier 0 clamp.
+    a = experiment("A baseline", {"max_concurrent_executions": 1000}, 0)
+    # B: Tier 1 bulkhead + Tier 5 fairness (box) + Tier 0 clamp (fabricd).
     b = experiment(
         "B resilient",
-        {
-            "max_concurrent_executions": 8,
-            "max_statement_timeout_ms": 1000,
-            "max_concurrent_per_partition": 4,
-        },
+        {"max_concurrent_executions": 8, "max_concurrent_per_partition": 4},
+        1000,
     )
     report(a, b)
 
