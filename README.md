@@ -51,10 +51,10 @@ POST /execute
 
 Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) are addressed by
 **logical name** in `config.io`, not by inline connection config. The endpoints and
-credentials are declared once, operator-side, in the server `config.json` `resources`
-map (see [Logical resources](#logical-resources-configio)) — the request never carries
-a host or a password. `http` (`allowed_hosts`) and `s3` stay script-controlled/in-engine
-and keep their inline config.
+credentials are declared once, operator-side, in the **`fabricd` egress sidecar's**
+`resources` table (see [Logical resources](#logical-resources-configio)) — the runlet
+server holds no credentials and the request never carries a host or a password. `http`
+(`allowed_hosts`) and `s3` stay script-controlled/in-engine and keep their inline config.
 
 | Field                  | Required | Description                                                              |
 | ---------------------- | -------- | ------------------------------------------------------------------------ |
@@ -80,8 +80,12 @@ and keep their inline config.
     "exec_time_us": 950,
     "http_requests": [],
     "db_requests": [],
+    "mongo_requests": [],
     "mail_requests": [],
-    "s3_requests": []
+    "s3_requests": [],
+    "redis_requests": [],
+    "amq_requests": [],
+    "auth_requests": []
   }
 }
 ```
@@ -95,9 +99,12 @@ branch on without parsing strings; `meta.trace_id` correlates it with server log
 ### Logical resources (`config.io`)
 
 Driver-backed capabilities are addressed by **logical name**, not inline connection
-config. The operator declares each named resource once in the server `config.json`
-`resources` map (an internally-tagged object: `kind` selects the capability, the rest is
-that driver's config):
+config. The runlet server links no database/mail/broker driver and **holds no
+credentials** — the operator declares each named resource once in the **`fabricd`
+egress sidecar's** config (`fabricd.json`, or the path in `FABRICD_CONFIG`), in its
+`resources` table (an internally-tagged object: `kind` selects the capability, the rest
+is that driver's config; an optional `tenant` scopes the binding to one workspace in
+trusted-identity mode):
 
 ```json
 {
@@ -108,19 +115,35 @@ that driver's config):
 }
 ```
 
-A request then names the resources it may use, keyed by capability kind:
+Alongside `resources`, `fabricd.json` takes the `db` resilience knobs (it owns the driver
+connections): `max_statement_timeout_ms` (Tier 0 ceiling clamping any db resource's
+`statement_timeout_ms`; `0` = no clamp) and `db_breaker_threshold` /
+`db_breaker_cooldown_ms` (Tier 3 per-target circuit breaker — after N consecutive connect
+failures to a `host:port`, further `db` calls fast-fail `DB_CIRCUIT_OPEN` for the cool-down
+instead of waiting on the connect timeout; `0` = off, cool-down default 5000 ms). See
+[`docs/design/resilience.md`](docs/design/resilience.md). An optional `metrics_listen`
+(e.g. `"127.0.0.1:9090"`) exposes the daemon's own Prometheus counters —
+`fabricd_db_breaker_trips_total` and `fabricd_auth_failures_total` — as a plaintext
+`GET /metrics`; omit it for no listener, and never expose it publicly.
+
+The runlet server config carries only the sidecar **transport**: `fabricd_socket` (local
+Unix socket, the default deployment) or `fabricd_quic` (remote `fabricd` over QUIC) — see
+[Configuration](#configuration). A request then names the resources it may use, keyed by
+capability kind:
 
 ```json
 { "config": { "io": { "db": ["orders-db"], "redis": ["cache"] } } }
 ```
 
 The name gates the capability (no name → the global is `undefined`) **and** selects which
-operator binding is wired. A name the operator never declared is rejected with a `400`
-`RESOURCE_NOT_FOUND`; a name of the wrong kind is a `400` `RESOURCE_KIND_MISMATCH`. This is
-the trust boundary: a (possibly compromised) caller can only reach operator-provisioned
-resources and never sees an endpoint or a credential. Interim: one binding per kind is
-wired (the JS wrapper still dispatches by kind, e.g. `db.query(…)`). Design:
-[`docs/design/resource-egress.md`](docs/design/resource-egress.md).
+operator binding `fabricd` wires. A name the operator never declared (or one bound to a
+different tenant) is rejected with a `400` `RESOURCE_NOT_FOUND`; a name of the wrong kind
+is a `400` `RESOURCE_KIND_MISMATCH`; naming any driver resource when no sidecar transport
+is configured is a `503` `EGRESS_UNAVAILABLE`. This is the trust boundary: a (possibly
+compromised) caller can only reach operator-provisioned resources and never sees an
+endpoint or a credential — credentials live in `fabricd`, never in the box. Interim: one
+binding per kind is wired (the JS wrapper still dispatches by kind, e.g. `db.query(…)`).
+Design: [`docs/design/resource-egress.md`](docs/design/resource-egress.md).
 
 ### Registered scripts
 
@@ -185,14 +208,14 @@ flapping database without parsing logs:
 
 | Metric                                 | Type      | Labels                                                                                                                       | Meaning                                                                         |
 | -------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `jsbox_executions_total`               | counter   | `outcome` (`success`, `script_error`, `capability_error`, `timeout`, `memory_limit`, `malformed_response`, `internal_error`) | Executions by terminal outcome.                                                 |
-| `jsbox_rejections_total`               | counter   | —                                                                                                                            | Requests rejected before execution (bad body, routing, oversized).              |
-| `jsbox_overload_total`                 | counter   | `scope` (`global`, `partition`)                                                                                              | Requests shed by the bulkhead (Tier 1) / partition cap (Tier 5).                |
-| `jsbox_db_breaker_trips_total`         | counter   | —                                                                                                                            | Cumulative db circuit-breaker open transitions (Tier 3).                        |
-| `jsbox_bulkhead_permits_available`     | gauge     | —                                                                                                                            | Free global bulkhead permits right now.                                         |
-| `jsbox_bulkhead_permits_total`         | gauge     | —                                                                                                                            | Configured global bulkhead capacity.                                            |
-| `jsbox_execution_duration_seconds`     | histogram | `le`                                                                                                                         | Execution wall-clock latency (`_bucket`/`_sum`/`_count`; executions that ran).  |
-| `jsbox_capability_op_duration_seconds` | histogram | `capability` (`db`/`mongo`/`http`/`mail`/`s3`/`redis`/`amq`/`auth`), `le`                                                            | Per-capability op latency — which downstream is slow, not just total exec time. |
+| `runlet_executions_total`               | counter   | `outcome` (`success`, `script_error`, `capability_error`, `timeout`, `memory_limit`, `malformed_response`, `internal_error`) | Executions by terminal outcome.                                                 |
+| `runlet_rejections_total`               | counter   | —                                                                                                                            | Requests rejected before execution (bad body, routing, oversized).              |
+| `runlet_overload_total`                 | counter   | `scope` (`global`, `partition`)                                                                                              | Requests shed by the bulkhead (Tier 1) / partition cap (Tier 5).                |
+| `runlet_db_breaker_trips_total`         | counter   | —                                                                                                                            | Cumulative db circuit-breaker open transitions (Tier 3). The breaker runs in `fabricd` (it owns the driver connections), so this box-side series stays present but reports `0` — scrape `fabricd_db_breaker_trips_total` from `fabricd`'s `metrics_listen` endpoint for the live counter. |
+| `runlet_bulkhead_permits_available`     | gauge     | —                                                                                                                            | Free global bulkhead permits right now.                                         |
+| `runlet_bulkhead_permits_total`         | gauge     | —                                                                                                                            | Configured global bulkhead capacity.                                            |
+| `runlet_execution_duration_seconds`     | histogram | `le`                                                                                                                         | Execution wall-clock latency (`_bucket`/`_sum`/`_count`; executions that ran).  |
+| `runlet_capability_op_duration_seconds` | histogram | `capability` (`db`/`mongo`/`http`/`mail`/`s3`/`redis`/`amq`/`auth`), `le`                                                            | Per-capability op latency — which downstream is slow, not just total exec time. |
 
 ## JS API
 
@@ -258,10 +281,11 @@ function handler(ctx) {
   var users = db.query("SELECT id, name FROM users WHERE active = $1", [true]);
   // users = { columns: ["id","name"], rows: [{id:"1",name:"Alice"}], row_count: 1, truncated: false }
 
-  db.execute("INSERT INTO logs (user_id, action) VALUES ($1, $2)", [
+  var ins = db.execute("INSERT INTO logs (user_id, action) VALUES ($1, $2)", [
     ctx.user_id,
     "login",
   ]);
+  // ins = { rows_affected: 1 }
 
   // Transactions
   db.begin();
@@ -280,7 +304,12 @@ function handler(ctx) {
 }
 ```
 
-BIGINT and NUMERIC values are always returned as strings (JS number precision safety).
+`db.query` returns `{ columns, rows, row_count, truncated }` (capped at the resource's
+`max_rows`, default 1000); `db.execute` returns `{ rows_affected }`;
+`db.begin`/`commit`/`rollback` return `{ ok: true }`. BIGINT and NUMERIC values are
+always returned as strings (JS number precision safety). The operator defines the `db`
+resource in `fabricd` (`"kind": "db"` — `host`, `port`, `user`, `password`, `database`,
+`ssl`, `statement_timeout_ms`, `max_rows`).
 
 ### mail.send
 
@@ -289,7 +318,7 @@ SMTP client (requires a `config.io.mail` resource):
 ```js
 function handler(ctx) {
   var res = mail.send({
-    from: "App <no-reply@example.com>", // optional, falls back to config.mail.from
+    from: "App <no-reply@example.com>", // optional, falls back to the resource's `from`
     to: ctx.email, // string or array of strings
     cc: ["ops@example.com"], // optional
     bcc: [], // optional
@@ -303,21 +332,28 @@ function handler(ctx) {
 }
 ```
 
-`config.mail` (operator-supplied, like `config.db` — the relay host is trusted, so
-private/internal relays are allowed):
+The operator defines the `mail` resource in `fabricd`'s `resources` table (trusted like
+`db` — the relay host is operator-supplied, so private/internal relays are allowed):
 
 ```json
 {
-  "host": "smtp.example.com",
-  "port": 587,
-  "user": "apikey",
-  "password": "secret",
-  "tls": "starttls",
-  "from": "no-reply@example.com",
-  "max_recipients": 50,
-  "timeout_ms": 10000
+  "resources": {
+    "smtp-main": {
+      "kind": "mail",
+      "host": "smtp.example.com",
+      "port": 587,
+      "user": "apikey",
+      "password": "secret",
+      "tls": "starttls",
+      "from": "no-reply@example.com",
+      "max_recipients": 50,
+      "timeout_ms": 10000
+    }
+  }
 }
 ```
+
+A request enables it with `"io": { "mail": ["smtp-main"] }`.
 
 | Field            | Default      | Description                                                 |
 | ---------------- | ------------ | ----------------------------------------------------------- |
@@ -328,6 +364,8 @@ private/internal relays are allowed):
 | `tls`            | `"starttls"` | `"starttls"` (587) · `"wrapper"` (465, implicit) · `"none"` |
 | `from`           | (required)   | Default From address                                        |
 | `max_recipients` | `50`         | Max recipients (to + cc + bcc) per send                     |
+| `allowed_recipient_domains` | `[]` | Recipient-domain allowlist (empty = unrestricted)       |
+| `max_sends`      | `0` (off)    | Per-execution cap on `mail.send` calls                      |
 | `timeout_ms`     | `10000`      | Connect + send timeout                                      |
 
 Addresses, subject, and bodies are assembled with a typed message builder, so caller
@@ -368,8 +406,10 @@ internal one. The sandboxed script cannot set `endpoint`; only operator config c
 > exposed on a public address). For local development, set top-level `"debug": true` in
 > the server config to relax this (see [Configuration](#configuration)); never in production.
 
-`config.s3` (operator-supplied, like `config.db`/`config.mail`). Works with any
-SigV4 store — AWS S3, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces:
+`config.s3` (trusted, caller-supplied in the request — the sandboxed script can never
+set the endpoint; unlike the driver-backed capabilities it stays in-engine, so it is
+**not** a `fabricd` resource). Works with any SigV4 store — AWS S3, Cloudflare R2,
+MinIO, Backblaze B2, DigitalOcean Spaces:
 
 ```json
 {
@@ -472,9 +512,9 @@ against `max_ops`.
 
 ### redis.get / set / del / incr / expire
 
-Key/value access against an operator-supplied Redis (`config.redis`, trusted like `db`/`mail`
-— no SSRF guard). **Strings in / strings out**: the script owns (de)serialization. Synchronous
-(no `await`).
+Key/value access against an operator-supplied Redis (requires a `config.io.redis`
+resource; trusted like `db`/`mail` — no SSRF guard). **Strings in / strings out**: the
+script owns (de)serialization. Synchronous (no `await`).
 
 ```js
 function handler(ctx) {
@@ -487,7 +527,9 @@ function handler(ctx) {
 }
 ```
 
-Config: `{ "redis": { "url": "redis://[user:pass@]host:6379[/db]", "timeout_ms": 5000 } }`.
+The operator defines the resource in `fabricd`:
+`{ "resources": { "cache": { "kind": "redis", "url": "redis://[user:pass@]host:6379[/db]", "timeout_ms": 5000 } } }`;
+a request enables it with `"io": { "redis": ["cache"] }`.
 Use a **`rediss://`** URL for TLS (managed services) — validated against bundled public
 CA roots, reusing the same `aws-lc-rs` provider as the rest of the stack (no extra crypto
 in the binary). A failure to reach Redis surfaces as a retryable
@@ -496,10 +538,11 @@ against `max_ops`.
 
 ### amq.send / amq.request — messaging producer (RabbitMQ or NATS)
 
-Publishes a **batch** of messages (`config.amq`, trusted — no SSRF guard). **Producer-side
-only** (no subscribe/consume). The backend is `config.amq.backend`: `"rabbitmq"` (default) or
-`"nats"`. List-always: `amq.send([[routingKey, payload], …])`; Rust opens one connection for
-the whole batch. Synchronous.
+Publishes a **batch** of messages (requires a `config.io.amq` resource; trusted — no SSRF
+guard). **Producer-side only** (no subscribe/consume). The backend is the resource's
+`backend` field: `"rabbitmq"` (default) or `"nats"`. List-always:
+`amq.send([[routingKey, payload], …])`; Rust opens one connection for the whole batch.
+Synchronous.
 
 ```js
 function handler(ctx) {
@@ -512,24 +555,29 @@ function handler(ctx) {
 ```
 
 The message **body is the JSON of each `payload`**; `routingKey` is the RabbitMQ queue name for
-the default exchange (override with `config.amq.exchange`) or the NATS **subject**. The **whole
-batch is one op** against `max_ops`; a batch over `config.amq.max_batch` (default 100) is
-rejected with `AMQ_BATCH_TOO_LARGE`. A broker outage → retryable
+the default exchange (override with the resource's `exchange`) or the NATS **subject**. The
+**whole batch is one op** against `max_ops`; a batch over the resource's `max_batch` (default
+100) is rejected with `AMQ_BATCH_TOO_LARGE`. A broker outage → retryable
 `capability/amq/AMQ_CONNECTION` (HTTP 200).
 
-**RabbitMQ config:** `{ "amq": { "host": "...", "port": 5672, "username": "guest", "password":
-"guest", "vhost": "/", "exchange": "", "max_batch": 100, "tls": false, "ca_cert": null } }`. Set
-**`"tls": true`** (port usually `5671`) for `amqps://` against managed brokers — validated
-against bundled public CA roots via the shared `aws-lc-rs` provider. For a self-hosted broker
-with a private CA, point `ca_cert` at the CA PEM (mounted into the container).
+The operator defines the resource in `fabricd`; a request enables it with
+`"io": { "amq": ["events"] }`.
+
+**RabbitMQ resource:** `{ "resources": { "events": { "kind": "amq", "host": "...", "port": 5672,
+"username": "guest", "password": "guest", "vhost": "/", "exchange": "", "max_batch": 100,
+"tls": false, "ca_cert": null } } }`. Set **`"tls": true`** (port usually `5671`) for `amqps://`
+against managed brokers — validated against bundled public CA roots via the shared `aws-lc-rs`
+provider. For a self-hosted broker with a private CA, point `ca_cert` at the CA PEM (mounted
+into the `fabricd` container).
 
 **NATS** (`"backend": "nats"`): port defaults to `4222`; `routingKey` is the subject; `vhost`/
 `exchange` don't apply; auth is optional (`username`+`password` or `token`). Adds
 **request-reply**: `amq.request(subject, payload)` publishes and returns the first reply's
-parsed JSON body, bounded by `config.amq.request_timeout_ms` (default 5000) → retryable
+parsed JSON body, bounded by the resource's `request_timeout_ms` (default 5000) → retryable
 `AMQ_TIMEOUT` on no reply. `amq.request` on the RabbitMQ backend throws non-retryable
-`AMQ_UNSUPPORTED`. NATS config: `{ "amq": { "backend": "nats", "host": "...", "port": 4222,
-"token": "...", "request_timeout_ms": 5000, "tls": false, "ca_cert": null } }`.
+`AMQ_UNSUPPORTED`. NATS resource: `{ "resources": { "events": { "kind": "amq", "backend": "nats",
+"host": "...", "port": 4222, "token": "...", "request_timeout_ms": 5000, "tls": false,
+"ca_cert": null } } }`.
 
 ### mongo.find / find_one / count / aggregate / insert* / update* / delete* — document database
 
@@ -554,9 +602,11 @@ function handler(ctx) {
 strings — `Int64`/`Decimal128` as strings, `ObjectId` as hex, `Date` as RFC 3339, `Binary` as
 base64; `Int32`/`Double` as numbers. Errors: retryable `MONGO_CONNECTION` (unreachable),
 `MONGO_WRITE` (duplicate key / constraint), `MONGO_QUERY` (bad filter/update/pipeline),
-retryable `MONGO_TIMEOUT` (deadline). Config: `{ "mongo": { "host": "...", "port": 27017,
+retryable `MONGO_TIMEOUT` (deadline). The operator defines the resource in `fabricd`:
+`{ "resources": { "app-docs": { "kind": "mongo", "host": "...", "port": 27017,
 "username": null, "password": null, "database": "app", "auth_source": "admin",
-"op_timeout_ms": 5000, "max_docs": 1000, "tls": false, "ca_cert": null } }`.
+"op_timeout_ms": 5000, "max_docs": 1000, "tls": false, "ca_cert": null } } }`; a request
+enables it with `"io": { "mongo": ["app-docs"] }`.
 
 ### $sys — runtime stdlib (crypto, date, env, secrets)
 
@@ -598,16 +648,16 @@ high-entropy secrets. See [`docs/09-sys.md`](docs/09-sys.md).
 
 ### auth — OIDC/IAM identity
 
-Resolves a caller's bearer token to its claims (`config.auth`, trusted — the issuer is
-operator-supplied, so no SSRF guard). Validation is **delegated to the IAM** (a `userinfo`
-round-trip), so there is no local JWT/JWKS crypto stack. Endpoints are auto-discovered from
-`{issuer}/.well-known/openid-configuration` unless overridden.
+Resolves a caller's bearer token to its claims (requires a `config.io.auth` resource;
+trusted — the issuer is operator-supplied, so no SSRF guard). Validation is **delegated to
+the IAM** (a `userinfo` round-trip), so there is no local JWT/JWKS crypto stack. Endpoints
+are auto-discovered from `{issuer}/.well-known/openid-configuration` unless overridden.
 
 ```js
 function handler(ctx) {
   var u = auth.user_info(ctx.token); // { ok:true, claims:{sub,email,…} } | { ok:false, status, code }
   if (!u.ok) return json(null, { code: "unauthorized" });
-  // RFC 7662 introspection (needs config.auth.client_id/secret) — see token liveness:
+  // RFC 7662 introspection (needs the resource's client_id/secret) — see token liveness:
   // var r = auth.introspect(ctx.token); if (!r.claims.active) { ... }
   return json({ id: u.claims.sub }, null);
 }
@@ -620,8 +670,10 @@ thrown — like `api`). Infra failures the handler can't act on (issuer down →
 `db`/`mail`). Per-token results are cached within a request (a repeat lookup makes no round
 trip and costs no op). Each call is metered in `meta.auth_requests`.
 
-Config: `{ "auth": { "issuer": "https://login.example.com", "userinfo_url": null,
-"introspect_url": null, "client_id": "", "client_secret": "", "timeout_ms": 10000 } }`. Only
+The operator defines the resource in `fabricd`:
+`{ "resources": { "iam": { "kind": "auth", "issuer": "https://login.example.com",
+"userinfo_url": null, "introspect_url": null, "client_id": "", "client_secret": "",
+"timeout_ms": 10000 } } }`; a request enables it with `"io": { "auth": ["iam"] }`. Only
 `issuer` is required (the rest are discovered / introspection-only). See
 [`docs/10-auth.md`](docs/10-auth.md).
 
@@ -635,6 +687,7 @@ Optional `config.json` in the working directory. All fields have defaults:
 ```json
 {
   "debug": false,
+  "error_debug": false,
   "server": {
     "host": "127.0.0.1",
     "port": 3000
@@ -647,31 +700,39 @@ Optional `config.json` in the working directory. All fields have defaults:
     "max_script_size": "1mb",
     "max_context_size": 0,
     "max_ops": 1500,
-    "max_concurrent_executions": 0,
-    "max_statement_timeout_ms": 0
+    "max_concurrent_executions": 0
   },
-  "scripts_dir": "scripts"
+  "scripts_dir": "scripts",
+  "fabricd_socket": "/tmp/fabricd.sock"
 }
 ```
 
-| Field                          | Default    | Description                                                                                                                                                                                                                                                                                                                     |
-| ------------------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `debug`                        | `false`    | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`api` so localhost/LAN targets (e.g. MinIO) work. Never enable in production.                                                                                                                                                                                          |
-| `error_debug`                  | `true`     | Include `error.debug` (stack traces) in system-error responses. Set `false` at an exposed edge to omit them.                                                                                                                                                                                                                    |
-| `memory_limit`                 | `"32mb"`   | Max JS heap per execution                                                                                                                                                                                                                                                                                                       |
-| `max_stack_size`               | `"512kb"`  | Max native call stack (recursion depth)                                                                                                                                                                                                                                                                                         |
-| `timeout_ms`                   | `4000`     | Max wall-clock execution time                                                                                                                                                                                                                                                                                                   |
-| `pool_size`                    | `0` (auto) | QuickJS runtime pool size (0 = CPU cores)                                                                                                                                                                                                                                                                                       |
-| `max_script_size`              | `"1mb"`    | Max script source size                                                                                                                                                                                                                                                                                                          |
-| `max_context_size`             | `0` (auto) | Max context JSON size. `0` auto-derives `memory_limit / 8`; explicit values are capped at `memory_limit / 4` (boot fails if exceeded).                                                                                                                                                                                          |
-| `max_ops`                      | `1500`     | Max HTTP + DB operations per execution                                                                                                                                                                                                                                                                                          |
-| `max_concurrent_executions`    | `0` (auto) | Bulkhead: max in-flight executions. `0` auto-derives `pool_size × 16`. Excess load fast-fails `429 OVERLOADED`. Tune to your DB/PgBouncer connection budget.                                                                                                                                                                    |
-| `max_statement_timeout_ms`     | `0` (off)  | Operator ceiling for `db` `statement_timeout`. `0` = no ceiling. Clamps per-request `statement_timeout_ms` (a request `0` becomes this). See [resilience note](docs/design/resilience.md).                                                                                                                                      |
-| `max_concurrent_per_partition` | `0` (off)  | Per-partition fairness (per-pod backstop): max concurrent executions per `X-Partition-Key` (or `partition` field). `0` = off. A key over its share fast-fails `429 PARTITION_OVERLOADED` even when global capacity remains, so one noisy key can't monopolize a pod. Not a global guarantee — the gateway owns global fairness. |
-| `partition_buckets`            | `0` (256)  | Hashed partition buckets (used only when `max_concurrent_per_partition > 0`). More buckets = fewer key collisions.                                                                                                                                                                                                              |
-| `db_breaker_threshold`         | `0` (off)  | Circuit breaker: consecutive `db` connect failures (per `host:port`) that trip the breaker open. `0` = off. While open, `db` requests fast-fail `DB_CIRCUIT_OPEN` instead of waiting on the connect timeout to a dead database.                                                                                                 |
-| `db_breaker_cooldown_ms`       | `0` (5000) | How long the `db` breaker stays open before a half-open probe (used only when `db_breaker_threshold > 0`).                                                                                                                                                                                                                      |
-| `scripts_dir`                  | _(unset)_  | Directory of registered scripts for execute-by-key. Unset = inline `script` only; `key` requests answer `SCRIPT_NOT_FOUND`.                                                                                                                                                                                                     |
+| Field                          | Default       | Description                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------ | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `debug`                        | `false`       | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`api` so localhost/LAN targets (e.g. MinIO) work. Never enable in production.                                                                                                                                                                                          |
+| `error_debug`                  | `false`       | Include `error.debug` (stack traces + raw driver causes) in system-error responses. **Off by default** (secure by default) — the raw cause can carry internal hostnames/driver detail. `meta.trace_id` is always present and the raw cause is always logged server-side, so support can correlate without it.                    |
+| `server.host` / `server.port`  | `127.0.0.1` / `3000` | Bind address and port.                                                                                                                                                                                                                                                                                                   |
+| `memory_limit`                 | `"32mb"`      | Max JS heap per execution                                                                                                                                                                                                                                                                                                       |
+| `max_stack_size`               | `"512kb"`     | Max native call stack (recursion depth)                                                                                                                                                                                                                                                                                         |
+| `timeout_ms`                   | `4000`        | Max wall-clock execution time                                                                                                                                                                                                                                                                                                   |
+| `pool_size`                    | `0` (auto)    | QuickJS runtime pool size (0 = CPU cores)                                                                                                                                                                                                                                                                                       |
+| `max_script_size`              | `"1mb"`       | Max script source size                                                                                                                                                                                                                                                                                                          |
+| `max_context_size`             | `0` (auto)    | Max context JSON size. `0` auto-derives `memory_limit / 8`; explicit values are capped at `memory_limit / 4` (boot fails if exceeded).                                                                                                                                                                                          |
+| `max_ops`                      | `1500`        | Max HTTP + DB operations per execution                                                                                                                                                                                                                                                                                          |
+| `max_output_size`              | `0` (off)     | Max bytes of JSON the handler may return (`0` = bounded only by `memory_limit`). Over the cap fails `422 OUTPUT_TOO_LARGE`. Set in untrusted-script deployments.                                                                                                                                                                |
+| `max_concurrent_executions`    | `0` (auto)    | Bulkhead: max in-flight executions. `0` auto-derives `pool_size × 16`. Excess load fast-fails `429 OVERLOADED`. Tune to your DB/PgBouncer connection budget.                                                                                                                                                                    |
+| `max_concurrent_per_partition` | `0` (off)     | Per-partition fairness (per-pod backstop): max concurrent executions per `X-Partition-Key` (or `partition` field). `0` = off. A key over its share fast-fails `429 PARTITION_OVERLOADED` even when global capacity remains, so one noisy key can't monopolize a pod. Not a global guarantee — the gateway owns global fairness. |
+| `partition_buckets`            | `0` (256)     | Hashed partition buckets (used only when `max_concurrent_per_partition > 0`). More buckets = fewer key collisions.                                                                                                                                                                                                              |
+| `allow_wildcard_hosts`         | `false`       | Honor `allowed_hosts: ["*"]` (removes the host allowlist, leaving only the private-IP filter). Off by default: a `*` matches nothing. Never honored while `debug` is on.                                                                                                                                                        |
+| `scripts_dir`                  | _(unset)_     | Directory of registered scripts for execute-by-key. Unset = inline `script` only; `key` requests answer `SCRIPT_NOT_FOUND`.                                                                                                                                                                                                     |
+| `modules_dir`                  | _(unset)_     | Directory of injectable ES modules for handler `import`. Unset = `import` never resolves. See [ES modules](#es-modules-import--export).                                                                                                                                                                                        |
+| `access_token`                 | _(unset)_     | Shared-secret bearer token gating `/execute` (constant-time compared); `/health` and `/metrics` stay open. Required on a non-loopback bind unless `allow_unauthenticated` is set.                                                                                                                                               |
+| `allow_unauthenticated`        | `false`       | Explicit opt-out: allow a non-loopback bind with no `access_token` (auth terminated upstream). Without it, an exposed tokenless bind **refuses to start** (fail-closed).                                                                                                                                                        |
+| `fabricd_socket`               | _(unset)_     | Path to the `fabricd` egress sidecar's Unix socket. **Required for any driver-backed capability** (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) — `fabricd` holds the `resources` credential table; the box only forwards `config.io` names. Unset + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.                                  |
+| `fabricd_quic`                 | _(unset)_     | Remote `fabricd` over QUIC (alternative to `fabricd_socket`): `{ replicas, server_name, server_cert_pin, auth_token \| auth_token_file }`. The box pins the daemon cert by SHA-256 fingerprint and presents an auth token. See [`docs/design/network-fabric.md`](docs/design/network-fabric.md).                                |
+| `trusted`                      | _(off)_       | Trusted-identity ("nexus edge") mode: `{ enabled, assert_network_isolation, headers, capability_entitlements, quota }`. Derives tenant/user identity from edge-injected headers; refuses an exposed bind unless isolation is asserted. See [`docs/design/multitenant-trust.md`](docs/design/multitenant-trust.md).              |
+| `telemetry`                    | _(off)_       | Tracing/logging: `{ otlp_endpoint, sample_ratio, service_name }`. No `otlp_endpoint` (default) = structured JSON logs only, no OTLP export.                                                                                                                                                                                     |
+| `events`                       | _(off)_       | Per-tenant usage + audit event emission: `{ enabled, buffer }` (default `false` / `4096`). Non-blocking, drop-on-full.                                                                                                                                                                                                          |
 
 Size fields accept `"8mb"`, `"256kb"`, `"1gb"`, or plain numbers in bytes.
 
@@ -721,7 +782,7 @@ HTTP request
           -> call handler(context)
         <- extract JSON result
       <- release runtime to pool (GC first)
-    <- attach meta (sizes, timing, http/db/mail/s3 metrics)
+    <- attach meta (sizes, timing, per-capability metrics)
   <- {data, error, meta} response
 ```
 
