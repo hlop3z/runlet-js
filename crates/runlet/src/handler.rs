@@ -1721,7 +1721,7 @@ mod trusted_pipeline_tests {
         let sink_dyn: Arc<dyn Sink> = sink_concrete;
         let mut app = state(HashMap::new(), None);
         app.events = Some(sink_dyn);
-        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-tenant-scope", "acting")]);
+        let hdrs = headers(&[("x-workspace-id", "ws_a"), ("x-tenant-scope", "acting")]);
         assert_eq!(
             run(&app, hdrs, RequestConfig::default()).await,
             StatusCode::OK
@@ -1758,7 +1758,7 @@ mod trusted_pipeline_tests {
         let mut app = state(HashMap::new(), Some(TenantQuota::new(plans)));
         app.events = Some(sink_dyn);
         let hdrs = headers(&[
-            ("x-tenant-id", "ws_a"),
+            ("x-workspace-id", "ws_a"),
             ("x-tenant-scope", "acting"),
             ("x-tenant-plan", "denied"),
         ]);
@@ -1785,7 +1785,7 @@ mod trusted_pipeline_tests {
     #[tokio::test]
     async fn anonymous_is_forbidden() {
         let app = state(HashMap::new(), None);
-        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-auth-anonymous", "true")]);
+        let hdrs = headers(&[("x-workspace-id", "ws_a"), ("x-auth-anonymous", "true")]);
         assert_eq!(
             run(&app, hdrs, RequestConfig::default()).await,
             StatusCode::FORBIDDEN
@@ -1796,7 +1796,7 @@ mod trusted_pipeline_tests {
     #[tokio::test]
     async fn suspended_is_forbidden() {
         let app = state(HashMap::new(), None);
-        let hdrs = headers(&[("x-tenant-id", "ws_a"), ("x-user-suspended", "true")]);
+        let hdrs = headers(&[("x-workspace-id", "ws_a"), ("x-user-suspended", "true")]);
         assert_eq!(
             run(&app, hdrs, RequestConfig::default()).await,
             StatusCode::FORBIDDEN
@@ -1821,7 +1821,7 @@ mod trusted_pipeline_tests {
         drop(gate.insert("db".to_owned(), "db.write".to_owned()));
         let app = state(gate, None);
         let hdrs = headers(&[
-            ("x-tenant-id", "ws_a"),
+            ("x-workspace-id", "ws_a"),
             ("x-tenant-scope", "acting"),
             ("x-user-entitlements", "mail.send"),
         ]);
@@ -1843,7 +1843,7 @@ mod trusted_pipeline_tests {
         let _ = plans.insert("denied".to_owned(), PlanLimit { max_concurrent: 0 });
         let app = state(HashMap::new(), Some(TenantQuota::new(plans)));
         let hdrs = headers(&[
-            ("x-tenant-id", "ws_a"),
+            ("x-workspace-id", "ws_a"),
             ("x-tenant-scope", "acting"),
             ("x-tenant-plan", "denied"),
         ]);
@@ -1858,7 +1858,7 @@ mod trusted_pipeline_tests {
     async fn permitted_request_executes() {
         let app = state(HashMap::new(), None);
         let hdrs = headers(&[
-            ("x-tenant-id", "ws_a"),
+            ("x-workspace-id", "ws_a"),
             ("x-tenant-scope", "acting"),
             ("x-user-id", "u1"),
         ]);
@@ -1875,7 +1875,7 @@ mod trusted_pipeline_tests {
         let app = state(HashMap::new(), None);
 
         // Absent scope → rejected.
-        let missing = headers(&[("x-tenant-id", "ws_a")]);
+        let missing = headers(&[("x-workspace-id", "ws_a")]);
         assert_eq!(
             run(&app, missing, RequestConfig::default()).await,
             StatusCode::FORBIDDEN,
@@ -1883,7 +1883,7 @@ mod trusted_pipeline_tests {
         );
 
         // Non-`acting` scope → rejected.
-        let wrong = headers(&[("x-tenant-id", "ws_a"), ("x-tenant-scope", "home")]);
+        let wrong = headers(&[("x-workspace-id", "ws_a"), ("x-tenant-scope", "home")]);
         assert_eq!(
             run(&app, wrong, RequestConfig::default()).await,
             StatusCode::FORBIDDEN,
@@ -1891,7 +1891,7 @@ mod trusted_pipeline_tests {
         );
 
         // `acting` scope → proceeds (executes the deterministic script).
-        let ok = headers(&[("x-tenant-id", "ws_a"), ("x-tenant-scope", "acting")]);
+        let ok = headers(&[("x-workspace-id", "ws_a"), ("x-tenant-scope", "acting")]);
         assert_eq!(
             run(&app, ok, RequestConfig::default()).await,
             StatusCode::OK,

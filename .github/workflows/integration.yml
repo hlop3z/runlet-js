@@ -1,6 +1,6 @@
 name: Integration
 
-# The live-backend suite (test_simple.py). Brings up the deterministic backends
+# The live-backend suite (tests/test_simple.py). Brings up the deterministic backends
 # via docker compose; the Python harness starts its own server (cargo run) and
 # self-skips any backend it can't probe. The auth providers (keycloak/zitadel)
 # are intentionally NOT started here (slow boot + PAT bootstrap) — those paths
@@ -53,7 +53,7 @@ jobs:
         run: cargo build -p runlet
 
       - name: Run integration suite
-        run: python test_simple.py
+        run: python tests/test_simple.py
 
       - name: Dump backend logs on failure
         if: failure()

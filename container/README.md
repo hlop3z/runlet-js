@@ -94,8 +94,23 @@ jsbox runs your `.js` as-is in QuickJS; `tsconfig.json` is editor-only
 global `handler`). The `tests/` examples are excluded for that reason.
 
 > `api`, `db`, `mail`, and `s3` are typed as always-present for convenience, but
-> at runtime each exists only when you send its `config` block — guard optional
-> ones with `typeof`.
+> at runtime each exists only when the request enables it — guard optional ones
+> with `typeof`. `api` is enabled by `config.allowed_hosts` and `s3` by
+> `config.s3`; the driver-backed capabilities are enabled by naming a resource
+> in `config.io` (next section).
+
+## Driver capabilities need the `fabricd` sidecar
+
+`db`, `mongo`, `mail`, `redis`, `amq`, and `auth` are brokered: the request names a
+**logical resource** — e.g. `"config": {"io": {"db": ["local-db"]}}` — and the
+`fabricd` sidecar resolves that name against its own credential table and performs
+the I/O. Endpoints and passwords never appear in the request or in the box.
+
+- Copy `fabricd.example.json` → `fabricd.json` (gitignored) and fill in real
+  values; run `fabricd` next to the box (see the commented service in
+  `docker-compose.yml` and [docs/deployment.md §5](../docs/deployment.md)).
+- Without a sidecar, a request naming a driver resource gets
+  `503 EGRESS_UNAVAILABLE`. Deterministic scripts, `api`, and `s3` need no sidecar.
 
 ## Notes
 

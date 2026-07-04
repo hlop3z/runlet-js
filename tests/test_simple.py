@@ -24,11 +24,11 @@ PGBOUNCER_PORT = int(os.environ.get("PGBOUNCER_PORT", "6432"))
 CR_HOST = os.environ.get("CR_HOST", "localhost")
 CR_PORT = int(os.environ.get("CR_PORT", "26257"))
 
-# Local httpbin clone (`httpbin` service in docker-compose) — the HTTP `api` tests run
+# Local httpbin clone (`httpbin` service in docker-compose) â€” the HTTP `api` tests run
 # against it so the suite never depends on httpbin.org uptime. go-httpbin echoes
 # headers/args as ARRAYS of strings, hence the [0] indexing in assertions. Reaching a
 # localhost/LAN target needs the server started with `debug: true` (SSRF private-IP
-# block) — the harness-generated config sets it.
+# block) â€” the harness-generated config sets it.
 HTTPBIN_URL = os.environ.get("HTTPBIN_URL", "http://localhost:8095").rstrip("/")
 HTTPBIN_HOST = urlparse(HTTPBIN_URL).hostname or "localhost"
 
@@ -114,7 +114,7 @@ def _post(body: dict, headers: dict | None = None) -> dict | None:
 def _post_status(url: str, body: dict, headers: dict | None = None):
     """POST to an explicit URL, returning `(http_status, parsed_envelope)`. Unlike `_post`
     (which targets BASE_URL and hides the status), this keeps the status so a caller can assert
-    on the code — used by the trusted-mode box which runs on its own port."""
+    on the code â€” used by the trusted-mode box which runs on its own port."""
     data = json.dumps(body).encode()
     hdrs = {"Content-Type": "application/json"}
     if headers:
@@ -279,7 +279,7 @@ def test_http_api(t: Runner):
     # A `*` wildcard host is intentionally INERT in SSRF-relaxed debug mode. The box runs with
     # debug:true so these api tests can reach the private-IP httpbin; under that relaxation `*`
     # would collapse the host allowlist down to the IP filter alone, so it is never honored
-    # (host.rs: `allow_wildcard_hosts && !allow_private`). The request is blocked in-band → the
+    # (host.rs: `allow_wildcard_hosts && !allow_private`). The request is blocked in-band â†’ the
     # private host is unreachable via `*` (status 0), even though a specific-host config reaches it.
     t.test("wildcard host inert under debug (private-IP relax) -> blocked",
            h(f"var r = api.get('{url}/get', {{foo:'bar'}}); return json({{status:r.status}}, null);", config=wildcard),
@@ -335,7 +335,7 @@ NATS_CONFIG = {"backend": "nats", "host": NATS_HOST, "port": NATS_PORT}
 # `config.io`, and the `fabricd` sidecar resolves them against its own `resources` table. The
 # harness therefore (1) builds that table from the env endpoints + the per-test variants below,
 # (2) starts `fabricd` with it, and (3) sends names, never configs. A down backend just makes its
-# section self-skip (the live probe through the box fails) — the resource still exists in the table.
+# section self-skip (the live probe through the box fails) â€” the resource still exists in the table.
 
 def _io(kind: str, name: str) -> dict:
     """A request `config.io` selecting one logical resource of `kind` (e.g. `{"io":{"db":["pg"]}}`)."""
@@ -420,7 +420,7 @@ SETUP_SQL = """
 
 
 def _db_available(name: str) -> bool:
-    """Check if the named `db` resource is reachable (probes through the box → fabricd)."""
+    """Check if the named `db` resource is reachable (probes through the box â†’ fabricd)."""
     resp = _post(h("db.query('SELECT 1 as ok'); return json('up', null);", config=_db_io(name)))
     return resp is not None and resp.get("data") == "up"
 
@@ -483,7 +483,7 @@ def test_db_engine(t: Runner, label: str, db: str):
            h("var r = db.query('SELECT num FROM test_types'); return json(typeof r.rows[0].num, null);", config=_db_io(db)),
            data_eq("string"))
 
-    # INT4 as number (CockroachDB SERIAL is INT8 → string)
+    # INT4 as number (CockroachDB SERIAL is INT8 â†’ string)
     t.test(f"{label}: int4 is number",
            h("var r = db.query('SELECT id FROM test_types'); return json(typeof r.rows[0].id, null);", config=_db_io(db)),
            data_eq("string") if is_crdb else data_eq("number"))
@@ -586,7 +586,7 @@ def _mongo_available(name: str) -> bool:
 
 
 def test_mongo(t: Runner):
-    """Mongo capability — string `_id`s sidestep the ObjectId-filter caveat (a hex-string
+    """Mongo capability â€” string `_id`s sidestep the ObjectId-filter caveat (a hex-string
     filter is a BSON string, not an ObjectId, so explicit string ids match cleanly)."""
     t.section("Mongo (document store)")
     cfg = _mongo_io("mongo")
@@ -702,7 +702,7 @@ def test_registry_hardening(t: Runner):
     """Actively attack the execute-by-key surface: traversal, type confusion, edges."""
     t.section("Registry hardening (adversarial)")
 
-    # Path traversal via key must never escape the registry — `key` is a map lookup,
+    # Path traversal via key must never escape the registry â€” `key` is a map lookup,
     # never a filesystem path at request time. Each of these is a clean 404, not a
     # file read, a 500, or a panic.
     for evil in ["../greet", "../../../etc/passwd", "..\\..\\greet", "/etc/passwd",
@@ -746,7 +746,7 @@ def test_registry_hardening(t: Runner):
            {"script": "function handler(){}", "key": "greet"},
            lambda r: r["meta"]["key"] == "greet" and r["error"]["code"] == "SCRIPT_XOR_KEY")
 
-    # Registered scripts must travel the IDENTICAL engine path as inline — prove the
+    # Registered scripts must travel the IDENTICAL engine path as inline â€” prove the
     # failure modes match by registering nothing special and exercising a known script.
     probe = _post({"key": "greet"})
     if not (probe is not None and probe.get("data") == "hello world"):
@@ -772,7 +772,7 @@ def test_isolation_under_concurrency(t: Runner):
     # a request would observe another's value. Run many in parallel and check every one
     # sees only its own id.
     def one(i):
-        # Retry on a bulkhead 429 — this probes isolation, not capacity.
+        # Retry on a bulkhead 429 â€” this probes isolation, not capacity.
         for _ in range(20):
             body = h(f"globalThis.__leak = {i}; return json(globalThis.__leak, null);")
             r = _post(body)
@@ -828,7 +828,7 @@ def test_bulkhead(t: Runner):
     print(f"  \033[36mINFO\033[0m burst outcomes: {dict(Counter(outcomes))}")
 
     # The bulkhead only sheds load when the configured bound is below the burst size.
-    # If the server runs the default (auto, high) bound, nothing is shed — probe, don't fail.
+    # If the server runs the default (auto, high) bound, nothing is shed â€” probe, don't fail.
     if "429" not in outcomes:
         print(f"  \033[33mPROBE\033[0m bulkhead not exercised (no 429s; bound >= burst). outcomes={set(outcomes)}\n")
     else:
@@ -872,7 +872,7 @@ def test_partition_fairness(t: Runner):
     partition_shed = sum(1 for c in noisy_codes if c == "PARTITION_OVERLOADED")
     good_ok = sum(1 for code, data in good_outcomes if code is None and data == "ok")
 
-    # Tier 5 is opt-in; if the server has no per-partition cap, nothing sheds — probe + skip
+    # Tier 5 is opt-in; if the server has no per-partition cap, nothing sheds â€” probe + skip
     # the fairness asserts, but still check the meta/header plumbing below.
     if partition_shed > 0:
         t.test("noisy partition sheds on its own cap (PARTITION_OVERLOADED)",
@@ -880,7 +880,7 @@ def test_partition_fairness(t: Runner):
         t.test("good partition still gets through under the noisy flood",
                h("return json(1,null);"), lambda _r: good_ok > 0)
     else:
-        print("  \033[33mPROBE\033[0m Tier 5 not active (no max_concurrent_per_partition) — asserts skipped\n")
+        print("  \033[33mPROBE\033[0m Tier 5 not active (no max_concurrent_per_partition) â€” asserts skipped\n")
 
     # Partition-key plumbing works regardless of whether the cap is set:
     r = _post({"script": fast}, headers={"X-Partition-Key": "acme"})
@@ -973,18 +973,18 @@ def test_esm(t: Runner):
     t.section("ES modules (export / import)")
 
     # A classic script handler still works (script-mode is detected by the absence of a
-    # top-level `export`) — the back-compat guarantee.
+    # top-level `export`) â€” the back-compat guarantee.
     t.test("classic script handler still runs",
            h_raw("function handler(ctx){ return json(ctx.a * 2, null); }", {"a": 21}),
            data_eq(42))
 
-    # `export default function handler` — the canonical ESM shape.
+    # `export default function handler` â€” the canonical ESM shape.
     t.test("export default handler",
            h_raw("export default function handler(ctx){ return json('hi:'+ctx.name, null); }",
                  {"name": "Ada"}),
            data_eq("hi:Ada"))
 
-    # `export function handler` — named export also resolves.
+    # `export function handler` â€” named export also resolves.
     t.test("named export handler",
            h_raw("export function handler(ctx){ return json('named', null); }"),
            data_eq("named"))
@@ -1002,7 +1002,7 @@ def test_esm(t: Runner):
                  "export default function handler(ctx){ return json(TAX_RATE, null); }"),
            data_eq(0.1))
 
-    # Importing an unregistered specifier fails to resolve — the security property: a script
+    # Importing an unregistered specifier fails to resolve â€” the security property: a script
     # can reach only registered modules, never an arbitrary path.
     t.test("import of unknown module -> MODULE_NOT_FOUND",
            h_raw("import { x } from 'no/such/module';\n"
@@ -1022,7 +1022,7 @@ def test_esm(t: Runner):
 def test_hasura(t: Runner):
     """The `hasura/client` injectable module (modules/hasura/client.mjs). Hermetic: each
     handler stubs `globalThis.api` so the module's request-shaping and error-handling are
-    exercised without a live Hasura — the module reads whatever `api.post` returns."""
+    exercised without a live Hasura â€” the module reads whatever `api.post` returns."""
     t.section("Hasura module (hasura/client)")
 
     # Probe: the module must be registered (merged modules_dir). Self-skip otherwise so a
@@ -1068,7 +1068,7 @@ def test_hasura(t: Runner):
                "}"),
            data_eq({"auth": "Bearer jwt123", "hasSecret": False}))
 
-    # GraphQL error inside an HTTP 200 → query() throws with .code + .graphql attached.
+    # GraphQL error inside an HTTP 200 â†’ query() throws with .code + .graphql attached.
     t.test("GraphQL error in a 200 body throws (not silent)",
            h_raw(
                "import { hasura } from 'hasura/client';\n"
@@ -1081,7 +1081,7 @@ def test_hasura(t: Runner):
                "}"),
            data_eq({"msg": "boom", "code": "validation-failed", "n": 1}))
 
-    # Transport failure (api's in-band status:0) → raw() normalizes to an errors envelope,
+    # Transport failure (api's in-band status:0) â†’ raw() normalizes to an errors envelope,
     # query() throws carrying the transport code.
     t.test("transport failure normalizes + throws",
            h_raw(
@@ -1096,7 +1096,7 @@ def test_hasura(t: Runner):
                "}"),
            data_eq({"envCode": "HTTP_CONNECT", "threw": "HTTP_CONNECT"}))
 
-    # No endpoint anywhere (no opts, no $sys.env) → a clear, actionable throw.
+    # No endpoint anywhere (no opts, no $sys.env) â†’ a clear, actionable throw.
     t.test("missing endpoint throws a helpful error",
            h_raw(
                "import { hasura } from 'hasura/client';\n"
@@ -1109,23 +1109,23 @@ def test_hasura(t: Runner):
 
 def test_circuit_breaker(t: Runner):
     """Tier 3: repeated connect failures to a dead db target trip the breaker, after which
-    requests to that target fast-fail DB_CIRCUIT_OPEN instead of waiting on the timeout —
+    requests to that target fast-fail DB_CIRCUIT_OPEN instead of waiting on the timeout â€”
     and a healthy target is unaffected."""
     t.section("Circuit breaker (Tier 3)")
     # The db breaker moved to `fabricd` with the trust flip (Step 5) and is not yet implemented
-    # there, so repeated connect failures no longer trip `DB_CIRCUIT_OPEN` — this test self-skips
+    # there, so repeated connect failures no longer trip `DB_CIRCUIT_OPEN` â€” this test self-skips
     # until the daemon grows a breaker. `db-broken` is the operator's unreachable resource.
     bad = "db-broken"
     script = "db.query('SELECT 1'); return json('ok', null);"
 
     codes = [_err_code(_post(h(script, config=_db_io(bad)))) for _ in range(7)]
     if "DB_CIRCUIT_OPEN" not in codes:
-        print("  \033[33mPROBE\033[0m breaker not active (moved to fabricd, not yet implemented) — skipping\n")
+        print("  \033[33mPROBE\033[0m breaker not active (moved to fabricd, not yet implemented) â€” skipping\n")
         return
 
     t.test("breaker trips DB_CIRCUIT_OPEN after repeated connect failures",
            h("return json(1,null);"), lambda _r: "DB_CIRCUIT_OPEN" in codes)
-    # An open breaker fast-fails — no connect attempt, so well under any connect wait.
+    # An open breaker fast-fails â€” no connect attempt, so well under any connect wait.
     start = time.time()
     r = _post(h(script, config=_db_io(bad)))
     elapsed = time.time() - start
@@ -1140,7 +1140,7 @@ def test_circuit_breaker(t: Runner):
 
 def test_statement_timeout_clamp(t: Runner, db: str):
     """Prove the operator ceiling clamps a resource's statement_timeout it cannot raise (Tier 0).
-    The clamp now runs in `fabricd` (`max_statement_timeout_ms`); `db` is the engine base name —
+    The clamp now runs in `fabricd` (`max_statement_timeout_ms`); `db` is the engine base name â€”
     its `-unlimited` (0) and `-huge` (60000) variants are clamped to the daemon ceiling."""
     t.section("statement_timeout clamp (Tier 0)")
 
@@ -1149,10 +1149,10 @@ def test_statement_timeout_clamp(t: Runner, db: str):
         return r is not None and r["data"] is None and r["error"] is not None
 
     # The `-unlimited` resource asks for no timeout. If fabricd's ceiling is active, the 2s sleep is
-    # killed well before it finishes. If no ceiling is configured, the sleep completes — probe and
+    # killed well before it finishes. If no ceiling is configured, the sleep completes â€” probe and
     # skip rather than fail.
     if not killed(db + "-unlimited"):
-        print("  \033[33mPROBE\033[0m clamp not active (fabricd has no max_statement_timeout_ms) — skipping\n")
+        print("  \033[33mPROBE\033[0m clamp not active (fabricd has no max_statement_timeout_ms) â€” skipping\n")
         return
     t.test("resource statement_timeout=0 (unlimited) is clamped + killed",
            h("return json(1,null);"), lambda _r: True)
@@ -1170,12 +1170,12 @@ def test_pgbouncer_edges(t: Runner, db: str, direct: bool):
     t.section(f"Connection-pool edges ({label})")
 
     # (1) statement_timeout enforcement. jsbox applies it as a session-level `SET` at
-    # connect (db.rs). On a direct connection this is a hard guarantee — assert it. Behind
+    # connect (db.rs). On a direct connection this is a hard guarantee â€” assert it. Behind
     # PgBouncer transaction mode it is BEST-EFFORT: the SET binds to one server connection
     # and a later autocommit statement may run on a different one, so we probe and record
     # rather than assert. (A startup parameter would be robust but PgBouncer refuses it:
     # "unsupported startup parameter in options". The robust path through a txn-mode pooler
-    # is a server-side role default — see docs/design/pooled-capabilities.md.) Either way
+    # is a server-side role default â€” see docs/design/pooled-capabilities.md.) Either way
     # jsbox's wall-clock interrupt cannot cancel a blocking libpq call, so the DB-side cap
     # is the only thing that stops a slow query.
     fast = db + "-fast"
@@ -1186,13 +1186,13 @@ def test_pgbouncer_edges(t: Runner, db: str, direct: bool):
         t.test(f"{label}: statement_timeout enforced (sleep killed)",
                h("return json(1,null);"), lambda _r: enforced)
     else:
-        verdict = "ENFORCED" if enforced else "NOT ENFORCED — sleep ran full"
+        verdict = "ENFORCED" if enforced else "NOT ENFORCED â€” sleep ran full"
         print(f"  \033[33mPROBE\033[0m {label}: statement_timeout via SET -> {verdict} "
               f"(best-effort in txn pooling; use a server-side role default for a guarantee)")
         t.test(f"{label}: server responsive after long query",
                h("return json('alive', null);"), data_eq("alive"))
 
-    # (2) Explicit transactions pin to one server connection in txn mode — multi-step
+    # (2) Explicit transactions pin to one server connection in txn mode â€” multi-step
     # work and session-scoped temp tables MUST hold within begin/commit. This is the
     # safe pattern and must pass on both.
     t.test(f"{label}: temp table within one transaction",
@@ -1217,7 +1217,7 @@ def test_pooler_query_timeout(t: Runner, db: str):
     """Tier 4: PgBouncer's own query_timeout is an INDEPENDENT backstop. Through a
     transaction-mode pooler the session `SET statement_timeout` is best-effort and can be
     lost; query_timeout (2s, set on the pooler) guarantees a runaway query is still killed
-    — and below jsbox's 4s wall-clock deadline (Tier 2). See docs/design/resilience.md."""
+    â€” and below jsbox's 4s wall-clock deadline (Tier 2). See docs/design/resilience.md."""
     t.section("Pooler query_timeout (Tier 4)")
 
     # pg_sleep(3) outlives the 2s pooler ceiling but is under jsbox's 4s wall clock, so the
@@ -1229,7 +1229,7 @@ def test_pooler_query_timeout(t: Runner, db: str):
     killed = r is not None and r["data"] is None and r["error"] is not None
 
     # No kill means neither the SET nor a pooler query_timeout fired (sleep ran ~3s under
-    # jsbox's 4s budget) — the pooler has no ceiling configured. Probe + skip rather than fail.
+    # jsbox's 4s budget) â€” the pooler has no ceiling configured. Probe + skip rather than fail.
     if not killed:
         print(f"  \033[33mPROBE\033[0m pooler did not terminate the 3s query (query_timeout unset?) "
               f"elapsed={elapsed:.1f}s\n")
@@ -1343,7 +1343,7 @@ def test_auth_provider(t: Runner, label: str, token: str, has_introspect: bool):
            h("return json(typeof auth, null);"),
            data_eq("undefined"))
 
-    # Valid token: OIDC discovery + bearer userinfo → claims.
+    # Valid token: OIDC discovery + bearer userinfo â†’ claims.
     t.test(f"{label}: user_info(valid) -> ok:true",
            h("return json(auth.user_info(ctx.token).ok, null);", ctx, cfg),
            data_eq(True))
@@ -1351,7 +1351,7 @@ def test_auth_provider(t: Runner, label: str, token: str, has_introspect: bool):
            h("var u = auth.user_info(ctx.token); return json(u.ok && typeof u.claims.sub === 'string', null);", ctx, cfg),
            data_eq(True))
 
-    # Bad token is the caller's business flow → in-band, never thrown.
+    # Bad token is the caller's business flow â†’ in-band, never thrown.
     t.test(f"{label}: user_info(bad) -> in-band, no throw",
            h("return json(auth.user_info('garbage-token-value'), null);", config=cfg),
            lambda r: r["data"]["ok"] is False
@@ -1385,13 +1385,13 @@ def test_auth_provider(t: Runner, label: str, token: str, has_introspect: bool):
 def discover_auth() -> tuple[dict, list]:
     """Talk **directly** to the identity providers (before the box/fabricd start) to mint tokens +
     introspection client creds. Returns `(auth_resources, providers)` where `auth_resources` is the
-    name→binding map to merge into the `fabricd` table (so credentials are present at startup), and
+    nameâ†’binding map to merge into the `fabricd` table (so credentials are present at startup), and
     `providers` is `[(label, token, has_introspect), ...]` for the reachable ones.
     """
     auth_resources: dict = {}
     providers: list = []
 
-    # Keycloak — mint a token + a confidential client live.
+    # Keycloak â€” mint a token + a confidential client live.
     if _discovery_ok(KEYCLOAK_ISSUER):
         kc_token = _keycloak_token()
         if kc_token:
@@ -1401,9 +1401,9 @@ def discover_auth() -> tuple[dict, list]:
         else:
             print("\n  \033[33mSKIP\033[0m Keycloak auth tests (reachable but token mint failed)\n")
     else:
-        print("\n  \033[33mSKIP\033[0m Keycloak auth tests (not running — use: docker compose up -d keycloak)\n")
+        print("\n  \033[33mSKIP\033[0m Keycloak auth tests (not running â€” use: docker compose up -d keycloak)\n")
 
-    # ZITADEL — needs a service-account PAT (introspection needs an API app, so it is
+    # ZITADEL â€” needs a service-account PAT (introspection needs an API app, so it is
     # exercised on Keycloak; ZITADEL covers discovery + userinfo + the throw path).
     zt_token = _zitadel_token()
     if zt_token and _discovery_ok(ZITADEL_ISSUER):
@@ -1412,7 +1412,7 @@ def discover_auth() -> tuple[dict, list]:
     elif zt_token:
         print("\n  \033[33mSKIP\033[0m Zitadel auth tests (PAT set but issuer unreachable)\n")
     else:
-        print("\n  \033[33mSKIP\033[0m Zitadel auth tests (no ZITADEL_PAT — see docker-compose.yml)\n")
+        print("\n  \033[33mSKIP\033[0m Zitadel auth tests (no ZITADEL_PAT â€” see docker-compose.yml)\n")
 
     return auth_resources, providers
 
@@ -1441,7 +1441,7 @@ def _start_servers(resources: dict) -> list:
     live in a gitignored scratch dir so this doesn't change `task run` behavior. Returns the
     started processes (caller terminates them).
     """
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".test-run")
     os.makedirs(run_dir, exist_ok=True)
     # Merge the test-fixture modules (tests/modules) with the shipped operator modules
@@ -1457,7 +1457,7 @@ def _start_servers(resources: dict) -> list:
 
     socket = os.path.join(run_dir, "fabricd.sock")
     # fabricd: the operator credential table + the Tier-0 statement_timeout ceiling. Credentials
-    # live ONLY here — the box never sees them.
+    # live ONLY here â€” the box never sees them.
     fabricd_cfg = {"socket": socket, "max_statement_timeout_ms": 800, "resources": resources}
     with open(os.path.join(run_dir, "fabricd.json"), "w", encoding="utf-8") as fh:
         json.dump(fabricd_cfg, fh)
@@ -1473,7 +1473,7 @@ def _start_servers(resources: dict) -> list:
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(box_cfg, fh)
 
-    # Build both up front, then launch the binaries directly — two concurrent `cargo run`
+    # Build both up front, then launch the binaries directly â€” two concurrent `cargo run`
     # invocations would race on the target/ build lock.
     subprocess.run(["cargo", "build", "-p", "fabricd", "-p", "runlet"], cwd=repo, check=True)
     bindir = os.path.join(repo, "target", "debug")
@@ -1495,10 +1495,10 @@ def _start_servers(resources: dict) -> list:
 
 def _start_trusted_box(port: int = 3010):
     """Start a dedicated `runlet` in trusted-header mode on a loopback port, for the N5 acting-org
-    gate. No `fabricd` is needed — the gate fires before any egress session, and the probe script is
+    gate. No `fabricd` is needed â€” the gate fires before any egress session, and the probe script is
     deterministic. Loopback needs no `assert_network_isolation`. Returns `(proc, base_url)` or
     `(None, None)` if the box could not be built/started (the caller self-skips)."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".test-run", "trusted")
     os.makedirs(run_dir, exist_ok=True)
     cfg = {"server": {"host": "127.0.0.1", "port": port}, "trusted": {"enabled": True}}
@@ -1513,7 +1513,7 @@ def _start_trusted_box(port: int = 3010):
         [binpath], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     url = f"http://127.0.0.1:{port}/execute"
     probe = h("return json(1, null);")
-    acting = {"x-tenant-id": "ws_probe", "x-tenant-scope": "acting"}
+    acting = {"x-workspace-id": "ws_probe", "x-tenant-scope": "acting"}
     for _ in range(40):
         st, _r = _post_status(url, probe, acting)
         if st is not None:
@@ -1530,11 +1530,11 @@ def test_trusted_acting_scope(t: Runner):
     t.section("Trusted-mode acting-org assurance (nexus N5)")
     proc, url = _start_trusted_box()
     if proc is None:
-        print("  \033[33mSKIP\033[0m trusted-mode box failed to build/start — asserts skipped\n")
+        print("  \033[33mSKIP\033[0m trusted-mode box failed to build/start â€” asserts skipped\n")
         return
     try:
         script = h("return json(1, null);")
-        tenant = {"x-tenant-id": "ws_a"}
+        tenant = {"x-workspace-id": "ws_a"}
 
         st, r = _post_status(url, script, {**tenant, "x-tenant-scope": "acting"})
         t.check("acting-org request executes (200, data == 1)",
@@ -1560,12 +1560,12 @@ def _start_telemetry_box(port: int = 3011):
     listening on. Exercises three things at once: W3C `traceparent` propagation into
     `meta.trace_id`, fail-open export (the request must still succeed with the collector down), and
     structured JSON logs on stdout. Returns `(proc, url, log_path)` or `(None, None, None)`."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".test-run", "telemetry")
     os.makedirs(run_dir, exist_ok=True)
     cfg = {
         "server": {"host": "127.0.0.1", "port": port},
-        # Nothing listens on :4317 — the tonic channel is lazy, so export just fails in the
+        # Nothing listens on :4317 â€” the tonic channel is lazy, so export just fails in the
         # background (drop-on-full) while requests proceed (fail-open, design D6).
         "telemetry": {
             "otlp_endpoint": "http://127.0.0.1:4317",
@@ -1602,7 +1602,7 @@ def test_telemetry_tracing(t: Runner):
     t.section("OpenTelemetry tracing + structured logs")
     proc, url, log_path = _start_telemetry_box()
     if proc is None:
-        print("  \033[33mSKIP\033[0m telemetry box failed to build/start — asserts skipped\n")
+        print("  \033[33mSKIP\033[0m telemetry box failed to build/start â€” asserts skipped\n")
         return
     try:
         script = h("return json(1, null);")
@@ -1616,7 +1616,7 @@ def test_telemetry_tracing(t: Runner):
                 st == 200 and tid == tp_trace)
 
         # 2. No traceparent: a fresh box-rooted 32-hex trace id, and the request still succeeds
-        #    (fail-open — the OTLP collector is down).
+        #    (fail-open â€” the OTLP collector is down).
         st2, r2 = _post_status(url, script)
         tid2 = (r2 or {}).get("meta", {}).get("trace_id", "")
         t.check("box starts its own trace when no traceparent (fail-open success)",
@@ -1648,7 +1648,7 @@ def _start_events_box(port: int = 3012):
     """Start a dedicated trusted-mode `runlet` with per-tenant events enabled, capturing stdout so
     the test can read the emitted usage/audit event stream. Returns `(proc, url, log_path)` or
     `(None, None, None)`."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".test-run", "events")
     os.makedirs(run_dir, exist_ok=True)
     cfg = {
@@ -1669,7 +1669,7 @@ def _start_events_box(port: int = 3012):
     url = f"http://127.0.0.1:{port}/execute"
     probe = h("return json(1, null);")
     for _ in range(40):
-        st, _r = _post_status(url, probe, {"x-tenant-id": "ws_probe", "x-tenant-scope": "acting"})
+        st, _r = _post_status(url, probe, {"x-workspace-id": "ws_probe", "x-tenant-scope": "acting"})
         if st is not None:
             return proc, url, log_path
         time.sleep(0.5)
@@ -1702,15 +1702,15 @@ def test_per_tenant_events(t: Runner):
     t.section("Per-tenant usage + audit events")
     proc, url, log_path = _start_events_box()
     if proc is None:
-        print("  \033[33mSKIP\033[0m events box failed to build/start — asserts skipped\n")
+        print("  \033[33mSKIP\033[0m events box failed to build/start â€” asserts skipped\n")
         return
     try:
         script = h("return json(1, null);")
-        # Executed request (acting scope) → usage + allowed audit.
-        st, _r = _post_status(url, script, {"x-tenant-id": "ws_ev", "x-tenant-scope": "acting"})
+        # Executed request (acting scope) â†’ usage + allowed audit.
+        st, _r = _post_status(url, script, {"x-workspace-id": "ws_ev", "x-tenant-scope": "acting"})
         t.check("acting request executes (200)", st == 200)
-        # Denied request (no acting scope) → denied audit, no usage.
-        st2, _r2 = _post_status(url, script, {"x-tenant-id": "ws_ev"})
+        # Denied request (no acting scope) â†’ denied audit, no usage.
+        st2, _r2 = _post_status(url, script, {"x-workspace-id": "ws_ev"})
         t.check("missing scope rejected (403)", st2 == 403)
 
         time.sleep(0.6)  # let the writer task flush
@@ -1739,7 +1739,7 @@ def main():
     procs: list = []
 
     # Auth discovery talks DIRECTLY to the identity providers (no box), so it must run BEFORE
-    # fabricd starts — the minted introspection client creds have to be in fabricd's resource table
+    # fabricd starts â€” the minted introspection client creds have to be in fabricd's resource table
     # at startup (the box never carries them).
     auth_resources, auth_providers = discover_auth()
 
@@ -1770,41 +1770,41 @@ def main():
     test_esm(t)
     test_hasura(t)
 
-    # Database tests — only if the backend is reachable (probed by resource name through fabricd).
+    # Database tests â€” only if the backend is reachable (probed by resource name through fabricd).
     if _db_available("pg"):
         test_db_engine(t, "PostgreSQL", "pg")
         test_pgbouncer_edges(t, "pg", direct=True)
         test_statement_timeout_clamp(t, "pg")
         test_circuit_breaker(t)
     else:
-        print("\n  \033[33mSKIP\033[0m PostgreSQL tests (not running — use: docker compose up -d)\n")
+        print("\n  \033[33mSKIP\033[0m PostgreSQL tests (not running â€” use: docker compose up -d)\n")
 
-    # Same db suite through PgBouncer (transaction pooling) — proves the per-request
+    # Same db suite through PgBouncer (transaction pooling) â€” proves the per-request
     # connect model works unchanged behind a pooler (docs/design/pooled-capabilities.md).
     if _db_available("pgbouncer"):
         test_db_engine(t, "PgBouncer", "pgbouncer")
         test_pgbouncer_edges(t, "pgbouncer", direct=False)
         test_pooler_query_timeout(t, "pgbouncer")
     else:
-        print("\n  \033[33mSKIP\033[0m PgBouncer tests (not running — use: docker compose up -d pgbouncer)\n")
+        print("\n  \033[33mSKIP\033[0m PgBouncer tests (not running â€” use: docker compose up -d pgbouncer)\n")
 
     if _db_available("cockroach"):
         test_db_engine(t, "CockroachDB", "cockroach")
     else:
-        print("\n  \033[33mSKIP\033[0m CockroachDB tests (not running — use: docker compose up -d)\n")
+        print("\n  \033[33mSKIP\033[0m CockroachDB tests (not running â€” use: docker compose up -d)\n")
 
-    # Mongo + NATS — only if their containers are running
+    # Mongo + NATS â€” only if their containers are running
     if _mongo_available("mongo"):
         test_mongo(t)
     else:
-        print("\n  \033[33mSKIP\033[0m Mongo tests (not running — use: docker compose up -d mongo)\n")
+        print("\n  \033[33mSKIP\033[0m Mongo tests (not running â€” use: docker compose up -d mongo)\n")
 
     if _nats_available("nats"):
         test_nats(t)
     else:
-        print("\n  \033[33mSKIP\033[0m NATS tests (not running — use: docker compose up -d nats)\n")
+        print("\n  \033[33mSKIP\033[0m NATS tests (not running â€” use: docker compose up -d nats)\n")
 
-    # Auth tests — for whichever providers were reachable at discovery (before startup).
+    # Auth tests â€” for whichever providers were reachable at discovery (before startup).
     run_auth_tests(t, auth_providers)
 
     # Trusted-mode acting-org gate (nexus N5): needs its own box in trusted mode. Only when this

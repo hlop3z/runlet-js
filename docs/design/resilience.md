@@ -130,7 +130,7 @@ targets is a dead/unreachable target, where Tier 2's deadline already bounds a _
 query. It is per-daemon like the bulkhead is per-pod: each `fabricd` learns the target's
 health independently, the right granularity since connect failures are observed locally.
 
-Measured with `stress_breaker_esm.py` (16 concurrent against a black-holed DB whose TCP SYN
+Measured with `tests/stress_breaker_esm.py` (16 concurrent against a black-holed DB whose TCP SYN
 is dropped so every connect pays the 5 s timeout; bulkhead sized to concurrency so the
 breaker is the only variable):
 
@@ -237,9 +237,9 @@ The Tier 2 design is where async-DB code most commonly goes wrong. The rules it 
    isolated to a blocking task — any async refactor must respect this and keep the JS context
    off the async boundary.
 
-## Validation: A/B stress testing (`stress_test.py`)
+## Validation: A/B stress testing (`tests/stress_test.py`)
 
-The model is measured, not trusted on reasoning alone. `stress_test.py` manages the server
+The model is measured, not trusted on reasoning alone. `tests/stress_test.py` manages the server
 lifecycle itself (one variant at a time, so config is the only variable), floods `/execute`
 with concurrent slow queries through PgBouncer, and interleaves a "victim" — a well-behaved
 partition's normal fast query — to measure noisy-neighbor impact.

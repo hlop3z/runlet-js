@@ -226,7 +226,7 @@ trusts blindly. Full model: [multitenant-trust.md](design/multitenant-trust.md).
   flag is your assertion — enforced out of band with a k8s `NetworkPolicy` — that only the
   edge can reach the bind. There is no TLS/JWT fallback once headers are trusted, so
   isolation is the whole security story.
-- **Headers.** Defaults: `x-tenant-id`, `x-user-id`, `x-user-roles`,
+- **Headers.** Defaults: `x-workspace-id`, `x-user-id`, `x-user-roles`,
   `x-user-entitlements`, `x-user-suspended`, `x-auth-anonymous`, `x-tenant-plan`,
   `x-tenant-scope`. Every name is overridable under `trusted.headers` so edge↔box drift is
   pinned in one place. The edge must set the scope header to `acting` per request

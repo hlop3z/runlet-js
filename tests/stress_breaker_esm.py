@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""Stress harness for the newer jsbox features — Tier 3 circuit breaker and ES modules.
+"""Stress harness for the newer jsbox features â€” Tier 3 circuit breaker and ES modules.
 
 Companion to `stress_test.py` (which covers Tier 0/1/5). Two independent experiments,
 each managing its own server so the only variable is the thing under test:
 
-  1. Circuit breaker (Tier 3) — A/B against a DEAD, hanging database. The breaker is a
+  1. Circuit breaker (Tier 3) â€” A/B against a DEAD, hanging database. The breaker is a
      *connect* breaker, so its value shows when connects time out (5s each), not when
      they are refused instantly. Target 192.0.2.1:5432 (RFC-5737 TEST-NET) black-holes
      the TCP SYN, so every connect pays the full 5s connect-timeout. The breaker lives in
      `fabricd` now (it owns the driver connections), so each variant runs the two-process
      topology: `fabricd` (dead-db resource + `db_breaker_threshold`) over a UDS + the box.
-       A (off):  db_breaker_threshold = 0  — every request waits ~5s on connect.
-       B (on):   db_breaker_threshold = 3  — after 3 fails the breaker opens and the
+       A (off):  db_breaker_threshold = 0  â€” every request waits ~5s on connect.
+       B (on):   db_breaker_threshold = 3  â€” after 3 fails the breaker opens and the
                  rest fast-fail DB_CIRCUIT_OPEN in ~ms.
      Hypothesis: B has far higher throughput and far lower tail latency under a dead DB,
      and stops burning spawn_blocking threads on the connect timeout.
 
-  2. ES-module overhead — per-request latency of three handler shapes on one normally
-     configured server (no `fabricd` — deterministic handlers need no egress): a classic
+  2. ES-module overhead â€” per-request latency of three handler shapes on one normally
+     configured server (no `fabricd` â€” deterministic handlers need no egress): a classic
      script, an `export default` module, and a module that `import`s a registry module.
      Quantifies the cost of module compile/eval per request.
 
 Run it INSIDE the dev container (it needs the binaries + a UDS-capable filesystem):
   docker exec -e RUNLET_BIN=/ctarget/debug/runlet -e FABRICD_BIN=/ctarget/debug/fabricd \
-      -e DEAD_DB_HOST=192.0.2.1 jsbox-dev sh -c "cd /src && python3 stress_breaker_esm.py"
+      -e DEAD_DB_HOST=192.0.2.1 jsbox-dev sh -c "cd /src && python3 tests/stress_breaker_esm.py"
 
 Env knobs (optional): RUNLET_BIN, FABRICD_BIN, DEAD_DB_HOST/PORT, BREAKER_CONCURRENCY,
-BREAKER_DURATION, ESM_REQUESTS, ESM_CONCURRENCY, MODULES_DIR. NOT pass/fail — prints a
+BREAKER_DURATION, ESM_REQUESTS, ESM_CONCURRENCY, MODULES_DIR. NOT pass/fail â€” prints a
 comparison + verdict.
 """
 
@@ -49,10 +49,10 @@ ESM_REQUESTS = int(os.environ.get("ESM_REQUESTS", "500"))
 ESM_CONCURRENCY = int(os.environ.get("ESM_CONCURRENCY", "8"))
 MODULES_DIR = os.environ.get(
     "MODULES_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "modules"),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "modules"),
 )
 
-# The dead-db operator resource — lives in fabricd's `resources` table; the request only
+# The dead-db operator resource â€” lives in fabricd's `resources` table; the request only
 # names it via `config.io`.
 DEAD_DB = {
     "kind": "db",
@@ -119,7 +119,7 @@ def _wait_for_server(up: bool, tries: int = 40) -> bool:
 def _binaries() -> tuple:
     """Resolve the (runlet, fabricd) binary paths, building both once when not given via env
     (two concurrent `cargo run`s would race on the target/ build lock)."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if not (RUNLET_BIN and FABRICD_BIN):
         subprocess.run(
             ["cargo", "build", "--quiet", "-p", "runlet", "-p", "fabricd"],
@@ -135,7 +135,7 @@ def _binaries() -> tuple:
 def start_stack(box_config: dict, fabricd_config: dict | None) -> list:
     """Start `fabricd` (when the experiment needs db egress) over a UDS, then the box pointed
     at that socket. Returns the started processes (stop with `stop_stack`)."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".stress-run")
     os.makedirs(run_dir, exist_ok=True)
     runlet_bin, fabricd_bin = _binaries()
@@ -212,7 +212,7 @@ def _run_dead_db_load(concurrency: int, duration: float) -> dict:
 
 
 def breaker_experiment(label: str, threshold: int) -> dict:
-    # Bulkhead == concurrency so NO request is shed as 429 — every request acquires a permit
+    # Bulkhead == concurrency so NO request is shed as 429 â€” every request acquires a permit
     # and the only variable is the connect path (slow dead-connect vs fast breaker-open). A
     # low bulkhead would flood the metrics with instant 429s and mask the breaker.
     box = {
@@ -220,7 +220,7 @@ def breaker_experiment(label: str, threshold: int) -> dict:
         "server": {"host": "127.0.0.1", "port": 3000},
         "engine": {"max_concurrent_executions": BREAKER_CONCURRENCY},
     }
-    # The breaker knob is fabricd config now — it owns the driver connections.
+    # The breaker knob is fabricd config now â€” it owns the driver connections.
     fabricd_cfg = {
         "db_breaker_threshold": threshold,
         "resources": {"dead-db": DEAD_DB},
@@ -238,7 +238,7 @@ def report_breaker(a: dict, b: dict):
     secs = lambda v: f"{v:.2f}s"
     print("\n" + "=" * 56)
     print(
-        f"  Tier 3 circuit breaker — dead DB {DEAD_HOST}:{DEAD_PORT} (connect hangs ~5s)"
+        f"  Tier 3 circuit breaker â€” dead DB {DEAD_HOST}:{DEAD_PORT} (connect hangs ~5s)"
     )
     print(f"  {BREAKER_CONCURRENCY} concurrent, {BREAKER_DURATION:.0f}s")
     print("=" * 56)
@@ -268,7 +268,7 @@ def report_breaker(a: dict, b: dict):
         )
     if b["codes"].get("DB_CIRCUIT_OPEN", 0) > 0:
         print(
-            f"    Tier 3 ✓  B fast-failed {b['codes'].get('DB_CIRCUIT_OPEN', 0)} requests as "
+            f"    Tier 3 âœ“  B fast-failed {b['codes'].get('DB_CIRCUIT_OPEN', 0)} requests as "
             f"DB_CIRCUIT_OPEN instead of waiting ~5s on a dead connect."
         )
     print()
@@ -316,7 +316,7 @@ def esm_experiment() -> dict:
         "engine": {},
     }
     print(f"  [ESM] starting (modules_dir={MODULES_DIR}) ...")
-    procs = start_stack(config, None)  # deterministic handlers — no fabricd needed
+    procs = start_stack(config, None)  # deterministic handlers â€” no fabricd needed
     out = {}
     try:
         time.sleep(1)
@@ -334,7 +334,7 @@ def report_esm(out: dict):
     us = lambda v: f"{v * 1e6:.0f}us"
     print("\n" + "=" * 56)
     print(
-        f"  ES-module overhead — {ESM_REQUESTS} req/shape, {ESM_CONCURRENCY} concurrent"
+        f"  ES-module overhead â€” {ESM_REQUESTS} req/shape, {ESM_CONCURRENCY} concurrent"
     )
     print("=" * 56)
     print(f"  {'shape':<22} {'ok':>6} {'p50':>10} {'p99':>10} {'mean':>10}")
@@ -359,7 +359,7 @@ def report_esm(out: dict):
 def main():
     if _post_timed(TRIVIAL, timeout=2)[1] != 0:
         print(
-            "ERROR: a server is already on :3000 — stop it; this harness manages its own."
+            "ERROR: a server is already on :3000 â€” stop it; this harness manages its own."
         )
         raise SystemExit(1)
     a = breaker_experiment("A breaker off", 0)

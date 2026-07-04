@@ -165,7 +165,7 @@ services:
   # ZITADEL (insecure/dev): `start-from-init` bootstraps the instance and a service
   # account whose Personal Access Token is written to ./.zitadel/zitadel-admin-sa.pat
   # on the host (the image is scratch-based, so we bind-mount a writable dir). Run the
-  # suite with ZITADEL_PAT_FILE=./.zitadel/zitadel-admin-sa.pat (see test_simple.py).
+  # suite with ZITADEL_PAT_FILE=./.zitadel/zitadel-admin-sa.pat (see tests/test_simple.py).
   # Reachable in-network as http://zitadel:8080, on the host as http://localhost:8082.
   zitadel:
     image: ghcr.io/zitadel/zitadel:latest

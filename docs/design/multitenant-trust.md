@@ -16,7 +16,7 @@ trusted identity. `runlet` consumes that identity from operator-configured trust
 
 | Purpose            | Default header         | Field                     |
 | ------------------ | ---------------------- | ------------------------- |
-| acting workspace   | `x-tenant-id`          | `tenant` (the universal key) |
+| acting workspace   | `x-workspace-id`       | `tenant` (the universal key) |
 | user (audit)       | `x-user-id`            | `user`                    |
 | member roles       | `x-user-roles`         | `roles` (comma-separated) |
 | member entitlements| `x-user-entitlements`  | `entitlements` (comma-sep)|
@@ -26,7 +26,10 @@ trusted identity. `runlet` consumes that identity from operator-configured trust
 | acting-org scope   | `x-tenant-scope`       | `scope` → must be `acting` (N5) |
 
 Every name is configurable (`trusted.headers.*`) so a drift between the edge contract and the box is
-pinned in one place. Trusted mode is **opt-in** (`trusted.enabled`); the default preserves the
+pinned in one place. The tenant default is `x-workspace-id` — the name the nexus identity sidecar
+injects (`x-tenant-id` survives only as a legacy read-fallback *inside* nexus and is never emitted
+toward boxes); the pinned contract is the "Downstream header contract" table in
+`nexus-upstream-requirements.md`. Trusted mode is **opt-in** (`trusted.enabled`); the default preserves the
 pre-change single-principal, loopback behavior.
 
 ## The trust invariant (and its safety net)
@@ -64,13 +67,13 @@ is the single key for:
   workspaces, enforced where credentials live.
 - **Quota**: per-tenant plan-gated usage (below).
 
-`runlet` treats `x-tenant-id` as opaque and already-authorized; it never branches on "user vs org"
+`runlet` treats `x-workspace-id` as opaque and already-authorized; it never branches on "user vs org"
 and never learns how the acting workspace was chosen (that is nexus upstream requirement **N5** —
 see `nexus-upstream-requirements.md`).
 
 ## Acting-org assurance (the N5 tripwire)
 
-Because `x-tenant-id` is opaque, `runlet` cannot tell an *authorized acting org* apart from a user's
+Because `x-workspace-id` is opaque, `runlet` cannot tell an *authorized acting org* apart from a user's
 *home org* — an edge that has not shipped N5 (or has drifted) would inject the home org and `runlet`
 would **silently mis-scope** a multi-org user across all four boundaries above. To close that gap the
 edge asserts acting-org authorization per request with a trusted `x-tenant-scope: acting` header, and
@@ -83,7 +86,7 @@ This is **intrinsic to trusted mode** — no opt-in flag, no "accept home-org sc
 because trusted mode *means* "behind an edge doing N5." A single-workspace deployment is unaffected
 for free (home == acting, so its edge always emits `acting`). Preserving D3, `runlet` checks only the
 scope *label*; it never interprets the org relationship. Honest scope: this is a **contract tripwire,
-not cryptographic proof** — the header rides the same trusted-edge boundary as `x-tenant-id`, so it is
+not cryptographic proof** — the header rides the same trusted-edge boundary as `x-workspace-id`, so it is
 only as strong as the NetworkPolicy. It defends against the *accidental* hazard (an edge without N5),
 not a compromised edge, which the trust invariant already owns. In-box JWT verification was rejected:
 it re-litigates the "no crypto in the box" decision and puts a JWKS-refresh surface on every
@@ -105,7 +108,7 @@ capability does.
 ## Per-tenant, plan-gated quota
 
 `runlet` does per-tenant usage **accounting + a hard cap**; per-tenant request throttling rides the
-edge (Envoy per-`x-tenant-id` rate-limit). The quota engine (`quota.rs`) mirrors the nexus
+edge (Envoy per-`x-workspace-id` rate-limit). The quota engine (`quota.rs`) mirrors the nexus
 `routing-rs/plan.rs` shape — a data-driven `plan → limit` table, "at-or-above", **fail-closed**:
 
 - A tenant's plan (from `x-tenant-plan`) selects a `PlanLimit` (today: `max_concurrent` in-flight

@@ -161,7 +161,7 @@ pub(crate) struct TrustedConfig {
     /// the box trusts `x-*` blindly, so an exposed bind without this fails closed (see
     /// [`Config::check_exposure`]). Mirrors `allow_unauthenticated`.
     pub(crate) assert_network_isolation: bool,
-    /// The trusted header names (defaults `x-tenant-id`/`x-user-*`/`x-auth-anonymous`/`x-tenant-plan`).
+    /// The trusted header names (defaults `x-workspace-id`/`x-user-*`/`x-auth-anonymous`/`x-tenant-plan`).
     pub(crate) headers: TrustedHeaders,
     /// Coarse member-capability gate: capability kind (`"db"`, `"mongo"`, …) → the entitlement (or
     /// role) a caller must hold in `x-user-entitlements`/`x-user-roles` to invoke it. A kind absent
@@ -176,7 +176,8 @@ pub(crate) struct TrustedConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub(crate) struct TrustedHeaders {
-    /// Tenant / acting-workspace id header (default `x-tenant-id`).
+    /// Tenant / acting-workspace id header (default `x-workspace-id` — the name the nexus identity
+    /// sidecar injects; `x-tenant-id` is a legacy fallback inside nexus only and is not read here).
     pub(crate) tenant: String,
     /// User id header, for audit (default `x-user-id`).
     pub(crate) user: String,
@@ -200,7 +201,7 @@ pub(crate) struct TrustedHeaders {
 impl Default for TrustedHeaders {
     fn default() -> Self {
         Self {
-            tenant: "x-tenant-id".to_owned(),
+            tenant: "x-workspace-id".to_owned(),
             user: "x-user-id".to_owned(),
             roles: "x-user-roles".to_owned(),
             entitlements: "x-user-entitlements".to_owned(),

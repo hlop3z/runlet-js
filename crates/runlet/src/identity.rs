@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn extracts_all_default_headers() {
         let map = headers(&[
-            ("x-tenant-id", "ws_acme"),
+            ("x-workspace-id", "ws_acme"),
             ("x-user-id", "u_42"),
             ("x-user-roles", "admin, billing"),
             ("x-user-entitlements", "db, mail"),
@@ -151,12 +151,12 @@ mod tests {
     /// A client-set value under a non-configured name is ignored; only the configured header counts.
     #[test]
     fn client_supplied_identity_is_ignored() {
-        // Configure a custom tenant header; the default `x-tenant-id` a client might set is not read.
+        // Configure a custom tenant header; the default `x-workspace-id` a client might set is not read.
         let names = TrustedHeaders {
             tenant: "x-trusted-tenant".to_owned(),
             ..TrustedHeaders::default()
         };
-        let map = headers(&[("x-tenant-id", "spoofed"), ("x-trusted-tenant", "ws_real")]);
+        let map = headers(&[("x-workspace-id", "spoofed"), ("x-trusted-tenant", "ws_real")]);
         let id = TrustedIdentity::from_headers(&map, &names);
         assert_eq!(
             id.tenant.as_deref(),

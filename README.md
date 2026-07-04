@@ -758,7 +758,7 @@ Every execution runs in an isolated QuickJS context with:
 docker compose up -d
 
 # Run the test suite (starts the server itself if one isn't running)
-python test_simple.py
+python tests/test_simple.py
 
 # Stop databases
 docker compose down

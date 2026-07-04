@@ -277,7 +277,7 @@ QuickJS/`rquickjs`.
    `WireInit` validated daemon-side by a pluggable `ClientAuthenticator` (`none` / `static` shipping;
    k8s SA-token OIDC a wired-but-unimplemented seam). The daemon caps concurrent connections +
    streams and redacts the token from logs. **Live-smoked** box→QUIC→`fabricd`→Postgres
-   (`smoke_quic.sh`): the happy path plus a wrong-token and an absent-token negative (both
+   (`scripts/smoke_quic.sh`): the happy path plus a wrong-token and an absent-token negative (both
    `400 UNAUTHENTICATED`, no query). Everything stays on the one `aws-lc-rs` rustls provider.
 
 Steps 1–3 are the bulk of the value, touch only `runlet-core`, and require no distributed

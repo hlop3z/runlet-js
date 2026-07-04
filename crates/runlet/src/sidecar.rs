@@ -8,8 +8,9 @@
 //!
 //! Two transports behind one [`SessionConn`]:
 //!
-//! - **UDS** ([`SidecarTransport::Uds`]) — the zero-config local default; filesystem permissions
-//!   gate it, so no token is sent.
+//! - **UDS** (`SidecarTransport::Uds`) — the zero-config local default; filesystem permissions
+//!   gate it, so no token is sent. Unix-only (tokio has no UDS elsewhere): on other platforms the
+//!   variant is compiled out and a configured socket is rejected at startup.
 //! - **QUIC** ([`SidecarTransport::Quic`]) — the remote path for a shared `fabricd` cluster
 //!   service. One client endpoint multiplexes a session per box-request as a bidirectional stream;
 //!   the box pins the daemon's self-signed cert and presents an auth token. The client keeps one
@@ -31,7 +32,9 @@ use fabric_wire::quic::client_endpoint;
 use fabric_wire::wire::{WireCall, WireInit, WireRequest, WireResponse, read_frame, write_frame};
 use fabric_wire::{BackendMetrics, Egress, EgressError, ErrorOwner, MeteredEgress};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
-use tokio::net::{UnixStream, lookup_host};
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio::net::lookup_host;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -44,7 +47,8 @@ use crate::config::FabricdQuic;
 pub(crate) enum SidecarTransport {
     /// No sidecar configured — driver-backed capabilities are unavailable (`503`).
     None,
-    /// Local Unix-domain socket (the zero-config default).
+    /// Local Unix-domain socket (the zero-config default). Unix-only — tokio has no UDS elsewhere.
+    #[cfg(unix)]
     Uds(Arc<str>),
     /// Remote QUIC: a shared client endpoint, the replica set, cert pin, and auth.
     Quic(Arc<QuicClient>),
@@ -58,7 +62,8 @@ impl SidecarTransport {
     /// # Errors
     ///
     /// Returns an error if the QUIC config is invalid (empty replica set, malformed cert pin,
-    /// both/neither auth source) or its client endpoint can't be built.
+    /// both/neither auth source) or its client endpoint can't be built — or if `socket` is set on
+    /// a platform without UDS support.
     pub(crate) fn from_config(
         socket: Option<&str>,
         quic: Option<&FabricdQuic>,
@@ -69,13 +74,24 @@ impl SidecarTransport {
             }
             return Ok(Self::Quic(Arc::new(QuicClient::from_config(quic_cfg)?)));
         }
-        socket.map_or(Ok(Self::None), |path| Ok(Self::Uds(Arc::from(path))))
+        #[cfg(not(unix))]
+        if socket.is_some() {
+            return Err(IoError::other(
+                "fabricd_socket (UDS) is unsupported on this platform; use fabricd_quic",
+            ));
+        }
+        #[cfg(unix)]
+        let transport = socket.map_or(Self::None, |path| Self::Uds(Arc::from(path)));
+        #[cfg(not(unix))]
+        let transport = Self::None;
+        Ok(transport)
     }
 
     /// A short, secret-free label for startup logging.
     pub(crate) const fn label(&self) -> &'static str {
         match self {
             Self::None => "none",
+            #[cfg(unix)]
             Self::Uds(_) => "uds",
             Self::Quic(_) => "quic",
         }
@@ -247,6 +263,7 @@ pub(crate) enum SessionError {
 #[derive(Debug)]
 pub(crate) enum SessionConn {
     /// A Unix-domain-socket session (read and write share the duplex stream).
+    #[cfg(unix)]
     Uds(UnixStream),
     /// A QUIC bidirectional-stream session.
     Quic {
@@ -261,6 +278,7 @@ impl SessionConn {
     /// Writes one request frame on the session's outbound half.
     async fn write(&mut self, request: &WireRequest) -> Result<(), IoError> {
         match self {
+            #[cfg(unix)]
             Self::Uds(stream) => write_frame(stream, request).await,
             Self::Quic { send, .. } => write_frame(send, request).await,
         }
@@ -269,6 +287,7 @@ impl SessionConn {
     /// Reads one response frame from the session's inbound half (`None` = clean EOF).
     async fn read(&mut self) -> Result<Option<WireResponse>, IoError> {
         match self {
+            #[cfg(unix)]
             Self::Uds(stream) => read_frame::<_, WireResponse>(stream).await,
             Self::Quic { recv, .. } => read_frame::<_, WireResponse>(recv).await,
         }
@@ -294,6 +313,7 @@ pub(crate) async fn connect_session(
         SidecarTransport::None => Err(SessionError::Unavailable(
             "no fabricd egress sidecar configured".to_owned(),
         )),
+        #[cfg(unix)]
         SidecarTransport::Uds(path) => {
             let stream = UnixStream::connect(path.as_ref())
                 .await

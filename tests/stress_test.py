@@ -4,14 +4,14 @@
 Drives concurrent load against `/execute` under a degraded-DB scenario (a slow query
 through PgBouncer) and compares two server configurations:
 
-  A (baseline)  — bulkhead effectively off, no statement_timeout ceiling.
-  B (resilient) — Tier 1 bulkhead + Tier 0 statement_timeout clamp enabled.
+  A (baseline)  â€” bulkhead effectively off, no statement_timeout ceiling.
+  B (resilient) â€” Tier 1 bulkhead + Tier 0 statement_timeout clamp enabled.
 
 Hypotheses (resilience.md): under overload B sheds excess as fast 429s and holds tail
 latency + stays responsive, while A queues on the DB and tail latency climbs.
 
 The harness manages the server lifecycle itself (one variant at a time), so the only
-variable is the config. It is NOT pass/fail — it prints a comparison and a verdict.
+variable is the config. It is NOT pass/fail â€” it prints a comparison and a verdict.
 
 The `db` capability is brokered by `fabricd` now, so each variant runs the two-process
 topology: `fabricd` (the db resource + the Tier 0 `max_statement_timeout_ms` ceiling) over
@@ -42,7 +42,7 @@ CONCURRENCY = int(os.environ.get("STRESS_CONCURRENCY", "40"))
 DURATION = float(os.environ.get("STRESS_DURATION", "8"))
 SLEEP_S = float(os.environ.get("STRESS_SLEEP", "2"))
 
-# The db operator resource — lives in fabricd's `resources` table; the requests only name
+# The db operator resource â€” lives in fabricd's `resources` table; the requests only name
 # it via `config.io`. `statement_timeout_ms: 0` asks for "unlimited" so the Tier 0 ceiling
 # (fabricd's `max_statement_timeout_ms`, the B variant) is what bounds the slow query.
 DB_RESOURCE = {
@@ -58,7 +58,7 @@ DB_IO = {"io": {"db": ["stress-db"]}}
 
 # The load: a slow DB query (simulates a degraded database / saturated pool). Each
 # request holds a connection for SLEEP_S server-side.
-# The flood is tagged partition "noisy"; the victim "good" — so with Tier 5 enabled
+# The flood is tagged partition "noisy"; the victim "good" â€” so with Tier 5 enabled
 # (variant B) the noisy partition sheds on its own cap and the good one keeps its share.
 WORK_BODY = {
     "script": f"function handler(ctx) {{ db.query('SELECT pg_sleep({SLEEP_S})'); return json('ok', null); }}",
@@ -66,7 +66,7 @@ WORK_BODY = {
     "partition": "noisy",
 }
 TRIVIAL_BODY = {"script": "function handler(ctx) { return json(1, null); }"}
-# A well-behaved partition's normal, fast query — interleaved during the overload to
+# A well-behaved partition's normal, fast query â€” interleaved during the overload to
 # measure noisy-neighbor impact (does the slow-query flood drag down a good request?).
 VICTIM_BODY = {
     "script": "function handler(ctx) { var r = db.query('SELECT 1 AS ok'); return json(r.rows[0].ok, null); }",
@@ -118,7 +118,7 @@ def _wait_for_server(up: bool, tries: int = 40) -> bool:
 def _binaries() -> tuple:
     """Resolve the (runlet, fabricd) binary paths, building both once when not given via env
     (two concurrent `cargo run`s would race on the target/ build lock)."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if not (RUNLET_BIN and FABRICD_BIN):
         subprocess.run(
             ["cargo", "build", "--quiet", "-p", "runlet", "-p", "fabricd"],
@@ -134,7 +134,7 @@ def _binaries() -> tuple:
 def start_stack(engine_overrides: dict, ceiling_ms: int) -> list:
     """Start `fabricd` (the db resource + the Tier 0 ceiling) over a UDS, then the box with
     the given engine overrides pointed at that socket. Returns the started processes."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".stress-run")
     os.makedirs(run_dir, exist_ok=True)
     runlet_bin, fabricd_bin = _binaries()
@@ -200,7 +200,7 @@ def run_load(concurrency: int, duration: float) -> dict:
     single victim thread interleaves a normal fast query to measure noisy-neighbor impact.
     """
     deadline = time.time() + duration
-    results = []  # (latency, status, code) — the slow-query flood
+    results = []  # (latency, status, code) â€” the slow-query flood
 
     def worker():
         local = []
@@ -208,7 +208,7 @@ def run_load(concurrency: int, duration: float) -> dict:
             local.append(_post_timed(WORK_BODY))
         return local
 
-    victim = []  # (latency, status, code) — the well-behaved partition under the flood
+    victim = []  # (latency, status, code) â€” the well-behaved partition under the flood
 
     def victim_prober():
         # Let the flood ramp first, then probe every ~250ms.
@@ -270,7 +270,7 @@ def report(a: dict, b: dict):
     pct = lambda v: f"{v:.0f}%"
     print("\n" + "=" * 54)
     print(
-        f"  A/B stress — {CONCURRENCY} concurrent, {DURATION:.0f}s, pg_sleep({SLEEP_S:.0f}) via PgBouncer"
+        f"  A/B stress â€” {CONCURRENCY} concurrent, {DURATION:.0f}s, pg_sleep({SLEEP_S:.0f}) via PgBouncer"
     )
     print("=" * 54)
     print(f"  {'metric':<22} {'A baseline':>14} {'B resilient':>14}")
@@ -297,21 +297,21 @@ def report(a: dict, b: dict):
         )
     if b["shed_429"] > 0 and a["shed_429"] == 0:
         print(
-            f"    Tier 1 ✓  B fails fast — sheds {b['shed_pct']:.0f}% as 429s; A queues (none shed)"
+            f"    Tier 1 âœ“  B fails fast â€” sheds {b['shed_pct']:.0f}% as 429s; A queues (none shed)"
         )
     print(
         f"    Noisy neighbor  victim (partition 'good')  A succeeded {a['vic_ok']}  vs  B succeeded {b['vic_ok']}"
     )
     if b["vic_ok"] > 0:
         print(
-            f"    Tier 5 ✓  the good partition keeps its share — {b['vic_ok']} victim requests got"
+            f"    Tier 5 âœ“  the good partition keeps its share â€” {b['vic_ok']} victim requests got"
         )
         print(
             f"              through under the flood (A: {a['vic_ok']}, dragged to p99 {a['vic_p99']:.2f}s)."
         )
     elif b["vic_shed"] > 0:
         print(
-            "    Tier 5 gap: the good partition was shed too — is max_concurrent_per_partition set?"
+            "    Tier 5 gap: the good partition was shed too â€” is max_concurrent_per_partition set?"
         )
     print()
 
@@ -332,7 +332,7 @@ def experiment(label: str, engine: dict, ceiling_ms: int) -> dict:
 def main():
     if _post_timed(TRIVIAL_BODY, timeout=2)[1] != 0:
         print(
-            "ERROR: a server is already on :3000 — stop it; this harness manages its own."
+            "ERROR: a server is already on :3000 â€” stop it; this harness manages its own."
         )
         raise SystemExit(1)
     # A: bulkhead effectively off, no statement_timeout ceiling.

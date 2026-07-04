@@ -7,3 +7,30 @@ services:
     volumes:
       - ./config.json:/app/config.json:ro
     restart: unless-stopped
+
+  # Driver-backed capabilities (db/mongo/mail/redis/amq/auth) additionally need the
+  # `fabricd` egress sidecar — it holds the credential table (resources config) and
+  # all the network drivers; the box only forwards logical names from `config.io`.
+  # Without it, requests naming a driver resource get `503 EGRESS_UNAVAILABLE`;
+  # deterministic / `api` / `s3` requests work with the box alone.
+  #
+  # No prebuilt fabricd image is published yet — build it from source
+  # (`cargo build --release -p fabricd`) and uncomment, sharing the UDS socket dir
+  # with the box: add `- fabricd-sock:/run/fabricd` to the jsbox volumes too, and
+  # set `"fabricd_socket": "/run/fabricd/fabricd.sock"` in config.json.
+  # Credentials: copy fabricd.example.json -> fabricd.json (gitignored) and fill
+  # in real values. See docs/deployment.md §5.
+  #
+  # fabricd:
+  #   container_name: fabricd
+  #   image: <your fabricd build>
+  #   environment:
+  #     FABRICD_CONFIG: /app/fabricd.json
+  #     FABRICD_SOCKET: /run/fabricd/fabricd.sock
+  #   volumes:
+  #     - ./fabricd.json:/app/fabricd.json:ro
+  #     - fabricd-sock:/run/fabricd
+  #   restart: unless-stopped
+
+# volumes:
+#   fabricd-sock:

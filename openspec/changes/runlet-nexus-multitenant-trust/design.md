@@ -145,7 +145,10 @@ principal behavior without redeploying the edge.
 
 ## Open Questions
 
-- Final trusted header names (recommend `x-tenant-id`; configurable regardless).
+- ~~Final trusted header names~~ **Resolved 2026-07-02:** nexus renamed the injected tenant header
+  to `x-workspace-id` (`x-tenant-id` is a legacy fallback inside nexus only), so the box default is
+  `x-workspace-id`; the scope header keeps the box's existing default `x-tenant-scope` (nexus emits
+  it under that name). Pinned in both repos' `nexus-upstream-requirements.md`; configurable regardless.
 - Whether coarse member authz (L2) ships in v1 or as the immediate fast-follow.
 - Quota dimensions for v1: executions/sec, concurrent, or compute-time — and which are edge
   (Envoy) vs `runlet` (accounting + hard cap).

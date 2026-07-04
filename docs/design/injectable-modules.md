@@ -166,7 +166,7 @@ context — the same class as the capability wrappers already eval'd today. Modu
 live in the per-request heap under `memory_limit`, so a fat module eats the customer's own
 budget, which is the correct incentive.
 
-Measured (`stress_breaker_esm.py`, sequential, tiny handlers, ~2.5 ms request floor):
+Measured (`tests/stress_breaker_esm.py`, sequential, tiny handlers, ~2.5 ms request floor):
 an export-default handler adds ~39 µs/request over a classic script (module vs script
 compile — negligible); a handler importing one small registry module adds ~201 µs/request
 (compile + resolve + the imported module's own compile and eval). Both are well under 10 %

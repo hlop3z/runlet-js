@@ -4,8 +4,9 @@
 
 When running in trusted-header mode, the system SHALL derive the request's tenant and user
 identity solely from operator-configured trusted headers injected by the edge, and SHALL
-ignore any identity value supplied by the client. The tenant identifier (`x-tenant-id` by
-default) is treated as an opaque, already-authorized acting-workspace id.
+ignore any identity value supplied by the client. The tenant identifier (`x-workspace-id` by
+default, matching the header the nexus identity sidecar injects) is treated as an opaque,
+already-authorized acting-workspace id.
 
 #### Scenario: Tenant identity is taken from the trusted header
 

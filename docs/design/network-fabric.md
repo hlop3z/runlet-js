@@ -128,11 +128,11 @@ the drivers that leave `runlet-core` land here.
 > so far: `fabric-wire::quic` (pinned-cert endpoints), the box's `runlet::sidecar` (UDS-or-QUIC
 > egress with cert pinning + client-side failover), and `fabricd`'s QUIC listener + pluggable
 > `ClientAuthenticator` (`none`/`static`/`sa-token`) + connection/stream caps. Verified end-to-end
-> by `smoke_quic.sh` (happy path + wrong/absent-token negatives). The **`sa-token`** provider (k8s
+> by `scripts/smoke_quic.sh` (happy path + wrong/absent-token negatives). The **`sa-token`** provider (k8s
 > projected `ServiceAccount` token, verified offline against the cluster JWKS) is implemented in
 > `fabric_backends::sa_token` (`JwksVerifier`: background-refreshed JWKS cache + offline RS256 +
 > `aud`/`iss`/`exp` check) and unit-tested hermetically; the remaining open item is the **KIND
-> end-to-end** test (`smoke_satoken.sh`) that exercises it against a real projected token in-cluster.
+> end-to-end** test (`scripts/smoke_satoken.sh`) that exercises it against a real projected token in-cluster.
 > Everything below the `## Deferred` line at the end stays parked.
 
 ## Why only this slice
@@ -263,7 +263,7 @@ once it is network-reachable).
 ## Verification
 
 Build/clippy/test are **Docker-only** (`aws-lc-sys` needs a C toolchain; `rust:1.92-alpine`). A
-new `smoke_quic.sh` runs box and `fabricd` in **separate containers**: box → QUIC → `fabricd` →
+new `scripts/smoke_quic.sh` runs box and `fabricd` in **separate containers**: box → QUIC → `fabricd` →
 Postgres end-to-end, plus a **rejected-credential negative** (bad/absent token ⇒ handshake/`Init`
 refused, no query). A framing-over-`quinn` round-trip unit test joins the existing suite; the full
 clippy gauntlet and current tests stay green. `quinn` + any new OIDC dependency are re-run through

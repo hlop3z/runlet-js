@@ -7,10 +7,13 @@ CONTEXT_FILE="tests/$DIR/context.json"
 CONFIG_FILE="tests/$DIR/secrets.json"
 
 # Include the per-test config block only if the test dir provides one.
-# Capabilities (mail, db, api) are opt-in: the global is injected only when
-# its config is present, so a missing secrets.json => `mail`/`db` is undefined.
-# Named secrets.json (not config.json) to avoid confusion with the service's
-# config.json (engine/server limits) and because it holds SMTP/DB credentials.
+# Capabilities are opt-in: the global is injected only when its config is
+# present, so a missing secrets.json => `mail`/`db` is undefined. Driver-backed
+# capabilities (db/mongo/mail/redis/amq/auth) take LOGICAL NAMES via `io`
+# (e.g. {"io":{"db":["local-db"]}}) — the credentials live in the fabricd
+# sidecar's resources config (see ../fabricd.example.json), never in the
+# request. Only `api` (allowed_hosts), `s3`, and `sys` keep request-side
+# config, which is why this file can still hold secrets and stays gitignored.
 if [ -f "$CONFIG_FILE" ]; then
   CONFIG_JSON="$(cat "$CONFIG_FILE")"
 else

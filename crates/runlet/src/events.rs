@@ -142,8 +142,7 @@ impl Event {
 fn now_unix_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|delta| delta.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |delta| delta.as_millis())
 }
 
 /// A non-blocking event sink. `record` must never block or fail the request path. `Debug` is
