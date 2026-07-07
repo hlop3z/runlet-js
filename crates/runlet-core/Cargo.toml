@@ -1,0 +1,79 @@
+[package]
+name = "runlet-core"
+description = "Reusable sandboxed JavaScript logic host powered by QuickJS — engine, runtime pool, sandbox, resilience, and capabilities"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# ── Always-compiled core (engine, sandbox, $sys, decimal, host) ──
+# These pull no network driver, so a deterministic-only consumer can depend on the crate
+# with `default-features = false` and link none of the heavy I/O stacks below. The driver
+# capabilities now live in `fabric-backends`; this crate keeps only their JS wrappers
+# (`inject_wrapper` + `js/*.js`) and the engine seam. See docs/design/resource-egress.md.
+[dependencies]
+# The shared egress-port contract: the `Egress` trait, the error taxonomy (`ErrorOwner`/`Fault`/
+# the `__runlet` tag), the circuit breaker, and the metric collector — re-exported from `egress`/
+# `errors`/`breaker`/`sandbox` so the engine seam and the in-engine capabilities use them.
+fabric-wire = { path = "../fabric-wire" }
+crossbeam-queue.workspace = true
+rquickjs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Retained for the host's tokio `Handle` (vestigial; see host.rs) and the engine seam.
+tokio.workspace = true
+uuid.workspace = true
+base64.workspace = true
+chrono.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+percent-encoding.workspace = true
+rust_decimal.workspace = true
+# Backs the always-on compiled-bytecode cache (bytecode.rs). Pure-Rust, no I/O — so it stays in
+# the deterministic-only `--no-default-features` core without pulling any network driver.
+moka.workspace = true
+
+# ── Optional, per-capability deps ──
+# Only `http`/`s3` stay in-engine (one is SSRF-guarded, the other is pure SigV4 signing), and
+# both use `reqwest`; the driver-backed capabilities moved to `fabric-backends`, so their driver
+# crates are gone from here.
+reqwest = { workspace = true, optional = true }
+
+# ── Capability features ──
+# Each capability is a cargo feature. `http`/`s3` gate the in-engine client; the driver-backed
+# capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) now gate only their JS wrapper +
+# engine inject gate — the connection/driver lives in `fabric-backends` behind the egress port,
+# so these pull no crates. A deterministic-only host builds with `default-features = false` and
+# links nothing here. `runlet` (the HTTP front) enables `full`.
+[features]
+default = ["full"]
+full = ["http", "db", "mongo", "mail", "s3", "redis", "amq", "auth"]
+# Internal markers (not for direct use): `_io` is enabled by every capability and gates the
+# engine's `inject_apis` (which injects the JS wrappers + the in-engine `http`/`s3` collectors);
+# `_throws` is enabled only by `s3` (the lone in-engine *throwing* capability) and gates the
+# `capability_fault_json` tag machinery. The driver-backed capabilities map their errors to the
+# `__runlet` tag via the egress port's always-on `dynamic_fault_json`, not that machinery.
+_io = []
+_throws = []
+http = ["dep:reqwest", "_io"]
+# The driver-backed capabilities gate only their JS wrapper (`<cap>.rs`'s `inject_wrapper`) and
+# the engine inject gate — no driver crate, no `_throws`.
+db = ["_io"]
+mongo = ["_io"]
+mail = ["_io"]
+s3 = ["dep:reqwest", "_io", "_throws"]
+redis = ["_io"]
+amq = ["_io"]
+auth = ["_io"]
+# The always-on compiled-bytecode cache (bytecode.rs) is unconditional — `moka` is a normal
+# dependency above, not a feature. It covers the ES-module source path only (classic scripts
+# still recompile). The declare-vs-load microbenchmark lives in the sibling `runlet-bench` crate
+# (kept out of this crate so the production lint gauntlet doesn't apply to criterion's code).
+
+[lints]
+workspace = true

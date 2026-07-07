@@ -1,0 +1,45 @@
+[package]
+name = "runlet"
+description = "A strict Rust JS execution service powered by QuickJS — HTTP front for runlet-core"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "runlet"
+path = "src/main.rs"
+
+[dependencies]
+runlet-core = { path = "../runlet-core" }
+# The box links NO network driver: it talks to the `fabricd` sidecar over UDS or QUIC using the
+# driver-free wire contract in `fabric-wire` (the `Egress` trait, the wire + QUIC transport, the
+# metric types). Credentials live in `fabricd`, never here.
+fabric-wire = { path = "../fabric-wire" }
+axum.workspace = true
+mimalloc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Distributed tracing: each /execute is a span (tenant/user/plan as attributes), exported OTLP
+# over plaintext gRPC to a local collector. Structured JSON logs go to stdout via
+# tracing-subscriber. See `telemetry.rs` and `docs/design/nexus-upstream-requirements.md` (N6).
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+uuid.workspace = true
+rustls.workspace = true
+# Remote `fabricd` over QUIC (`sidecar.rs`): the box holds the `quinn` client connection + streams.
+quinn.workspace = true
+# Decodes the configured server-cert pin (hex SHA-256) for the QUIC client.
+hex.workspace = true
+
+[lints]
+workspace = true

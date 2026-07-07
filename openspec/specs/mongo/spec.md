@@ -1,0 +1,230 @@
+# mongo Specification
+
+## Purpose
+
+The `mongo` capability gives a handler a document-database client inside the QuickJS
+sandbox: `mongo.find`/`find_one`/`insert_one`/`insert_many`/`update_one`/`update_many`/
+`delete_one`/`delete_many`/`count`/`aggregate`. The connection is **operator-bound**: the
+request enables the capability by naming a logical resource in `config.io.mongo`, and the
+operator's resource definition — never the request — supplies the endpoint and credentials,
+so this capability is trusted (it connects to whatever host the operator bound, with no
+SSRF guard) — the same trust model as `db`/`mail`, and unlike the
+script-controlled `api` capability. It is admitted as a first-class capability (not routed
+over `api`) per the capability-admission gate in `docs-sys/rfc.md` §3.5: a trusted internal
+target, document type-fidelity that JSON-over-HTTP would lose, and a fit to the bounded
+single request→response model. Like `db` it is **async** (Tier 2 resilience: a client-side
+per-operation deadline anchored to the execution wall-clock). This spec defines opt-in, the
+JS surface, the BSON→JSON type-mapping rule, result limits, the client-side deadline, the
+mongo-error taxonomy, and metering. Source of truth: `src/mongo.rs`, `src/js/mongo.js`,
+`docs/design/resilience.md`, and the canonical async template `src/db.rs`.
+
+## Requirements
+
+### Requirement: Opt-in via config.io.mongo
+
+The `mongo` global SHALL exist only when the request names at least one operator-bound
+logical resource in `config.io.mongo`; absent such an entry the global is undefined. The
+request SHALL carry no connection endpoint or credentials for the capability — only logical
+resource names.
+
+#### Scenario: Named resource injects the global
+
+- **WHEN** a request's `config.io.mongo` names an operator-bound resource and the handler references `mongo`
+- **THEN** `mongo` is a defined object exposing `find`, `find_one`, `insert_one`, `insert_many`, `update_one`, `update_many`, `delete_one`, `delete_many`, `count`, and `aggregate`
+
+#### Scenario: No named resource leaves the global undefined
+
+- **WHEN** a request names no resource in `config.io.mongo`
+- **THEN** `typeof mongo === "undefined"` inside the handler
+
+#### Scenario: Unknown resource name is rejected
+
+- **WHEN** `config.io.mongo` names a resource the operator has not bound (for this caller)
+- **THEN** the request is rejected with `RESOURCE_NOT_FOUND` and the handler does not run
+
+### Requirement: Trusted operator-bound connection (no SSRF guard)
+
+The capability SHALL connect to the host/port in the operator's resource definition resolved
+from the logical name, without any private/internal IP block or host allowlist, because the
+connection target is operator-supplied rather than script- or caller-controlled.
+
+#### Scenario: Connects to operator-named host
+
+- **WHEN** the resolved resource definition names an internal or private-network host
+- **THEN** the capability attempts the connection without rejecting it as a private/internal address
+
+#### Scenario: Resource definition fields
+
+- **WHEN** the operator defines a `mongo` resource
+- **THEN** it accepts `host`, `port` (default 27017), `username`, `password`, `database`, `auth_source` (default `admin`), `tls` (default false), `ca_cert` (optional PEM path), `op_timeout_ms` (default 5000), and `max_docs` (default 1000)
+
+### Requirement: TLS reusing the shared provider
+
+The capability SHALL connect over TLS when the resource definition sets `tls` true, reusing
+the process-wide `aws-lc-rs` rustls provider, and SHALL accept an optional `ca_cert` PEM
+path for a self-hosted database with a private certificate authority.
+
+#### Scenario: TLS connection
+
+- **WHEN** the resource definition sets `tls` true
+- **THEN** the connection to the database is established over TLS using the shared crypto provider
+
+#### Scenario: Custom CA certificate
+
+- **WHEN** the resource definition sets `tls` true and its `ca_cert` names a PEM file
+- **THEN** that CA is used to verify the server certificate; omitting `ca_cert` relies on the bundled webpki roots
+
+### Requirement: Read operations
+
+The system SHALL expose `mongo.find(collection, filter?, options?)`,
+`mongo.find_one(collection, filter?)`, `mongo.count(collection, filter?)`, and
+`mongo.aggregate(collection, pipeline)`, passing the caller's `filter`/`pipeline`/`options`
+as data to the driver (never string-interpolated into a query language).
+
+#### Scenario: find returns a result shape
+
+- **WHEN** the handler calls `mongo.find(collection, filter, options)` and it succeeds
+- **THEN** it returns `{docs, count, truncated}` where `docs` is an array of documents
+
+#### Scenario: find_one returns a document or null
+
+- **WHEN** the handler calls `mongo.find_one(collection, filter)`
+- **THEN** it returns the first matching document, or `null` when nothing matches
+
+#### Scenario: find honors limit, skip, sort, and projection
+
+- **WHEN** `options` supplies `limit`, `skip`, `sort`, or `projection`
+- **THEN** each is applied to the query as the matching driver option
+
+#### Scenario: count returns a number
+
+- **WHEN** the handler calls `mongo.count(collection, filter)`
+- **THEN** it returns the number of matching documents
+
+#### Scenario: aggregate returns documents
+
+- **WHEN** the handler calls `mongo.aggregate(collection, pipeline)` with a stage pipeline
+- **THEN** it returns `{docs, count, truncated}` for the pipeline's output documents
+
+### Requirement: Write operations
+
+The system SHALL expose `mongo.insert_one`/`insert_many`/`update_one`/`update_many`/
+`delete_one`/`delete_many`, returning a result describing what changed.
+
+#### Scenario: insert_one returns the inserted id
+
+- **WHEN** the handler calls `mongo.insert_one(collection, doc)` and it succeeds
+- **THEN** it returns `{inserted_id}` with the new document's id as a string
+
+#### Scenario: insert_many returns the inserted count
+
+- **WHEN** the handler calls `mongo.insert_many(collection, docs)` and it succeeds
+- **THEN** it returns `{inserted_count}` with the number of documents inserted
+
+#### Scenario: update returns matched and modified counts
+
+- **WHEN** the handler calls `mongo.update_one`/`update_many(collection, filter, update)`
+- **THEN** it returns `{matched, modified}` with the matched and modified document counts
+
+#### Scenario: delete returns the deleted count
+
+- **WHEN** the handler calls `mongo.delete_one`/`delete_many(collection, filter)`
+- **THEN** it returns `{deleted}` with the number of documents removed
+
+### Requirement: BSON-to-JSON type mapping
+
+Document values SHALL map to JSON such that any value that does not fit a JS number exactly
+is returned as a **string** — mirroring the `db` rule. `Int32` and `Double` come back as JSON
+numbers; `Int64` and `Decimal128` come back as strings; `ObjectId` as its 24-character hex
+string; `Date` as an RFC 3339 string; `Binary` as base64; booleans, strings, null, nested
+documents, and arrays pass through structurally.
+
+#### Scenario: Large and exact-precision numbers as strings
+
+- **WHEN** a document field is an `Int64` or a `Decimal128`
+- **THEN** the value is serialized as a JSON string (e.g. `"9007199254740993"`, `"19.99"`)
+
+#### Scenario: Small integers and doubles as numbers
+
+- **WHEN** a document field is an `Int32` or a `Double`
+- **THEN** the value is serialized as a JSON number
+
+#### Scenario: ObjectId, Date, and Binary as strings
+
+- **WHEN** a document field is an `ObjectId`, a `Date`, or a `Binary`
+- **THEN** the `ObjectId` is its hex string, the `Date` is an RFC 3339 string, and the `Binary` is base64
+
+#### Scenario: Structural values pass through
+
+- **WHEN** a document field is a boolean, string, null, nested document, or array
+- **THEN** it is serialized as the corresponding JSON value
+
+### Requirement: Result-count truncation
+
+A `mongo.find`/`aggregate` result SHALL be truncated to the configured `max_docs`, with
+`truncated` flagging when documents were dropped.
+
+#### Scenario: Result within the limit
+
+- **WHEN** a query returns at most `max_docs` documents
+- **THEN** all documents are returned and `truncated` is `false`
+
+#### Scenario: Result exceeds the limit
+
+- **WHEN** a query returns more than `max_docs` documents
+- **THEN** the result is capped at `max_docs` documents and `truncated` is `true`
+
+### Requirement: Per-operation client-side deadline
+
+Each `mongo` operation SHALL be bounded by a client-side execution deadline anchored to the
+execution wall-clock budget, in addition to a best-effort server-side operation time limit
+set from `op_timeout_ms`; an operation that runs past the deadline SHALL be abandoned and
+fail with a retryable `MONGO_TIMEOUT`, freeing the blocking thread.
+
+#### Scenario: Server-side operation timeout applied
+
+- **WHEN** an operation is issued
+- **THEN** the resource's `op_timeout_ms` is applied as the operation's server-side max time
+
+#### Scenario: Hung operation bounded by the deadline
+
+- **WHEN** an operation runs past the client-side execution deadline
+- **THEN** it is abandoned, the blocking thread is freed, and the call fails with code `MONGO_TIMEOUT` marked retryable
+
+### Requirement: Mongo error taxonomy
+
+A failed `mongo` call SHALL throw a classified error the handler can branch on: a connection
+failure is a retryable `MONGO_CONNECTION` owned by the operator; a duplicate-key / write
+constraint is a non-retryable `MONGO_WRITE` owned by the developer; a malformed
+filter/pipeline/update is a non-retryable `MONGO_QUERY` owned by the developer; the deadline
+is a retryable `MONGO_TIMEOUT`; with `MONGO_ERROR` as the retryable fallback.
+
+#### Scenario: Connection failure is retryable
+
+- **WHEN** the database cannot be reached or authentication fails
+- **THEN** the call fails with code `MONGO_CONNECTION` marked retryable and owned by the operator
+
+#### Scenario: Duplicate key is a developer write error
+
+- **WHEN** a write violates a unique index (duplicate key)
+- **THEN** the call fails with code `MONGO_WRITE`, non-retryable, owned by the developer
+
+#### Scenario: Malformed query is a developer error
+
+- **WHEN** a filter, update, or aggregation pipeline is malformed
+- **THEN** the call fails with code `MONGO_QUERY`, non-retryable, owned by the developer
+
+#### Scenario: Operation budget exhausted
+
+- **WHEN** a `mongo` call would exceed the per-execution `max_ops` budget
+- **THEN** the call fails with code `MONGO_OP_LIMIT`, non-retryable, owned by the developer
+
+### Requirement: Operation metering
+
+Every `mongo` operation SHALL count as exactly one operation against `max_ops` and be
+surfaced in the response `meta.mongo_requests`.
+
+#### Scenario: Metrics drained into meta
+
+- **WHEN** a handler performs one or more `mongo` operations
+- **THEN** `meta.mongo_requests` contains one entry per operation with its `action`, `duration_us`, documents returned/affected, and `truncated`

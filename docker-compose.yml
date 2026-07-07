@@ -1,0 +1,199 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: testdb
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d testdb"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # PgBouncer in transaction-pooling mode in front of `postgres` — the adopted answer
+  # to per-execution connection churn (see docs/design/pooled-capabilities.md). jsbox
+  # needs no code changes: point `config.db` at host port 6432 instead of 5432. The
+  # integration suite runs the full db section through it to prove the per-request
+  # connect model works unchanged behind a transaction-mode pooler.
+  # AUTH_TYPE scram-sha-256 keeps the userlist password in a form that can answer the
+  # SCRAM challenge both ways (client → pgbouncer, pgbouncer → postgres 17).
+  # MAX_PREPARED_STATEMENTS > 0 lets the Rust driver's named prepared statements work
+  # across pooled server connections (PgBouncer ≥ 1.21 tracks them protocol-level).
+  # QUERY_TIMEOUT (Tier 4, docs/design/resilience.md) is the pooler's OWN ceiling: it
+  # cancels any query running longer than 2s — an independent backstop that fires even
+  # when jsbox's session `SET statement_timeout` is lost through transaction pooling, and
+  # below jsbox's 4s wall-clock deadline (Tier 2). 2s sits above normal query latency and
+  # is operator-tunable; it's the layer that makes a runaway query a guaranteed kill.
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: test
+      DB_PASSWORD: test
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      MAX_PREPARED_STATEMENTS: "200"
+      MAX_CLIENT_CONN: "200"
+      DEFAULT_POOL_SIZE: "10"
+      QUERY_TIMEOUT: "2"
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5432"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # Local httpbin clone for the HTTP `api` tests — keeps the suite hermetic instead of
+  # depending on httpbin.org uptime. Note go-httpbin echoes headers/args as ARRAYS of
+  # strings (the tests index [0]), and the server must run with `debug: true` to reach
+  # a localhost/LAN target (SSRF private-IP block) — the harness-generated test config
+  # sets it. In-network URL: http://httpbin:8080, host: http://localhost:8095.
+  httpbin:
+    image: mccutchen/go-httpbin
+    ports:
+      - "8095:8080"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 15
+
+  # Document store for the `mongo` capability tests. No auth (standalone dev node) — the
+  # suite points `config.mongo` at host port 27017. In-network: mongo:27017.
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 10s
+      retries: 15
+
+  # Subject-based messaging server for the `amq` nats-backend tests. `-js` enables
+  # JetStream (harmless; the suite uses only core publish + request-reply). No auth — the
+  # suite points `config.amq` at host port 4222 with `backend: "nats"`. In-network: nats:4222.
+  # `-m 8222` matters: overriding `command` drops the image's default config (which is what
+  # normally enables the 8222 monitoring port), so without it the healthz check below can
+  # never pass and `docker compose up --wait` declares the container unhealthy.
+  nats:
+    image: nats:2-alpine
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  cockroach:
+    image: cockroachdb/cockroach:latest-v24.3
+    command: start-single-node --insecure --advertise-addr=cockroach
+    ports:
+      - "26257:26257"
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "-e", "SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  cockroach-init:
+    image: cockroachdb/cockroach:latest-v24.3
+    depends_on:
+      cockroach:
+        condition: service_healthy
+    command: >
+      sql --insecure --host=cockroach -e "
+        CREATE DATABASE IF NOT EXISTS testdb;
+        CREATE USER IF NOT EXISTS test;
+        GRANT ALL ON DATABASE testdb TO test;
+      "
+
+  # -- Identity providers for the `auth` capability tests --------------------
+  # Keycloak (dev mode): the master realm + `admin-cli` direct-grant client let the
+  # test harness mint a real user token via the password grant. Reachable in-network
+  # as http://keycloak:8080, on the host as http://localhost:8081.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports:
+      - "8081:8080"
+
+  # ZITADEL needs its own Postgres (kept separate from the `db` test database so the
+  # two capabilities never interfere).
+  zitadel-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zitadel
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zitadel"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  # ZITADEL (insecure/dev): `start-from-init` bootstraps the instance and a service
+  # account whose Personal Access Token is written to ./.zitadel/zitadel-admin-sa.pat
+  # on the host (the image is scratch-based, so we bind-mount a writable dir). Run the
+  # suite with ZITADEL_PAT_FILE=./.zitadel/zitadel-admin-sa.pat (see tests/test_simple.py).
+  # Reachable in-network as http://zitadel:8080, on the host as http://localhost:8082.
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:latest
+    command: 'start-from-init --masterkeyFromEnv --tlsMode disabled'
+    volumes:
+      - ./.zitadel:/pat
+    environment:
+      ZITADEL_MASTERKEY: "MasterkeyNeedsToHave32Characters"
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_EXTERNALDOMAIN: "${ZITADEL_EXTERNALDOMAIN:-localhost}"
+      ZITADEL_EXTERNALPORT: "${ZITADEL_EXTERNALPORT:-8082}"
+      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
+      ZITADEL_DATABASE_POSTGRES_PORT: "5432"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      # First-instance bootstrap: a machine user + a long-lived PAT written to a file.
+      ZITADEL_FIRSTINSTANCE_PATPATH: /pat/zitadel-admin-sa.pat
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: jsbox-sa
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: jsbox-sa
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
+    depends_on:
+      zitadel-db:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
