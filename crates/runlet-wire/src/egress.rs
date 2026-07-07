@@ -8,7 +8,7 @@
 //!
 //! This is the seam that lets driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
 //! `auth`) move out of the sandbox process and behind a sidecar — see
-//! `docs/design/resource-egress.md`. It lives in `fabric-wire` (not `runlet-core`) so the
+//! `docs/design/resource-egress.md`. It lives in `runlet-wire` (not `runlet-core`) so the
 //! driver host (`fabric-backends`, eventually `fabricd`) can implement it without linking the
 //! sandbox.
 

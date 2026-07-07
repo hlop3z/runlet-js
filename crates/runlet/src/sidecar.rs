@@ -28,9 +28,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fabric_wire::quic::client_endpoint;
-use fabric_wire::wire::{WireCall, WireInit, WireRequest, WireResponse, read_frame, write_frame};
-use fabric_wire::{BackendMetrics, Egress, EgressError, ErrorOwner, MeteredEgress};
+use runlet_wire::quic::client_endpoint;
+use runlet_wire::wire::{WireCall, WireInit, WireRequest, WireResponse, read_frame, write_frame};
+use runlet_wire::{BackendMetrics, Egress, EgressError, ErrorOwner, MeteredEgress};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 #[cfg(unix)]
 use tokio::net::UnixStream;

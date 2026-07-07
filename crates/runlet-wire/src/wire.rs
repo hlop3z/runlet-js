@@ -1,7 +1,7 @@
 //! The box↔`fabricd` egress wire contract: the per-capability metric types, the session
 //! protocol, and the length-prefixed JSON framing.
 //!
-//! This lives in `fabric-wire` (not `fabric-backends`) so the sandbox box links it **without** any
+//! This lives in `runlet-wire` (not `fabric-backends`) so the sandbox box links it **without** any
 //! driver: after the trust flip the box sends only logical resource *names*, then reads back
 //! results and metrics, while `fabricd` (which links the drivers) resolves the names to operator
 //! configs. One client connection = one box-request session — an `Init` (names + deadline), then

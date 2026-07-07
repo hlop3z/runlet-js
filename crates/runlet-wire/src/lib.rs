@@ -1,4 +1,4 @@
-//! `fabric-wire`: the shared egress-port contract for runlet.
+//! `runlet-wire`: the shared egress-port contract for runlet.
 //!
 //! A driver-free, QuickJS-free leaf crate holding everything both sides of the egress seam
 //! need in common:

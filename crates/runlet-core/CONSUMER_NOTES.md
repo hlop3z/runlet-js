@@ -151,7 +151,7 @@ resolver without forking the concrete types).
 **What changed:** the driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) were
 split out of `runlet-core` into a new **`fabric-backends`** crate, and the egress wire contract
 (the `Egress` trait, `EgressError`, the error taxonomy, the circuit breaker, the metric collector)
-into a new leaf **`fabric-wire`** crate. `runlet-core` now links **no** network driver even with
+into a new leaf **`runlet-wire`** crate. `runlet-core` now links **no** network driver even with
 `full`; it keeps only the JS wrappers + the engine seam (see `docs/design/resource-egress.md`).
 
 **Consumer impact:**

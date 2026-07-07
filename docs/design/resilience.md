@@ -123,7 +123,7 @@ so trip state accumulates across the one-request sessions. Trips are exposed as
 `fabricd_db_breaker_trips_total` on the daemon's opt-in `metrics_listen` scrape endpoint
 (the counter is daemon-scoped, so it can't ride the per-session `Drain` metrics — and the
 box-side `runlet_db_breaker_trips_total` stays a zero placeholder). Implementation:
-`fabric-wire/src/breaker.rs`, gated in the `db` backend's connect path.
+`runlet-wire/src/breaker.rs`, gated in the `db` backend's connect path.
 
 This is deliberately a _connect_ breaker, not a per-query latency breaker — the failure it
 targets is a dead/unreachable target, where Tier 2's deadline already bounds a _slow_ live

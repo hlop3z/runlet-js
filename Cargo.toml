@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/fabric-wire",
+    "crates/runlet-wire",
     "crates/runlet-core",
     "crates/runlet",
     "crates/runlet-bench",

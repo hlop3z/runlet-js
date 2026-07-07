@@ -16,9 +16,9 @@
 - [x] 3.2 Namespace the bytecode/compilation cache by the trusted tenant id (replace the current partition namespace source).
 - [x] 3.3 Update/extend unit tests: noisy-tenant shedding by tenant id, caller-asserted partition is ignored, no cross-tenant cache dedup.
 
-## 4. Tenant-scoped egress (fabric-wire + fabricd)
+## 4. Tenant-scoped egress (runlet-wire + fabricd)
 
-- [x] 4.1 Extend `WireInit` in `crates/fabric-wire/src/wire.rs` to carry the trusted tenant id (serde default + skip-if-none; never sourced from script).
+- [x] 4.1 Extend `WireInit` in `crates/runlet-wire/src/wire.rs` to carry the trusted tenant id (serde default + skip-if-none; never sourced from script).
 - [x] 4.2 In `runlet` `sidecar`/`connect_session`, populate the tenant id on the handshake for tenant-scoped sessions.
 - [x] 4.3 In `fabricd`, scope resource resolution to the session tenant's binding set; refuse names outside it; keep credentials in `fabricd` (unchanged wire result).
 - [x] 4.4 Extend the operator resource config (`fabric-backends` `ResourceBinding`) to associate bindings with a tenant; add resolution unit tests (in-tenant resolves, cross-tenant refused).

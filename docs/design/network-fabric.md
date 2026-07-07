@@ -125,7 +125,7 @@ the drivers that leave `runlet-core` land here.
 # QUIC remote transport (approved slice)
 
 > **Status: implemented 2026-06-30** (approved same day). The one piece of the fabric vision built
-> so far: `fabric-wire::quic` (pinned-cert endpoints), the box's `runlet::sidecar` (UDS-or-QUIC
+> so far: `runlet-wire::quic` (pinned-cert endpoints), the box's `runlet::sidecar` (UDS-or-QUIC
 > egress with cert pinning + client-side failover), and `fabricd`'s QUIC listener + pluggable
 > `ClientAuthenticator` (`none`/`static`/`sa-token`) + connection/stream caps. Verified end-to-end
 > by `scripts/smoke_quic.sh` (happy path + wrong/absent-token negatives). The **`sa-token`** provider (k8s
@@ -143,7 +143,7 @@ single increment that removes that limit, without committing to the full mesh, i
 UDS for a QUIC link** so `fabricd` can run on a different host. No NATS, no membership/gossip, no
 discovery layer — those remain [deferred](#deferred-still-parked).
 
-This is a thin swap because the wire contract is already transport-neutral: `fabric_wire::wire`
+This is a thin swap because the wire contract is already transport-neutral: `runlet_wire::wire`
 (`read_frame`/`write_frame` + the `Init → Call* → Drain` session state machine) is written against
 `tokio::io::AsyncRead`/`AsyncWrite`. A `quinn` bidirectional stream (`SendStream`/`RecvStream`)
 implements exactly those, so **the framing, name-resolution (`resolve`), metrics, and
@@ -256,7 +256,7 @@ once it is network-reachable).
 
 | Crate | Change |
 | --- | --- |
-| `fabric-wire` | Add `quinn`; a `quic` module with `client_endpoint`/`server_endpoint` builders on the existing `aws-lc-rs` `rustls` provider; a `TlsConfig` (cert/key + pinned fingerprint) and the pinning verifier. Framing untouched. |
+| `runlet-wire` | Add `quinn`; a `quic` module with `client_endpoint`/`server_endpoint` builders on the existing `aws-lc-rs` `rustls` provider; a `TlsConfig` (cert/key + pinned fingerprint) and the pinning verifier. Framing untouched. |
 | `runlet` (box) | Config gains the endpoint **list** + `tls` + auth-token/SA-token settings (UDS default unchanged). `uds.rs` generalizes over the stream pair (or a sibling `quic.rs`); add client-side discovery/failover + reconnect. `connect_session`/`roundtrip`/deadline reused. |
 | `fabricd` | Bind a `quinn` endpoint when configured (UDS otherwise); `accept_bi` per session → existing `serve()` unchanged. Add the `ClientAuthenticator` seam (SA-token primary, opaque-token fallback), connection/stream caps, auth-failure metric, secret redaction. |
 

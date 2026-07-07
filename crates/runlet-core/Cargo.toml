@@ -19,7 +19,7 @@ categories.workspace = true
 # The shared egress-port contract: the `Egress` trait, the error taxonomy (`ErrorOwner`/`Fault`/
 # the `__runlet` tag), the circuit breaker, and the metric collector — re-exported from `egress`/
 # `errors`/`breaker`/`sandbox` so the engine seam and the in-engine capabilities use them.
-fabric-wire = { path = "../fabric-wire" }
+runlet-wire = { path = "../runlet-wire" }
 crossbeam-queue.workspace = true
 rquickjs.workspace = true
 serde.workspace = true

@@ -14,7 +14,7 @@ a trusted identity rather than authenticating anyone itself.
 
 Constraints: the strict lint gauntlet (no `unwrap`/`expect`/`panic`/`as`/bare-arith), the
 string-in/string-out FFI contract for capabilities, and the existing tiered resilience and
-`fabric-wire` box↔`fabricd` protocol. Build/test are Docker-only.
+`runlet-wire` box↔`fabricd` protocol. Build/test are Docker-only.
 
 ## Goals / Non-Goals
 

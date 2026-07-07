@@ -19,12 +19,12 @@
 use serde::Serialize;
 use serde_json::Value;
 
-// The error-taxonomy primitives + the `__runlet` wire envelope moved to `fabric-wire` (the shared
+// The error-taxonomy primitives + the `__runlet` wire envelope moved to `runlet-wire` (the shared
 // egress contract). Re-export so `crate::errors::{ErrorOwner, Fault}` stays public (consumers +
 // the in-engine capabilities) and `DynamicFault`/`dynamic_fault_json` stay crate-internal (the
 // engine's egress seam).
-pub(crate) use fabric_wire::{DynamicFault, dynamic_fault_json};
-pub use fabric_wire::{ErrorOwner, Fault};
+pub(crate) use runlet_wire::{DynamicFault, dynamic_fault_json};
+pub use runlet_wire::{ErrorOwner, Fault};
 
 /// Coarse category a client branches on (the response `error.type`).
 #[derive(Debug, Clone, Copy, Serialize)]

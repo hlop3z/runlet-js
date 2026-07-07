@@ -126,7 +126,7 @@ calls them directly (see step 2).
 
 ## Why five crates (the split is forced, not chosen)
 
-The workspace ends up as **five functional crates** — `fabric-wire`, `fabric-backends`,
+The workspace ends up as **five functional crates** — `runlet-wire`, `fabric-backends`,
 `runlet-core`, `runlet`, `fabricd` (plus `runlet-bench`, a pre-existing benchmark crate that is
 not part of this split). The shape is not five independent decisions; it falls out of **one hard
 constraint** plus the fact that there are two binaries:
@@ -142,7 +142,7 @@ supply-chain audit tail (`mongocrypt`/`ring`/`aws-lc`). Trace what the constrain
    a thin HTTP shell over it. Drivers must leave here or the box links them.
 3. **`fabric-backends`** — the driver bag (every vendor crate). This is what `fabricd` links and the
    box must not.
-4. **`fabric-wire`** — the non-obvious one, and the reason it is five and not four. The box and the
+4. **`runlet-wire`** — the non-obvious one, and the reason it is five and not four. The box and the
    daemon **share** code: the wire protocol, the `Egress` trait, the error taxonomy, the circuit
    breaker, the metric collector. That shared code cannot live in `runlet-core` (then
    `fabric-backends` would depend on it and re-pull QuickJS into `fabricd`) and cannot live in
@@ -150,18 +150,18 @@ supply-chain audit tail (`mongocrypt`/`ring`/`aws-lc`). Trace what the constrain
    It must be a **third, neutral leaf** that depends on neither.
 
 So: two binaries + the sandbox lib + the driver bag + the shared leaf neither side can own = five.
-Drop `fabric-wire` and the dependency graph collapses the very isolation the split exists to get.
+Drop `runlet-wire` and the dependency graph collapses the very isolation the split exists to get.
 
 The dependency rule that enforces it (`runlet` never depends on `fabric-backends`; `fabric-backends`
 never depends on `runlet-core`):
 
 ```
-fabric-wire            (leaf: no drivers, no QuickJS)
+runlet-wire            (leaf: no drivers, no QuickJS)
   ├── runlet-core      (QuickJS, no drivers)      ──>  runlet   (box: no drivers, no creds)
   └── fabric-backends  (drivers, no QuickJS)       ──>  fabricd  (sidecar: drivers + creds)
 ```
 
-`fabric-wire` is the only crate both arms touch, and it is deliberately tiny. The guarantee is
+`runlet-wire` is the only crate both arms touch, and it is deliberately tiny. The guarantee is
 checkable: `cargo tree -p runlet` shows no vendor driver, and `cargo tree -p fabricd` shows no
 QuickJS/`rquickjs`.
 
@@ -221,7 +221,7 @@ QuickJS/`rquickjs`.
    classification all preserved. `mail`/`amq`/`auth` are structurally identical (dispatch
    unchanged) + unit-tested glue, not yet live-smoked (need SMTP/broker/IdP infra).
 4. **Driver crates leave `runlet-core`.**
-   - ✅ **4a — done.** Extracted two crates: **`fabric-wire`** (the shared leaf: the `Egress`
+   - ✅ **4a — done.** Extracted two crates: **`runlet-wire`** (the shared leaf: the `Egress`
      trait + `EgressError`, the `ErrorOwner`/`Fault`/`DynamicFault` taxonomy + `__runlet` wire
      envelope, the `CircuitBreaker`, and the metric `Collector`) and **`fabric-backends`** (the six
      `*Backend`s + their `*Config`/`*Metric`/`*Error`/`*Deps` + the in-process `BackendSet`, the
@@ -229,7 +229,7 @@ QuickJS/`rquickjs`.
      `amqprs`/`async-nats`) now live in `fabric-backends`; `runlet-core` links **none** even with
      `full` (proven via `cargo tree`) — the core feature matrix shrank to just the JS wrappers
      (`<cap>.rs`'s `inject_wrapper` + `js/*.js`) and the engine seam. `fabric-backends` depends on
-     `fabric-wire` only — never on `runlet-core` (no QuickJS), so it is the shape `fabricd` will
+     `runlet-wire` only — never on `runlet-core` (no QuickJS), so it is the shape `fabricd` will
      host. `runlet` wires an in-process `BackendSet` (provable no-op: clippy clean across the full
      cfg matrix, all tests green, behavior unchanged). The driver-backed `ExecMetrics` fields left
      the engine — the binary drains them straight from the `BackendSet`.
@@ -256,7 +256,7 @@ QuickJS/`rquickjs`.
    - The box (`runlet`) **dropped the `fabric-backends` dep entirely** — it links **no** network
      driver and holds **no** credentials (proven via `cargo tree -p runlet`). The driver-free wire
      contract (the `Egress` trait, the wire protocol, the `*Metric` types, `BackendMetrics`,
-     `MeteredEgress`) moved to `fabric-wire`; `fabric-backends` keeps the drivers + `*Config` +
+     `MeteredEgress`) moved to `runlet-wire`; `fabric-backends` keeps the drivers + `*Config` +
      `ResourceBinding`.
    - **No in-process fallback:** a request that names a driver resource requires `fabricd`. An
      unreachable/absent sidecar is `503 EGRESS_UNAVAILABLE`; an unknown/wrong-kind name is resolved

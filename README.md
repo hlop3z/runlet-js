@@ -10,7 +10,7 @@ Powered by QuickJS (via rquickjs), axum, and mimalloc.
 The driver-backed capabilities are brokered by the **`fabricd` egress sidecar**, which lives
 in its own repo: [github.com/hlop3z/fabricd](https://github.com/hlop3z/fabricd). This repo is
 fully independent of it — `fabricd` implements the wire contract defined here
-(`crates/fabric-wire`) and can be replaced by anything else that speaks it.
+(`crates/runlet-wire`) and can be replaced by anything else that speaks it.
 
 ## [Docker](https://github.com/hlop3z/runlet-js/pkgs/container/runlet-js)
 

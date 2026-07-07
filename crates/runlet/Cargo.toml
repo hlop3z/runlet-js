@@ -17,9 +17,9 @@ path = "src/main.rs"
 [dependencies]
 runlet-core = { path = "../runlet-core" }
 # The box links NO network driver: it talks to the `fabricd` sidecar over UDS or QUIC using the
-# driver-free wire contract in `fabric-wire` (the `Egress` trait, the wire + QUIC transport, the
+# driver-free wire contract in `runlet-wire` (the `Egress` trait, the wire + QUIC transport, the
 # metric types). Credentials live in `fabricd`, never here.
-fabric-wire = { path = "../fabric-wire" }
+runlet-wire = { path = "../runlet-wire" }
 axum.workspace = true
 mimalloc.workspace = true
 serde.workspace = true

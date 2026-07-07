@@ -12,7 +12,7 @@ const MONGO_WRAPPER: &str = include_str!("js/mongo.js");
 
 /// Injects the `mongo` global (the `mongo.js` wrapper, routing through `io.call`).
 ///
-/// No connection happens here — the wired [`fabric_wire::Egress`] port (e.g. an in-process
+/// No connection happens here — the wired [`runlet_wire::Egress`] port (e.g. an in-process
 /// `BackendSet`, or a sidecar) serves the calls. The presence of a `mongo` resource on the
 /// invocation gates this wrapper (the engine never sees credentials).
 ///

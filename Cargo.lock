@@ -616,20 +616,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fabric-wire"
-version = "0.1.1"
-dependencies = [
- "quinn",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tokio",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1984,7 +1970,6 @@ name = "runlet"
 version = "0.1.1"
 dependencies = [
  "axum 0.8.9",
- "fabric-wire",
  "hex",
  "mimalloc",
  "opentelemetry",
@@ -1992,6 +1977,7 @@ dependencies = [
  "opentelemetry_sdk",
  "quinn",
  "runlet-core",
+ "runlet-wire",
  "rustls",
  "serde",
  "serde_json",
@@ -2017,19 +2003,33 @@ dependencies = [
  "base64",
  "chrono",
  "crossbeam-queue",
- "fabric-wire",
  "hex",
  "hmac",
  "moka",
  "percent-encoding",
  "reqwest",
  "rquickjs",
+ "runlet-wire",
  "rust_decimal",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "runlet-wire"
+version = "0.1.1"
+dependencies = [
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
 ]
 
 [[package]]

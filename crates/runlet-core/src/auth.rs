@@ -12,7 +12,7 @@ const AUTH_WRAPPER: &str = include_str!("js/auth.js");
 
 /// Injects the `auth` global (the `auth.js` wrapper, routing through `io.call`).
 ///
-/// No connection happens here — the wired [`fabric_wire::Egress`] port (e.g. an in-process
+/// No connection happens here — the wired [`runlet_wire::Egress`] port (e.g. an in-process
 /// `BackendSet`, or a sidecar) serves the calls. The presence of a `auth` resource on the
 /// invocation gates this wrapper (the engine never sees credentials).
 ///

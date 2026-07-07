@@ -1438,7 +1438,7 @@ def _locate_fabricd(repo: str):
     (github.com/hlop3z/fabricd); the box repo stays independent of it. Lookup order:
       1. `FABRICD_BIN` — explicit path to a prebuilt binary.
       2. a sibling checkout `../fabricd` — built there with its own workspace (it path-depends
-         on this repo's `crates/fabric-wire`, so the sibling layout is the expected one).
+         on this repo's `crates/runlet-wire`, so the sibling layout is the expected one).
     Returns the binary path, or None — the box then runs WITHOUT a sidecar and every
     driver-backed section self-skips (probes answer 503 EGRESS_UNAVAILABLE)."""
     explicit = os.environ.get("FABRICD_BIN")

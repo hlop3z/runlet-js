@@ -26,8 +26,8 @@ use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::{Status, TraceContextExt as _};
 
-use fabric_wire::wire::WireInit;
-use fabric_wire::{
+use runlet_wire::wire::WireInit;
+use runlet_wire::{
     AmqMetric, AuthMetric, BackendMetrics, DbMetric, Egress, MailMetric, MeteredEgress,
     MongoMetric, RedisMetric, ct_eq,
 };
@@ -1464,7 +1464,7 @@ fn system_error_response(error: ErrorEnvelope, status: u16, meta: Meta) -> AxumR
 #[cfg(test)]
 mod tests {
     //! `/execute` bearer-auth gate: `Authorization` header parsing (constant-time compare itself is
-    //! tested in `fabric_wire::ct`).
+    //! tested in `runlet_wire::ct`).
 
     use super::request_authorized;
     use axum::http::HeaderMap;

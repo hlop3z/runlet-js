@@ -1,14 +1,14 @@
 //! Shared sandbox utilities: input-size validation, the script-error JSON helper, and the
 //! metric-collection apparatus.
 //!
-//! The generic [`Collector`] + its helpers moved to `fabric-wire` (shared with the driver
+//! The generic [`Collector`] + its helpers moved to `runlet-wire` (shared with the driver
 //! backends); they are re-exported here under `crate::sandbox` for the in-engine capabilities
 //! (`http`/`s3`) and the engine's metric drain, so those call sites stay unchanged.
 
 // The metric apparatus is used only by the in-engine capabilities (`http`/`s3`); a build without
 // them (incl. a deterministic-only core) links none of it.
 #[cfg(any(feature = "http", feature = "s3"))]
-pub(crate) use fabric_wire::metrics::{Collector, check_op_limit, drain, new_collector, record};
+pub(crate) use runlet_wire::metrics::{Collector, check_op_limit, drain, new_collector, record};
 
 /// Builds a JSON error string: `{"error": "message"}`.
 ///

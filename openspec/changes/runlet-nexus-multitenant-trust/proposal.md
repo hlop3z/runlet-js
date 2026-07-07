@@ -25,7 +25,7 @@
 
 ## Impact
 
-- **Code:** `runlet/src/{config.rs,handler.rs,main.rs}` (trusted-header ingress, boot guard, tenant sourcing), `runlet-core` partition/bytecode-cache keying, `fabric-wire` `WireInit` (carry tenant id), `fabricd` resource resolution (tenant-scoped), a new quota surface.
+- **Code:** `runlet/src/{config.rs,handler.rs,main.rs}` (trusted-header ingress, boot guard, tenant sourcing), `runlet-core` partition/bytecode-cache keying, `runlet-wire` `WireInit` (carry tenant id), `fabricd` resource resolution (tenant-scoped), a new quota surface.
 - **APIs:** `/execute` request contract gains trusted-header inputs and drops the caller-asserted `X-Partition-Key`; new `403`/`401` rejection and `quota_exceeded` outcomes.
 - **Deployment:** requires the nexus edge in front + a k8s NetworkPolicy restricting `pool_jsbox` to the edge. Not exposed directly.
 - **Cross-repo dependency (nexus, not jsbox work):** upstream requirement **N5** — the identity plane must emit the *authorized acting org* (via ZITADEL org-scoped token + grants), distinct from the user's home-org `resourceowner`, so `x-tenant-id` is a trustworthy acting-workspace id.

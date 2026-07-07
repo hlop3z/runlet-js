@@ -70,12 +70,12 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
 it links no vendor driver and holds no credentials. The egress sidecar **`fabricd`** and the
 driver bag **`fabric-backends`** live in their own repo (`github.com/hlop3z/fabricd`, expected
 as a sibling checkout `../fabricd` for dev/tests) and are **replaceable at any time**: this
-repo owns the entire contract (`crates/fabric-wire`), and anything that speaks it can stand in
+repo owns the entire contract (`crates/runlet-wire`), and anything that speaks it can stand in
 for `fabricd`. Nothing here depends on the fabricd repo — the dependency points the other way.
 
 **Cargo workspace (three crates + a bench crate):**
 
-- **`fabric-wire`** (`crates/fabric-wire/`) — the shared, driver-free, QuickJS-free egress
+- **`runlet-wire`** (`crates/runlet-wire/`) — the shared, driver-free, QuickJS-free egress
   contract, depended on by every other crate (including, cross-repo, the fabricd repo's
   crates): the `Egress` trait + `EgressError`, the error
   taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__runlet` wire envelope), the per-target
@@ -129,7 +129,7 @@ for `fabricd`. Nothing here depends on the fabricd repo — the dependency point
 
 **In the sibling repo** (`github.com/hlop3z/fabricd`): **`fabricd`** — the egress sidecar /
 broker (bin) holding the operator credential table and **all** the vendor drivers (via its
-`fabric-backends` crate), hosting a `BackendSet` per session behind the `fabric-wire` protocol
+`fabric-backends` crate), hosting a `BackendSet` per session behind the `runlet-wire` protocol
 over UDS or QUIC. Required for driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
 `auth`); deterministic/`http`/`s3` requests never need it. Its design docs stay canonical
 here: `docs/design/resource-egress.md`, `docs/design/network-fabric.md`.

@@ -1,5 +1,5 @@
 [package]
-name = "fabric-wire"
+name = "runlet-wire"
 description = "Shared egress-port wire contract for runlet: the Egress trait, the tagged-error envelope, the error taxonomy primitives, the per-target circuit breaker, and the metric collector — owned by this repo, consumed by runlet-core/runlet here and by the fabricd repo's crates; no driver or QuickJS code"
 readme = "../../README.md"
 version.workspace = true
