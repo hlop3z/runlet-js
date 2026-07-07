@@ -202,8 +202,11 @@ criteria = "safe-to-run"
 version = "0.5.4"
 criteria = "safe-to-deploy"
 
+# Bumped 0.9.8 -> 0.9.20 with the RUSTSEC-2026-0204 fix (2026-07-07): the imported audit
+# sets cover deltas only up to 0.9.18 and no upstream audit of 0.9.20 exists yet — the old
+# 0.9.8 anchor + delta chain can replace this again once one lands (cargo vet prune).
 [[exemptions.crossbeam-epoch]]
-version = "0.9.8"
+version = "0.9.20"
 criteria = "safe-to-deploy"
 
 [[exemptions.crossbeam-queue]]
