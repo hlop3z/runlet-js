@@ -1,7 +1,7 @@
 #!/bin/sh
 # Per-capability cfg sweep for runlet-core (the deterministic-core feature matrix).
 # Runs the real gate (plain `cargo clippy`, NOT --all-targets) for each single capability
-# plus the no-capability build. fabric-backends is featureless and not swept here.
+# plus the no-capability build. fabric-backends (fabricd repo) is featureless and not swept.
 set -e
 for f in NONE db mongo mail redis amq auth http s3; do
   if [ "$f" = "NONE" ]; then

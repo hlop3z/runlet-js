@@ -9,8 +9,8 @@ This guide shows how to run **jsbox** using Docker Compose.
 Download only the required runtime files:
 
 ```sh
-curl -O https://raw.githubusercontent.com/hlop3z/jsbox/main/container/docker-compose.yml
-curl -O https://raw.githubusercontent.com/hlop3z/jsbox/main/container/config.json
+curl -O https://raw.githubusercontent.com/hlop3z/runlet-js/main/container/docker-compose.yml
+curl -O https://raw.githubusercontent.com/hlop3z/runlet-js/main/container/config.json
 ```
 
 ---
@@ -106,9 +106,11 @@ global `handler`). The `tests/` examples are excluded for that reason.
 `fabricd` sidecar resolves that name against its own credential table and performs
 the I/O. Endpoints and passwords never appear in the request or in the box.
 
-- Copy `fabricd.example.json` → `fabricd.json` (gitignored) and fill in real
-  values; run `fabricd` next to the box (see the commented service in
-  `docker-compose.yml` and [docs/deployment.md §5](../docs/deployment.md)).
+- Copy the fabricd repo's `fabricd.example.json` → `fabricd.json` (gitignored)
+  and fill in real values; run `fabricd` (from
+  [github.com/hlop3z/fabricd](https://github.com/hlop3z/fabricd)) next to the box
+  (see the commented service in `docker-compose.yml` and
+  [docs/deployment.md §5](../docs/deployment.md)).
 - Without a sidecar, a request naming a driver resource gets
   `503 EGRESS_UNAVAILABLE`. Deterministic scripts, `api`, and `s3` need no sidecar.
 

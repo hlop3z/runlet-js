@@ -66,10 +66,18 @@ A sandboxed JavaScript execution service in Rust. Clients `POST /execute` a JS
 `handler(ctx)` function plus a JSON context; the server runs it in an isolated QuickJS
 context and returns `{data, error, meta}`. The single endpoint is the whole product.
 
-**Cargo workspace (five crates + a bench crate):**
+**Two repos, one contract.** This repo (`runlet-js`) is the box and is fully self-contained:
+it links no vendor driver and holds no credentials. The egress sidecar **`fabricd`** and the
+driver bag **`fabric-backends`** live in their own repo (`github.com/hlop3z/fabricd`, expected
+as a sibling checkout `../fabricd` for dev/tests) and are **replaceable at any time**: this
+repo owns the entire contract (`crates/fabric-wire`), and anything that speaks it can stand in
+for `fabricd`. Nothing here depends on the fabricd repo — the dependency points the other way.
+
+**Cargo workspace (three crates + a bench crate):**
 
 - **`fabric-wire`** (`crates/fabric-wire/`) — the shared, driver-free, QuickJS-free egress
-  contract, depended on by every other crate: the `Egress` trait + `EgressError`, the error
+  contract, depended on by every other crate (including, cross-repo, the fabricd repo's
+  crates): the `Egress` trait + `EgressError`, the error
   taxonomy (`ErrorOwner`/`Fault`/`DynamicFault` + the `__runlet` wire envelope), the per-target
   `CircuitBreaker`, the metric `Collector`, **and** the box↔`fabricd` wire protocol (`wire.rs`:
   `WireInit`/`WireCall`/`WireRequest`/`WireResponse` + length-prefixed framing, the `*Metric`
@@ -78,19 +86,9 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   `subtle`, used by both the box's edge-credential check and `fabricd`'s static-token check) plus
   the **QUIC remote transport** (`quic.rs`:
   pinned-self-signed-cert server/client `quinn` endpoint builders + `ServerTls`, on the shared
-  `aws-lc-rs` provider) that the same framing rides for a network `fabricd`.
-- **`fabric-backends`** (`crates/fabric-backends/`) — the driver-backed egress backends
-  (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`), each a JS-free `*Backend` (string-in/string-out
-  dispatch + metrics + `into_resource_error`), plus `BackendSet` (wires them behind
-  `fabric_wire::Egress`), the `*Config` types, and the operator `TenantResourceBinding` table +
-  **tenant-scoped** name→config `resolve` (each binding carries the `tenant` authorized to use it; a
-  cross-tenant name resolves as `NotFound` so existence never leaks across workspaces). Also hosts
-  `sa_token` (`JwksVerifier`): offline k8s `ServiceAccount`-token
-  verification (cluster-JWKS RSA sig + `aud`/`iss`/`exp`) for `fabricd`'s QUIC `sa-token` client
-  authenticator — it lives here because this crate already owns `reqwest`/`jsonwebtoken`, not because
-  it is an egress backend. Holds **all** the vendor drivers. Depends on `fabric-wire` only (never
-  `runlet-core` — no QuickJS); **only `fabricd` links it.** Featureless (the driver bag always
-  carries every backend). See `docs/design/resource-egress.md`.
+  `aws-lc-rs` provider) that the same framing rides for a network `fabricd`. **Changing this
+  crate changes the cross-repo contract** — keep it additive/compatible or coordinate a
+  matching fabricd change.
 - **`runlet-core`** (`crates/runlet-core/`) — the reusable logic host: the QuickJS engine,
   runtime pool, sandbox, resilience, error taxonomy, capabilities, and the callable
   [`LogicHost`] port (`Invocation` → `Outcome`). Knows nothing about HTTP. The public entry
@@ -128,22 +126,13 @@ context and returns `{data, error, meta}`. The single endpoint is the whole prod
   roles/entitlements (`authz.rs`), and enforces per-tenant plan-gated quota (`quota.rs`). A boot
   guard refuses trusted mode on a non-loopback bind unless network isolation is asserted. See
   `docs/design/multitenant-trust.md`.
-- **`fabricd`** (`crates/fabricd/`) — the egress **sidecar / broker** (bin): holds the operator
-  credential table (its `resources` config) and **all** the drivers (via `fabric-backends`), and
-  hosts a `BackendSet` per session behind the `fabric-wire` protocol over **either transport** —
-  a local **UDS** (the zero-config default) or a remote **QUIC** listener (`quic` config: a shared,
-  network-reachable cluster service). One UDS connection / one QUIC bi-stream = one box-request
-  session (`Init`(names+deadline+**tenant**)→`Call`\*→`Drain`(metrics)); it resolves the box's logical
-  names to configs **within the session tenant's binding set** (a name bound for another tenant
-  resolves as `NotFound`), so credentials never reach the box and never cross workspaces. On QUIC it
-  validates the box's `WireInit.token` before
-  resolving anything via a pluggable `ClientAuthenticator` (`auth.rs`: `none` / `static` /
-  `sa-token`), and caps concurrent connections + streams. The `sa-token` provider verifies a k8s
-  projected `ServiceAccount` token **offline** against the cluster JWKS (RSA sig + `aud`/`iss`/`exp`)
-  via `fabric_backends::sa_token::JwksVerifier` — a background-refreshed key cache that keeps the
-  synchronous accept path I/O-free (fail-closed until the first fetch); only the **KIND end-to-end**
-  test remains. Required for driver-backed capabilities; the on-ramp to the network fabric
-  (`docs/design/network-fabric.md`).
+
+**In the sibling repo** (`github.com/hlop3z/fabricd`): **`fabricd`** — the egress sidecar /
+broker (bin) holding the operator credential table and **all** the vendor drivers (via its
+`fabric-backends` crate), hosting a `BackendSet` per session behind the `fabric-wire` protocol
+over UDS or QUIC. Required for driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
+`auth`); deterministic/`http`/`s3` requests never need it. Its design docs stay canonical
+here: `docs/design/resource-egress.md`, `docs/design/network-fabric.md`.
 
 ## Commands
 
@@ -155,7 +144,7 @@ The project uses [Task](https://taskfile.dev) (`Taskfile.yml`). Raw `cargo` equi
 - **Format:** `task fmt` / `task fmt-check`
 - **Lint:** `task clippy` (`cargo clippy`) — see the lint warning below
 - **Unit tests:** `cargo test`
-- **Integration tests:** `task test-db-up` (starts Postgres + PgBouncer + CockroachDB + a local httpbin via `docker compose`), then `python tests/test_simple.py`. The db section also runs through PgBouncer (transaction pooling, host `:6432`) to keep the external-pooler path covered (`docs/design/pooled-capabilities.md`). The HTTP `api` tests hit the local `httpbin` service (host `:8095`, env-overridable `HTTPBIN_URL`) — hermetic, no httpbin.org dependency; note go-httpbin echoes headers as **arrays**, and reaching it requires `debug: true` (SSRF private-IP relax). The script-registry section needs the server started by the harness itself (it generates `.test-run/config.json` with `debug: true` + `scripts_dir=tests/scripts`) and self-skips otherwise. The Python harness **starts its own server** with `cargo run`, so don't run one separately. It is a custom runner (not pytest) — there is no per-test name filter; edit `main()` in `tests/test_simple.py` to narrow what runs. Each capability section **self-skips** if its backend isn't reachable (it live-probes first), so a partial `docker compose up` only runs what's available.
+- **Integration tests:** `task test-db-up` (starts Postgres + PgBouncer + CockroachDB + a local httpbin via `docker compose`), then `python tests/test_simple.py`. The db section also runs through PgBouncer (transaction pooling, host `:6432`) to keep the external-pooler path covered (`docs/design/pooled-capabilities.md`). The HTTP `api` tests hit the local `httpbin` service (host `:8095`, env-overridable `HTTPBIN_URL`) — hermetic, no httpbin.org dependency; note go-httpbin echoes headers as **arrays**, and reaching it requires `debug: true` (SSRF private-IP relax). The script-registry section needs the server started by the harness itself (it generates `.test-run/config.json` with `debug: true` + `scripts_dir=tests/scripts`) and self-skips otherwise. The Python harness **starts its own server** with `cargo run`, so don't run one separately. Driver-backed sections (db/mongo/nats/auth) additionally need the **`fabricd` sidecar from its own repo**: set `FABRICD_BIN` to a prebuilt binary, or keep a sibling checkout at `../fabricd` (the harness builds it there); without one, those sections self-skip. It is a custom runner (not pytest) — there is no per-test name filter; edit `main()` in `tests/test_simple.py` to narrow what runs. Each capability section **self-skips** if its backend isn't reachable (it live-probes first), so a partial `docker compose up` only runs what's available.
   - **Auth (`auth`) tests** need an identity provider. `docker compose up -d keycloak zitadel` brings up both. Keycloak (host `:8081`) is fully automatic — the harness mints a token via the `admin-cli` password grant and creates a confidential client for introspection. ZITADEL (host `:8082`) needs its bootstrap service-account PAT: `docker compose exec`-free, it's written to `./.zitadel/zitadel-admin-sa.pat` (a gitignored bind mount) on first start, so run the suite with `ZITADEL_PAT_FILE=./.zitadel/zitadel-admin-sa.pat` (or `ZITADEL_PAT=<token>`). Provider URLs/creds are env-overridable (`KEYCLOAK_ISSUER`, `ZITADEL_ISSUER`, …) for in-network/CI runs. ZITADEL introspection needs an API app, so introspection-with-creds is exercised on Keycloak; ZITADEL covers discovery + userinfo + the throw path.
 - **Everything:** `task` (fmt-check + clippy + tests + supply-chain) · `task check` (no supply-chain)
 - **Supply chain:** `task supply-chain` (cargo-audit + cargo-deny + cargo-vet; install via `task setup`). cargo-vet is initialized (`supply-chain/`): the dep tree is covered by imported third-party audit sets (Mozilla/Google/Bytecode Alliance/Embark/Zcash/ISRG) with the remainder as `exemptions` — a new/bumped dep that isn't audited or exempted fails `cargo vet`, so re-run it after dependency changes and `cargo vet prune` / add an exemption as needed. **cargo-vet is version-pinned in lockstep between `task setup` (Taskfile) and CI (`ci.yml`), currently 0.10.2** — the `imports.lock` format changes across versions (0.10.2 writes `trusted-publisher` entries that 0.10.0, the last prebuilt GitHub release, cannot parse), so bump both places together or CI fails on a lock file the local tool wrote.

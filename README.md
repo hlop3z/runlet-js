@@ -1,4 +1,4 @@
-# jsbox (runlet)
+# runlet
 
 A sandboxed JavaScript execution engine built in Rust. Send a JS handler function + context via HTTP, get structured `{data, error, meta}` back.
 
@@ -7,12 +7,17 @@ Powered by QuickJS (via rquickjs), axum, and mimalloc.
 > 🧒 **New here?** Start with the friendly, beginner-first guide in **[`docs/`](docs/README.md)** —
 > it explains `api`, `db`, `mail`, `s3`, and how to handle money/decimals in plain language.
 
-## [Docker](https://github.com/hlop3z/jsbox/pkgs/container/jsbox)
+The driver-backed capabilities are brokered by the **`fabricd` egress sidecar**, which lives
+in its own repo: [github.com/hlop3z/fabricd](https://github.com/hlop3z/fabricd). This repo is
+fully independent of it — `fabricd` implements the wire contract defined here
+(`crates/fabric-wire`) and can be replaced by anything else that speaks it.
+
+## [Docker](https://github.com/hlop3z/runlet-js/pkgs/container/runlet-js)
 
 - [Docker-Compose](container/)
 
 ```sh
-docker run --rm -it -p 4172:3000 ghcr.io/hlop3z/jsbox:latest
+docker run --rm -it -p 4172:3000 ghcr.io/hlop3z/runlet-js:latest
 ```
 
 ```sh

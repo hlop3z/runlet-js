@@ -1433,14 +1433,45 @@ def _wait_for_server() -> bool:
     return False
 
 
+def _locate_fabricd(repo: str):
+    """Locate (or build) the `fabricd` binary. `fabricd` lives in its own repo
+    (github.com/hlop3z/fabricd); the box repo stays independent of it. Lookup order:
+      1. `FABRICD_BIN` — explicit path to a prebuilt binary.
+      2. a sibling checkout `../fabricd` — built there with its own workspace (it path-depends
+         on this repo's `crates/fabric-wire`, so the sibling layout is the expected one).
+    Returns the binary path, or None — the box then runs WITHOUT a sidecar and every
+    driver-backed section self-skips (probes answer 503 EGRESS_UNAVAILABLE)."""
+    explicit = os.environ.get("FABRICD_BIN")
+    if explicit:
+        return explicit if os.path.exists(explicit) else None
+    sibling = os.path.join(os.path.dirname(repo), "fabricd")
+    if os.path.isdir(os.path.join(sibling, "crates", "fabricd")):
+        try:
+            subprocess.run(["cargo", "build", "-p", "fabricd"], cwd=sibling, check=True)
+        except Exception:
+            return None
+        exe = "fabricd.exe" if os.name == "nt" else "fabricd"
+        path = os.path.join(sibling, "target", "debug", exe)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+# Set by `_start_servers`: whether a `fabricd` sidecar is up. Sections that would FAIL (not
+# self-skip) without one — auth runs against providers probed before startup — key off this.
+FABRICD_UP = False
+
+
 def _start_servers(resources: dict) -> list:
     """Start the two-process topology in `.test-run/`: `fabricd` (holds the credential `resources`
     table + the drivers) over a UDS, then `runlet` (the box, driver-free) pointed at that socket.
 
     The box reads `config.json` from its cwd; `fabricd` reads its table from `FABRICD_CONFIG`. Both
     live in a gitignored scratch dir so this doesn't change `task run` behavior. Returns the
-    started processes (caller terminates them).
+    started processes (caller terminates them). If no `fabricd` binary can be found (see
+    `_locate_fabricd`), only the box starts and driver-backed sections self-skip.
     """
+    global FABRICD_UP
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".test-run")
     os.makedirs(run_dir, exist_ok=True)
@@ -1455,42 +1486,54 @@ def _start_servers(resources: dict) -> list:
         if os.path.isdir(src):
             shutil.copytree(src, merged_modules, dirs_exist_ok=True)
 
+    fabricd_bin = _locate_fabricd(repo)
     socket = os.path.join(run_dir, "fabricd.sock")
-    # fabricd: the operator credential table + the Tier-0 statement_timeout ceiling. Credentials
-    # live ONLY here â€” the box never sees them.
-    fabricd_cfg = {"socket": socket, "max_statement_timeout_ms": 800, "resources": resources}
-    with open(os.path.join(run_dir, "fabricd.json"), "w", encoding="utf-8") as fh:
-        json.dump(fabricd_cfg, fh)
+    if fabricd_bin is not None:
+        # fabricd: the operator credential table + the Tier-0 statement_timeout ceiling. Credentials
+        # live ONLY here â€” the box never sees them.
+        fabricd_cfg = {"socket": socket, "max_statement_timeout_ms": 800, "resources": resources}
+        with open(os.path.join(run_dir, "fabricd.json"), "w", encoding="utf-8") as fh:
+            json.dump(fabricd_cfg, fh)
+    else:
+        print("NOTE: no `fabricd` binary (set FABRICD_BIN or clone github.com/hlop3z/fabricd "
+              "as a sibling of this repo) â€” driver-backed sections will self-skip")
     # Box: a fabricd socket + scripts/modules + low bounds. NO `resources`, NO credentials.
     # debug=true relaxes the SSRF private-IP block so the `api` tests can reach the local httpbin.
     box_cfg = {
         "debug": True,
         "scripts_dir": os.path.join(repo, "tests", "scripts"),
         "modules_dir": merged_modules,
-        "fabricd_socket": socket,
         "engine": {"max_concurrent_executions": 6, "max_concurrent_per_partition": 2},
     }
+    if fabricd_bin is not None:
+        box_cfg["fabricd_socket"] = socket
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(box_cfg, fh)
 
-    # Build both up front, then launch the binaries directly â€” two concurrent `cargo run`
-    # invocations would race on the target/ build lock.
-    subprocess.run(["cargo", "build", "-p", "fabricd", "-p", "runlet"], cwd=repo, check=True)
+    # Build the box up front, then launch the binaries directly â€” a concurrent `cargo run`
+    # would race on the target/ build lock. (`fabricd` was already built by `_locate_fabricd`
+    # in its own repo/workspace.)
+    subprocess.run(["cargo", "build", "-p", "runlet"], cwd=repo, check=True)
     bindir = os.path.join(repo, "target", "debug")
-    if os.path.exists(socket):
-        os.remove(socket)
-    fabricd = subprocess.Popen(
-        [os.path.join(bindir, "fabricd")], cwd=run_dir,
-        env={**os.environ, "FABRICD_CONFIG": os.path.join(run_dir, "fabricd.json")},
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(60):  # wait for fabricd to bind the socket before starting the box
+    procs = []
+    if fabricd_bin is not None:
         if os.path.exists(socket):
-            break
-        time.sleep(0.5)
+            os.remove(socket)
+        fabricd = subprocess.Popen(
+            [fabricd_bin], cwd=run_dir,
+            env={**os.environ, "FABRICD_CONFIG": os.path.join(run_dir, "fabricd.json")},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(fabricd)
+        for _ in range(60):  # wait for fabricd to bind the socket before starting the box
+            if os.path.exists(socket):
+                break
+            time.sleep(0.5)
+        FABRICD_UP = True
     runlet = subprocess.Popen(
         [os.path.join(bindir, "runlet")], cwd=run_dir,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return [fabricd, runlet]
+    procs.append(runlet)
+    return procs
 
 
 def _start_trusted_box(port: int = 3010):
@@ -1805,7 +1848,12 @@ def main():
         print("\n  \033[33mSKIP\033[0m NATS tests (not running â€” use: docker compose up -d nats)\n")
 
     # Auth tests â€” for whichever providers were reachable at discovery (before startup).
-    run_auth_tests(t, auth_providers)
+    # They run through the box â†’ fabricd, so they need the sidecar (unlike the probed
+    # sections above, they would fail rather than self-skip without it).
+    if FABRICD_UP or not procs:
+        run_auth_tests(t, auth_providers)
+    elif auth_providers:
+        print("\n  \033[33mSKIP\033[0m auth tests (no fabricd sidecar â€” see FABRICD_BIN)\n")
 
     # Trusted-mode acting-org gate (nexus N5): needs its own box in trusted mode. Only when this
     # harness owns the local build/run (it spins up a second runlet on a loopback port); skipped when

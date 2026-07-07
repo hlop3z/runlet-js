@@ -856,7 +856,7 @@ declare const $sys: Sys;
  * Type surface for the operator-deployed injectable module `modules/hasura/client.mjs`.
  * Unlike the capability globals above, this is **imported**, not ambient:
  * `import { hasura } from "hasura/client";`. It resolves only when the file is deployed
- * under `config.modules_dir`; see {@link https://github.com/hlop3z/jsbox/blob/main/docs/modules.md modules.md}.
+ * under `config.modules_dir`; see {@link https://github.com/hlop3z/runlet-js/blob/main/docs/modules.md modules.md}.
  */
 declare module "hasura/client" {
   /** Options for {@link hasura}. */

@@ -2,8 +2,6 @@
 resolver = "3"
 members = [
     "crates/fabric-wire",
-    "crates/fabric-backends",
-    "crates/fabricd",
     "crates/runlet-core",
     "crates/runlet",
     "crates/runlet-bench",
@@ -16,8 +14,8 @@ members = [
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.92"
-license = "MIT"
-repository = "https://github.com/user/runlet"
+license = "BSD-3-Clause"
+repository = "https://github.com/hlop3z/runlet-js"
 keywords = ["quickjs", "javascript", "scripting", "rust"]
 categories = ["development-tools"]
 
@@ -79,7 +77,6 @@ rquickjs = { version = "0.12", features = [
     "loader",
 ] }
 base64 = "0.22"
-bytes = "1"
 # `clock` (⊇ `std` ⊇ `alloc`) — `$sys`/`s3` need RFC-3339 formatting + `Utc::now`. Declared
 # directly so a `--no-default-features` core build (no driver crates) still has them, rather
 # than relying on a driver to enable them transitively.
@@ -90,29 +87,7 @@ hex = "0.4"
 hmac = "0.13"
 sha2 = "0.11"
 percent-encoding = "2"
-# Async Postgres driver (Tier 2 resilience: per-query deadline + active cancellation
-# via connection teardown — see docs/design/resilience.md). The sync `postgres` wrapper
-# can't time out a blocking query from outside; `tokio-postgres` futures can.
-tokio-postgres = { version = "0.7", features = [
-    "with-serde_json-1",
-    "with-chrono-0_4",
-    "with-uuid-1",
-] }
-# Pinned to 0.1.x: 0.1.5 bumps the MSRV to Rust 1.93.1 (we target 1.92). Revisit with a
-# toolchain bump.
-postgres_rustls = "0.1"
-# Document database (Tier 2 resilience: per-op client-side deadline like db). Async driver;
-# `default-features = false` drops the `dns-resolver` (mongodb+srv) feature we don't use.
-# `rustls-tls-aws-lc` (NOT the default `rustls-tls`, which pulls `ring`) routes mongodb's
-# rustls onto the process-wide `aws-lc-rs` provider — one crypto stack, no second one.
-# `compat-3-0-0` is mongodb's required major-version acknowledgement feature.
-mongodb = { version = "3", default-features = false, features = [
-    "compat-3-0-0",
-    "rustls-tls-aws-lc",
-] }
 rustls = "0.23"
-tokio-rustls = "0.26"
-webpki-roots = "1"
 # QUIC transport for the box↔fabricd remote egress link (the network alternative to the local
 # UDS). `default-features = false` + `rustls-aws-lc-rs` keeps it on the one process-wide
 # `aws-lc-rs` rustls provider (NOT the default `ring`), reusing the existing crypto stack. See
@@ -130,43 +105,9 @@ reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "rustls",
 ] }
-# Offline JWT/JWKS verification for the `fabricd` QUIC `sa-token` client authenticator (k8s
-# projected ServiceAccount tokens). `aws_lc_rs` backend (v10) reuses the one process-wide
-# `aws-lc-rs` provider — no `ring`, no second crypto stack. `use_pem` enables
-# `EncodingKey::from_rsa_pem` for the hermetic unit tests; `DecodingKey::from_jwk` builds keys
-# straight from the cluster JWKS (no hand-parsing of RSA modulus/exponent).
-jsonwebtoken = { version = "10", default-features = false, features = [
-    "use_pem",
-    "aws_lc_rs",
-] }
-# TLS (`amqps://`) reuses the existing `aws-lc-rs` rustls provider (tokio-rustls), not a
-# second crypto stack.
-amqprs = { version = "2", features = ["tls"] }
-# Subject-based messaging backend for the `amq` capability (publish + request-reply). See
-# `docs-sys/rfc.md` §3.5. `default-features = false` drops `ring` (the default crypto
-# provider) for `aws-lc-rs` — reusing the one process-wide provider, no second crypto stack —
-# and sheds the unused jetstream/kv/object-store/service/websockets subsystems. We use only
-# core connect + publish + request-reply (+ optional TLS), so `crypto`/`nuid`/`server_2_10`
-# are the needed defaults.
-async-nats = { version = "0.49", default-features = false, features = [
-    "aws-lc-rs",
-    "crypto",
-    "nuid",
-    "server_2_10",
-] }
-# TLS (`rediss://`) via rustls + webpki bundled roots (managed services use public CAs).
-# `rustls` here defaults to `aws-lc-rs`, the same provider db/reqwest/lettre already use.
-redis = { version = "1", features = ["tls-rustls", "tls-rustls-webpki-roots"] }
-rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
-lettre = { version = "0.11", default-features = false, features = [
-    "smtp-transport",
-    "builder",
-    "hostname",
-    "pool",
-    "rustls-no-provider",
-    "aws-lc-rs",
-    "webpki-roots",
-] }
+# Plain decimal math for the `$`/Decimal global (decimal.rs). The Postgres NUMERIC decode
+# (rust_decimal's `db-tokio-postgres` feature) lives with the drivers in the fabricd repo.
+rust_decimal = "1"
 
 # ──────────────────────────────────────────────────────────────
 # Rustc lints — deny everything allowed-by-default that matters

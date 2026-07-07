@@ -48,6 +48,15 @@ jobs:
       - name: Initialize CockroachDB
         run: docker compose run --rm cockroach-init
 
+      # The egress sidecar lives in its own repo; the harness builds it from a sibling
+      # checkout (../fabricd). Best-effort: without it the driver-backed sections
+      # (db/mongo/nats/auth) self-skip and only the in-box suite runs.
+      - name: Checkout fabricd (sibling)
+        run: |
+          git clone --depth 1 https://github.com/${{ github.repository_owner }}/fabricd \
+            "$GITHUB_WORKSPACE/../fabricd" \
+            || echo "::warning::no fabricd sibling — driver-backed sections will self-skip"
+
       # Warm the build so the harness's `cargo run` starts promptly.
       - name: Pre-build server
         run: cargo build -p runlet

@@ -116,18 +116,25 @@ def _wait_for_server(up: bool, tries: int = 40) -> bool:
 
 
 def _binaries() -> tuple:
-    """Resolve the (runlet, fabricd) binary paths, building both once when not given via env
-    (two concurrent `cargo run`s would race on the target/ build lock)."""
+    """Resolve the (runlet, fabricd) binary paths. `runlet` builds in this repo; `fabricd`
+    lives in its own repo (github.com/hlop3z/fabricd) â€” pass FABRICD_BIN, or keep a sibling
+    checkout at ../fabricd (built here once when needed)."""
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if not (RUNLET_BIN and FABRICD_BIN):
-        subprocess.run(
-            ["cargo", "build", "--quiet", "-p", "runlet", "-p", "fabricd"],
-            cwd=repo, check=True,
-        )
-    bindir = os.path.join(repo, "target", "debug")
+    exe = ".exe" if os.name == "nt" else ""
+    if not RUNLET_BIN:
+        subprocess.run(["cargo", "build", "--quiet", "-p", "runlet"], cwd=repo, check=True)
+    fabricd_bin = FABRICD_BIN
+    if not fabricd_bin:
+        sibling = os.path.join(os.path.dirname(repo), "fabricd")
+        if not os.path.isdir(os.path.join(sibling, "crates", "fabricd")):
+            raise SystemExit(
+                "fabricd binary not found: set FABRICD_BIN or clone "
+                "github.com/hlop3z/fabricd as a sibling of this repo")
+        subprocess.run(["cargo", "build", "--quiet", "-p", "fabricd"], cwd=sibling, check=True)
+        fabricd_bin = os.path.join(sibling, "target", "debug", "fabricd" + exe)
     return (
-        RUNLET_BIN or os.path.join(bindir, "runlet"),
-        FABRICD_BIN or os.path.join(bindir, "fabricd"),
+        RUNLET_BIN or os.path.join(repo, "target", "debug", "runlet" + exe),
+        fabricd_bin,
     )
 
 
