@@ -619,7 +619,7 @@ function handler(ctx) {
   // crypto: one-way hashing/signing, IDs, reversible encoders
   $sys.crypto.sha256("hello"); // hex
   $sys.crypto.hmac("sha256", "key", "msg", "base64"); // hex (default) | base64 | base64url
-  $sys.crypto.uuid(); // v4
+  $sys.crypto.uuid(); // v7 (time-ordered)
   $sys.crypto.base64.encode("hi"); // also .base64url / .hex / .url, each .encode/.decode
 
   // date: parse (ISO/RFC3339, YYYY-MM-DD, epoch ms → UTC), timedelta math, diff

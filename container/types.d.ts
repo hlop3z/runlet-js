@@ -732,7 +732,7 @@ interface SysCrypto {
     msg: string,
     encoding?: SysEncoding,
   ): string;
-  /** A random v4 UUID. */
+  /** A time-ordered v7 UUID (millisecond timestamp prefix + random tail). */
   uuid(): string;
   /** Standard base64 codec. */
   base64: SysCodec;

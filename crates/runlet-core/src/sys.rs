@@ -205,7 +205,7 @@ fn crypto_dispatch(op: &str, payload: &Value, secrets: &SecretStore) -> Result<V
         "sha256" => Ok(Value::String(sha256_hex(field_str(payload, "data")?))),
         "sha512" => Ok(Value::String(sha512_hex(field_str(payload, "data")?))),
         "hmac" => hmac_op(payload, secrets),
-        "uuid" => Ok(Value::String(Uuid::new_v4().to_string())),
+        "uuid" => Ok(Value::String(Uuid::now_v7().to_string())),
         "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode"
         | "hex_encode" | "hex_decode" | "url_encode" | "url_decode" => {
             encoding_dispatch(op, payload)

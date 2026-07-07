@@ -54,7 +54,13 @@ $sys.crypto.hmac("sha256", "my-key", "the message", "base64"); // or "base64url"
 ### A random ID
 
 ```js
-$sys.crypto.uuid(); // "f47ac10b-58cc-4372-a567-0e02b2c3d479"  (a fresh one every time)
+$sys.crypto.uuid(); // "0197c2f3-7d80-7b3a-9e4f-2a1b3c4d5e6f"  (a fresh one every time)
+```
+
+It's a **UUIDv7** — the front of the ID is the current time, so IDs made later sort
+after IDs made earlier. Great for database keys.
+
+```js
 ```
 
 ### Encoders (turn text into safe shapes) 🔡
@@ -214,7 +220,7 @@ $sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws: secrets can'
 
 - `$sys.crypto.sha256(t)` / `.sha512(t)` → fingerprint a string.
 - `$sys.crypto.hmac("sha256", key, msg)` → sign (key can be a `$sys.secrets.X` handle).
-- `$sys.crypto.uuid()` → a random ID.
+- `$sys.crypto.uuid()` → a fresh ID (UUIDv7, time-ordered).
 - `$sys.crypto.base64 / base64url / hex / url` → `.encode()` / `.decode()`.
 - `$sys.date.now()` / `.parse(x)` → a date; then `.add({days})`, `.sub({...})`, `.diff(d)`.
 - `.iso()` / `.unix()` to get it out; `json(...)` makes it an ISO string for free.
