@@ -12,7 +12,7 @@ runlet-core still carries six built-in capability modules (`db`/`mongo`/`mail`/`
 - **Standard capabilities move out of core** into a new `runlet-caps` preset crate (pure data: the six JS wrappers as `CapabilityDef`s, no drivers). The `runlet` bin composes the preset — stock binary behavior unchanged.
 - **BREAKING**: the six vestigial cargo features (`db`, `mongo`, `mail`, `redis`, `amq`, `auth`) are removed from `runlet-core`; only `http` and `s3` remain (the two in-engine capabilities that carry real code). `http`/`s3` stay in core.
 - **BREAKING**: per-capability response metrics move from fixed `meta.<cap>_requests` fields to a dynamic `meta.io.<name>` map keyed by capability name (custom capabilities meter identically to standard ones). Pre-publish, single known consumer — break clean, no alias window.
-- Sandbox invariants (per-request opt-in, op limits/metering, deadline propagation, error taxonomy, `Profile::Deterministic` injecting no I/O) are enforced centrally by the mux for **all** capabilities, built-in or dev-registered — extensions cannot opt out.
+- Sandbox invariants (per-request opt-in, op limits/metering, deadline propagation, error taxonomy, `Profile::Deterministic` injecting no I/O) are enforced centrally by the mux for **all** capabilities, built-in or dev-registered — extensions cannot opt out. The mux **fails closed**: an error in its own enforcement (metering, deadline-clock, trust-policy eval) denies the call rather than falling through to the I/O. Authorities that legitimately do not pass the mux (in-engine `http`/`s3`, ambient clock/RNG/exit) are **enumerated** as a reviewed bypass surface, and `Profile::Deterministic` *removes* the ambient ones rather than leaving them registered-but-gated.
 
 ## Capabilities
 

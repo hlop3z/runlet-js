@@ -70,6 +70,33 @@ clean, `cargo clippy --all-targets` 0 errors, `cargo test` 44 passed.
   the interrupt handler during matching, and ReDoS stays bounded by the execution timeout (no
   separate mitigation needed). Kept as a regression test.
 
+## Follow-up: framework-wide SSRF hardening (`ssrf-guard-hardening`)
+
+Once the guard becomes the framework's promise for *every* `ScriptControlled` capability, the
+audited residual gaps were closed (all incremental, no redesign):
+
+- **Explicit scheme allowlist, per hop** (`http.rs`): `validate_url`/`validate_redirect` accept
+  only `http`/`https` — a non-http(s) URL or a cross-protocol redirect (`file://`/`gopher://`/…)
+  is a deterministic `HTTP_SSRF_BLOCKED`, no longer relying on reqwest's supported-scheme set.
+- **Shared connect-time pinning** (`ssrf.rs`): `SsrfResolver`/`resolve_filtered` extracted into
+  `ssrf.rs` and installed on the `s3` list/delete/send client too, so operator-endpoint
+  operations pin the classifier-validated address (presign stays pure sign-time host validation).
+- **Classifier completeness** (`ssrf.rs`): deprecated IPv4-compatible IPv6 `::a.b.c.d`, multicast
+  (`224.0.0.0/4`, `ff00::/8`), and reserved/future (`240.0.0.0/4`) now blocked; alt-encoded
+  literals (decimal/octal/hex/short-form) pinned by our own regression tests (D4) rather than
+  assumed from the `url` crate.
+- **Production boot guard** (`runlet/src/config.rs`): `debug` (private-IP relax) or a wildcard
+  `*` host allowlist on a non-loopback bind refuses to start unless
+  `trusted.assert_network_isolation` is set — mirroring the trusted-mode guard.
+
+**Independent second line (deployment, not code).** The in-engine guard is necessary but not
+sufficient. The recommended second, *independent* layer is **network-layer egress control** — a
+firewalled network namespace or an egress proxy that denies RFC-1918 / metadata / non-approved
+destinations at the infra layer — so a bug in the in-engine classifier is not the only thing
+standing between a hostile script and the internal network. This is a deployment concern
+(NetworkPolicy / netns / proxy), deliberately out of scope for the crate change, and is the
+opt-out the boot guard's `assert_network_isolation` flag asserts.
+
 ## Log
 
 - _(init)_ Tracker created; threat model captured. Docker verified available (29.1.3).

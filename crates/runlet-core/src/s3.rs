@@ -509,7 +509,7 @@ fn do_usage(
         serde_json::from_str(payload_json).map_err(|err| format!("invalid s3 payload: {err}"))?;
 
     let (scheme, host) = resolve_host(config, allow_private)?;
-    let client = build_blocking_client()?;
+    let client = build_blocking_client(allow_private)?;
     let target = ListTarget {
         config,
         scheme: &scheme,
@@ -574,14 +574,20 @@ struct ListTarget<'a> {
     prefix: &'a str,
 }
 
-/// Builds a short-timeout, no-redirect blocking client for list requests.
+/// Builds a short-timeout, no-redirect blocking client for connecting operations
+/// (`usage` list, `delete`).
 ///
 /// Redirects are disabled so a `301`/`307` can never bounce the request to an
-/// unvalidated host (the endpoint host is checked once in [`resolve_host`]).
-fn build_blocking_client() -> Result<Client, String> {
+/// unvalidated host (the endpoint host is checked once in [`resolve_host`]). The client
+/// also installs the shared SSRF-pinned resolver ([`ssrf::SsrfResolver`]), so the address
+/// it connects to is the classifier-validated one — closing the DNS-rebinding window
+/// between endpoint validation and connection even though the endpoint is operator-supplied
+/// (`allow_private` honored in `debug` mode).
+fn build_blocking_client(allow_private: bool) -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(10))
         .redirect(redirect::Policy::none())
+        .dns_resolver(Arc::new(ssrf::SsrfResolver::new(allow_private)))
         .build()
         .map_err(|err| format!("failed to build s3 client: {err}"))
 }
@@ -746,7 +752,7 @@ fn do_delete(
 
     let (scheme, host) = resolve_host(config, allow_private)?;
     let url = build_delete_url(config, &scheme, &host, &payload.key)?;
-    let client = build_blocking_client()?;
+    let client = build_blocking_client(allow_private)?;
 
     let start = Instant::now();
     let response = client

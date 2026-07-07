@@ -277,6 +277,16 @@ function handler(ctx) {
 }
 ```
 
+**SSRF-guarded (script-controlled target).** Only `http`/`https` URLs are reachable — any
+other scheme (`file`/`gopher`/`ftp`/`data`/…) is refused up front and on every redirect hop,
+so a cross-protocol redirect is never followed. Private/internal addresses are blocked
+(including alt-encoded literals like `2130706433`/`0x7f000001`/`127.1` and IPv6-wrapped forms),
+and the client pins the classifier-validated address at connect (no DNS-rebinding TOCTOU). The
+guard is **framework-enforced for every `ScriptControlled` capability**, not a per-capability
+add-on. The in-engine guard is the first line; a **network-layer egress control** (firewalled
+netns / egress proxy) is the recommended independent second line at deploy time (see
+`docs/security-hardening.md`) — defense in depth, not a replacement.
+
 ### db.query / db.execute / db.begin / db.commit / db.rollback
 
 PostgreSQL/CockroachDB client (requires a `config.io.db` resource):

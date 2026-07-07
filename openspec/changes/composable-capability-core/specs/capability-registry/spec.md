@@ -77,6 +77,29 @@ SHALL NOT be able to bypass these controls.
 - **WHEN** a registered backend returns an egress error marked retryable
 - **THEN** the script observes a tagged capability error and the response error envelope carries the backend's `code` with `retryable: true`
 
+#### Scenario: Mux fails closed on internal error
+
+- **WHEN** the central enforcement itself errors while processing a call (e.g. the op-metering, deadline-clock read, or trust-policy evaluation fails or panics)
+- **THEN** the call is denied with a classified error and no connection is attempted — the mux never falls through to executing the I/O when its own guard cannot be evaluated
+
+### Requirement: Bounded and enumerated mux-bypass surface
+
+The host SHALL enumerate every authority reachable from a script that is not mediated by the
+capability mux — the in-engine `http` and `s3` capabilities, and ambient primitives such as the
+wall clock, entropy/RNG, and process exit — as a reviewed bypass of the central enforcement. Under
+the deterministic profile these ambient authorities SHALL be removed from the context, not merely
+gated; a registered-but-disabled import is not acceptable.
+
+#### Scenario: Ambient authority is removed, not gated, under deterministic profile
+
+- **WHEN** an invocation runs with the deterministic profile
+- **THEN** the neutralized ambient authorities (time, randomness, `$sys` clock/entropy) are absent from the context such that a script cannot re-reach them, rather than present-but-stubbed in a way that could be un-gated by a later change
+
+#### Scenario: In-engine capabilities are declared as mux bypasses
+
+- **WHEN** the `http` or `s3` capability is injected (they carry their own in-engine code and do not route through the egress mux)
+- **THEN** each still enforces its own trust model — `http` applies the SSRF guard, `s3` performs only signing — and both are documented in the enumerated bypass surface so the omission from central mediation is a reviewed decision, not an oversight
+
 ### Requirement: Deterministic profile excludes all I/O capabilities
 
 Under the deterministic execution profile the host SHALL inject no registered I/O capability,

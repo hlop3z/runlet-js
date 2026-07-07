@@ -6,20 +6,17 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use rquickjs::{Ctx, Function, Value as JsValue};
 use serde::Serialize;
-use tokio::task;
 
 use crate::errors::{self, ErrorOwner, Fault};
 use crate::sandbox::{self, Collector};
-use crate::ssrf::{block_private_ip, is_private_ip};
+use crate::ssrf::{self, block_private_ip};
 
 /// Timeout for each HTTP request from JS.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -138,7 +135,7 @@ pub fn inject_api(
         .redirect(policy)
         // Pin resolution: the address reqwest connects to is the one the SSRF filter passed,
         // closing the DNS-rebinding TOCTOU window between a pre-check and the connect lookup.
-        .dns_resolver(Arc::new(SsrfResolver { allow_private }))
+        .dns_resolver(Arc::new(ssrf::SsrfResolver::new(allow_private)))
         .build()?;
 
     let closure_hosts = Arc::clone(&hosts);
@@ -226,56 +223,20 @@ impl MetricCtx<'_> {
     }
 }
 
-// -- DNS resolution (SSRF-pinned) -------------------------------------------
-
-/// A `reqwest` DNS resolver that drops every address failing the SSRF classifier **at the
-/// lookup reqwest connects with**, so a hostname can't resolve public for a pre-check and
-/// private for the actual connection (DNS rebinding). `block_private_ip` in `validate_url`
-/// stays as a fast-fail for literal IPs and a clean in-band error; this is the authoritative
-/// connect-time backstop. In `debug` mode (`allow_private`) the filter is skipped.
-struct SsrfResolver {
-    /// When `true` (server `debug`), private/internal addresses are allowed (local testing).
-    allow_private: bool,
-}
-
-impl Resolve for SsrfResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_owned();
-        let allow_private = self.allow_private;
-        // Run the blocking `getaddrinfo` off the reactor (the blocking client is a
-        // current-thread runtime) so the request timeout can still fire while DNS is in flight.
-        Box::pin(async move {
-            match task::spawn_blocking(move || resolve_filtered(&host, allow_private)).await {
-                Ok(result) => result,
-                Err(join_err) => Err(join_err.into()),
-            }
-        })
-    }
-}
-
-/// Resolves `host` and keeps only addresses the SSRF classifier permits. Returns an error if
-/// the host doesn't resolve or every address is private/internal (fail closed — never hand
-/// reqwest an empty or unfiltered set). Port `0` is a placeholder; reqwest substitutes the
-/// URL's port.
-fn resolve_filtered(
-    host: &str,
-    allow_private: bool,
-) -> Result<Addrs, Box<dyn Error + Send + Sync>> {
-    let mut kept: Vec<SocketAddr> = Vec::new();
-    for addr in (host, 0_u16).to_socket_addrs()? {
-        if allow_private || !is_private_ip(&addr.ip()) {
-            kept.push(addr);
-        }
-    }
-    if kept.is_empty() {
-        return Err(format!("host '{host}' has no public address (SSRF-filtered)").into());
-    }
-    Ok(Box::new(kept.into_iter()))
-}
-
 // -- URL validation ---------------------------------------------------------
 
-/// Validates URL: checks allowed hosts and blocks private/internal IPs.
+/// The only request schemes the guard ever permits. Enforced explicitly (not left to the
+/// client's supported-scheme set) so a cross-protocol target — `file`, `gopher`, `ftp`,
+/// `data`, … — is a deterministic block on the initial URL and on every redirect hop.
+const ALLOWED_SCHEMES: &[&str] = &["http", "https"];
+
+/// Returns `true` if the URL scheme is one the guard permits (`http`/`https`). The `url`
+/// crate lowercases the scheme during parsing, so an exact compare suffices.
+fn is_scheme_allowed(scheme: &str) -> bool {
+    ALLOWED_SCHEMES.contains(&scheme)
+}
+
+/// Validates URL: checks the scheme allowlist, allowed hosts, and blocks private/internal IPs.
 /// Returns the host string (for metrics) on success.
 fn validate_url(
     url: &str,
@@ -284,6 +245,13 @@ fn validate_url(
     wildcard_allowed: bool,
 ) -> Result<String, String> {
     let parsed = reqwest::Url::parse(url).map_err(|err| format!("invalid URL '{url}': {err}"))?;
+
+    if !is_scheme_allowed(parsed.scheme()) {
+        return Err(format!(
+            "scheme '{}' is not allowed (only http/https)",
+            parsed.scheme()
+        ));
+    }
 
     let host = parsed
         .host_str()
@@ -310,6 +278,11 @@ fn validate_redirect(
         return attempt.stop();
     }
     let url = attempt.url();
+    // Re-check the scheme per hop — a redirect to `file://`/`gopher://`/… is refused here, not
+    // left to the client's supported-scheme set.
+    if !is_scheme_allowed(url.scheme()) {
+        return attempt.stop();
+    }
     let host = url.host_str().unwrap_or("");
     if !is_host_allowed(host, hosts, wildcard_allowed) {
         return attempt.stop();
@@ -438,9 +411,11 @@ fn execute_http(
 
 #[cfg(test)]
 mod tests {
-    //! Host-allowlist wildcard gating and the SSRF-pinned DNS filter.
+    //! Host-allowlist wildcard gating, the explicit scheme allowlist, and the alt-encoding
+    //! canonicalization the guard inherits from the `url` crate (pinned by our own tests).
 
-    use super::{is_host_allowed, resolve_filtered};
+    use super::{is_host_allowed, is_scheme_allowed, validate_url};
+    use crate::ssrf::block_private_ip;
 
     /// Builds a single-element allow list.
     fn allow(host: &str) -> Vec<String> {
@@ -473,25 +448,57 @@ mod tests {
         );
     }
 
-    /// The SSRF filter keeps a public literal, rejects a private one, and honors the debug
-    /// relaxation. Literal IPs resolve without network, so this is hermetic.
+    /// Only `http`/`https` pass the scheme allowlist; every other scheme is rejected.
     #[test]
-    fn resolve_filtered_drops_private_addresses() {
-        assert_eq!(
-            resolve_filtered("8.8.8.8", false).map(Iterator::count).ok(),
-            Some(1),
-            "a public literal survives the filter"
+    fn scheme_allowlist_permits_only_http() {
+        assert!(is_scheme_allowed("http"), "http is allowed");
+        assert!(is_scheme_allowed("https"), "https is allowed");
+        for scheme in ["file", "gopher", "ftp", "data", "ws"] {
+            assert!(!is_scheme_allowed(scheme), "{scheme} is rejected");
+        }
+    }
+
+    /// `validate_url` rejects a non-http(s) URL before any host/IP check — the scheme gate
+    /// is deterministic and does not depend on the client's supported schemes.
+    #[test]
+    fn validate_url_rejects_non_http_scheme() {
+        assert!(
+            validate_url("file:///etc/passwd", &allow("*"), true, true).is_err(),
+            "file:// is refused up front"
         );
         assert!(
-            resolve_filtered("127.0.0.1", false).is_err(),
-            "a private literal is filtered to empty → error (fail closed)"
+            validate_url("gopher://evil.example/", &allow("evil.example"), true, true).is_err(),
+            "gopher:// is refused up front"
         );
-        assert_eq!(
-            resolve_filtered("127.0.0.1", true)
-                .map(Iterator::count)
-                .ok(),
-            Some(1),
-            "debug relaxation lets a private literal through"
-        );
+    }
+
+    /// D4: decimal/octal/hex/short-form IP literals are canonicalized to a dotted quad by the
+    /// `url` crate's WHATWG host parser *before* classification, so an internal address written
+    /// in an alternate encoding is blocked exactly as the dotted-quad form is. Pinned here so a
+    /// future `url`-crate behavior change is caught by our suite, not silently reopened. Uses the
+    /// same parse path `validate_url` runs (`reqwest::Url::parse` → `host_str` → `block_private_ip`).
+    #[test]
+    fn alt_encoded_loopback_canonicalizes_to_blocked() {
+        for url in [
+            "http://2130706433/", // decimal 127.0.0.1
+            "http://0x7f000001/", // hex 127.0.0.1
+            "http://127.1/",      // short form 127.0.0.1
+            "http://0177.0.0.1/", // octal-first-octet 127.0.0.1
+        ] {
+            let parsed = reqwest::Url::parse(url)
+                .unwrap_or_else(|_err| unreachable!("test URL must parse: {url}"));
+            let host = parsed
+                .host_str()
+                .unwrap_or_else(|| unreachable!("test URL must have a host: {url}"));
+            assert_eq!(
+                host, "127.0.0.1",
+                "{url} canonicalizes to dotted-quad loopback"
+            );
+            let port = parsed.port_or_known_default().unwrap_or(80);
+            assert!(
+                block_private_ip(host, port, false).is_err(),
+                "{url} resolves to a blocked loopback address"
+            );
+        }
     }
 }

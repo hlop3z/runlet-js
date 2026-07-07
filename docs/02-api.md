@@ -78,6 +78,23 @@ function handler(ctx) {
 
 > Note: you can't change the `Content-Type` header — the robot sets that one for you.
 
+## Only real web addresses work 🛡️
+
+`api` can only reach **`http://` and `https://`** addresses. Anything else — `file://`,
+`gopher://`, `ftp://`, `data:` — is turned away before the robot even dials, and a website
+that tries to *bounce* you to one of those (a redirect) is not followed either. The same
+door is checked on every hop, so there's no sneaking through a redirect.
+
+It also refuses to visit private/internal addresses (your own network, `localhost`, cloud
+metadata) — even ones written in a tricky way (`2130706433`, `0x7f000001`, `127.1`) or
+hidden inside an IPv6 wrapper — and it locks onto the exact address it checked, so a website
+can't say one thing and connect somewhere else. This guard is built into the framework: any
+capability a developer marks *script-controlled* gets it automatically, for free.
+
+> For operators: the in-engine guard is a strong first line, but the recommended second,
+> independent line is **network-layer egress control** (a firewalled netns or egress proxy)
+> at deploy time — defense in depth, not a substitute. See `docs/security-hardening.md`.
+
 ## It shows up on the receipt 🧾
 
 Every call you make is listed in `meta.http_requests` in the answer, so you can see

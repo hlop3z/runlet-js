@@ -8,12 +8,19 @@ The system SHALL expose `POST /execute/batch` accepting `{ items: [...] }` where
 has the single-execute shape (`script` XOR `key`, optional `context`, optional `config`),
 and SHALL respond with `{ results: [...], meta }` where `results[i]` is the full
 `{data, error, meta}` envelope for `items[i]` (order-preserving) and the batch `meta`
-carries `items`, `ok`, `failed`, `duration_ms`, and a batch `trace_id`.
+carries `items`, `ok`, `failed`, `duration_ms`, and a batch `trace_id`. Each item MAY carry an
+optional client-supplied `id`; when present it SHALL be echoed on the corresponding `results[i]`
+entry, in addition to (not instead of) positional ordering.
 
 #### Scenario: Order-preserving results
 
 - **WHEN** a batch submits items A, B, C
 - **THEN** `results[0..2]` correspond to A, B, C regardless of the order they finished executing
+
+#### Scenario: Client item id is echoed for correlation
+
+- **WHEN** a batch item carries a client-supplied `id`
+- **THEN** its `results[i]` entry echoes that `id`, so a client can correlate and safely resubmit only failed items without relying on array position alone
 
 #### Scenario: Per-item envelope is the single-execute envelope
 
@@ -58,6 +65,29 @@ requests.
 
 - **WHEN** events are enabled and a batch of 3 items executes
 - **THEN** 3 usage events are emitted, each keyed to the tenant with that item's billing dims
+
+#### Scenario: Authorization is evaluated per item
+
+- **WHEN** trusted mode is active and a batch's items invoke capabilities gated by roles/entitlements
+- **THEN** the capability/quota authorization is evaluated for every item (not once for the batch), so a batch cannot be used to smuggle an operation past a per-request authz gate — the GraphQL-batch-attack failure mode
+
+### Requirement: Bounded batch resource consumption
+
+A single batch SHALL NOT be able to exhaust shared server resources on behalf of one tenant. The
+system SHALL cap total response bytes (and/or per-item output bytes) so a batch cannot produce an
+unbounded response, and the intra-batch concurrency of one batch SHALL be bounded by the submitting
+partition's fair share of the runtime pool — a batch may occupy at most its partition's concurrency
+ceiling, never the whole pool.
+
+#### Scenario: Response-size cap
+
+- **WHEN** a batch's accumulated item outputs would exceed the configured total-response-bytes cap
+- **THEN** the offending item(s) are truncated to a classified size-limit error envelope (or the batch is rejected, per config), rather than the server buffering an unbounded response
+
+#### Scenario: A single batch cannot monopolize the runtime pool
+
+- **WHEN** a batch with more items than the partition's concurrency cap is admitted
+- **THEN** at most the partition's ceiling of items execute concurrently and the remainder queue, so other partitions retain their share of runtime slots and a batch's worst-case connection hold time is bounded by (items ÷ partition ceiling) × per-item wall-clock timeout
 
 ### Requirement: Batch-level caps
 

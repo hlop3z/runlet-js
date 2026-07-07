@@ -29,10 +29,19 @@ Egress-shaped plugins, and this change is what lets a custom box link them direc
 
 ## Decisions
 
-### D1 — Composition is compile-time, via a `LogicHost` builder
+### D1 — Composition is compile-time, via a `LogicHost` builder that erases to a concrete type
 Devs assemble their own binary: `LogicHost::builder(cfg).capability(def).fallback_egress(e).build()`.
+`.build()` MUST collapse to a single non-generic `LogicHost` — capabilities are held as
+`Vec<CapabilityDef>` / a `HashMap<name, Arc<dyn Egress>>`, not accumulated into a type parameter
+per capability. This is the tower/axum lesson: a `LogicHost<Db, Http, Mail, …>` generic leaks the
+full capability list into every consumer's signatures, making add/remove-a-capability a breaking
+change for downstream code and exploding the published type surface. The builder may be generic
+internally; the built value is monomorphic. (We already erase the backend via `Arc<dyn Egress>`;
+this states the invariant so a future refactor doesn't reintroduce capability-typed generics.)
 *Alternatives*: runtime dylib plugins (breaks the lint gauntlet/supply-chain/one-crypto-stack
-story); config-file-driven loading (capabilities are code + trust policy, not config).
+story); config-file-driven loading (capabilities are code + trust policy, not config);
+auto-registration via `inventory`/`linkme` (rejected — a security choke point wants the capability
+set explicit and greppable, not assembled by life-before-main linker tricks).
 
 ### D2 — The extension unit is `CapabilityDef` in runlet-core; the backend port stays `runlet_wire::Egress`
 `CapabilityDef { name, js_wrapper, trust, backend: Arc<dyn Egress> }`. The trait is already
@@ -74,7 +83,62 @@ consumer (our own tests/typings) → remove the old fields in the same change ra
 carrying a deprecation shim into the published API. Dynamization applies symmetrically to
 `config.io` intake (generic name → resource list over registered names).
 
+### D9 — The mux fails closed on its own internal errors; the bypass surface is enumerated
+Reference-monitor discipline: complete mediation is only complete if the mediator never falls
+through. If metering, the deadline-clock read, or trust-policy evaluation errors or panics, the
+call is **denied**, not executed — the reflexive "don't break the customer, fail open" instinct is
+the wrong default for a security boundary. Corollary: the authorities that legitimately do *not*
+pass the mux (in-engine `http`/`s3`, ambient clock/RNG/exit) are the real unmediated surface, so
+they are enumerated as a reviewed list rather than discovered later. `Profile::Deterministic` must
+*remove* those ambient imports, not leave them registered-but-gated (WASI lesson: gated-but-present
+authority gets un-gated by a later refactor). *Alternative*: best-effort mediation with fail-open on
+enforcement errors — rejected; it converts an enforcement bug into a silent capability escape.
+
+### D10 — Action tokens are a typed contract in the frozen crate, not free strings
+The snake_case action token (first arg to `__<cap>`) is today kept in sync by hand between
+`js/<cap>.js` and the Rust dispatch `match`. Splitting wrappers into `runlet-caps` while backends
+live in the `fabricd` repo widens that string contract across three release cadences — a renamed
+verb becomes a runtime `unknown action`, not a compile error. Scope-preserving fix: define the
+action tokens as a shared `const`/enum **within this repo** (`runlet-caps`, or a small shared module
+it and the dispatch both import) so the wrapper and the Rust dispatch reference one source of truth
+and a rename fails to compile on the box side. The **cross-repo** seam to `fabricd` cannot be
+compile-checked from here regardless — it stays governed by the existing `runlet-wire` string
+protocol plus the D6 fixture test asserting tokens against `fabric-backends`' names. (Promoting the
+enum into `runlet-wire` itself would give fabricd compile-time sharing too, but that touches the
+frozen contract crate — out of scope for this change; note it as a candidate for a future
+coordinated `runlet-wire` bump.) Keeps the preset's hand-authored `types.d.ts` story (D6) intact —
+only the internal token identity is typed, not the JS surface.
+*Alternative*: keep the fixture test alone — weaker; it catches drift at test time, not at compile
+time, and not at all between the wrapper and its own dispatch.
+
+### Decision: Capability registry / plugin composition — Build (hand-written builder)
+
+- **Status**: approved
+- **Why**: Extism/Wasmtime component model solve *runtime untrusted third-party plugin loading* — a
+  Non-Goal here; adopting one adds a second sandbox + crypto + supply-chain stack beside QuickJS for
+  no benefit. Our extension unit is trusted compile-time Rust carrying a trust policy.
+- **Considered**: Adopt Extism / Wasmtime (mature, but the wrong problem — runtime WASM artifacts).
+- **Isolation**: `LogicHost::builder` + `CapabilityDef` composed over the existing
+  `runlet_wire::Egress` trait; no new runtime, no new crypto stack.
+
+### Decision: SSRF guard the mux enforces for ScriptControlled caps — Extend reqwest + Adopt `ip_network`
+
+- **Status**: approved
+- **Why**: the framework applies the audited reqwest-resolver connect-pinning plus `ip_network`
+  classification; the full build-vs-adopt evaluation and adapter boundary are recorded in the
+  `ssrf-guard-hardening` change (this change consumes that guard, it does not re-decide it).
+- **Considered**: Adopt `agent-fetch` (immature); keep a fully hand-rolled classifier.
+- **Isolation**: the shared `ssrf.rs` module the mux calls for every `ScriptControlled` def.
+
 ## Risks / Trade-offs
+
+- [Cross-capability confused deputy — accepted residual risk] → the per-capability trust model
+  (D4) is individually correct and jointly bypassable: a script can read a secret via an
+  `OperatorSupplied` capability (`db`) and exfiltrate it via a `ScriptControlled` one (`http`),
+  because all capabilities share one JS heap that re-ambient-izes authority. No type prevents this;
+  it is the same trust the operator already extends by injecting the credential. Documented as a
+  known residual risk, not a solvable framework property — cross-capability taint tracking is a
+  separate, much larger proposal if ever warranted.
 
 - [Registry indirection slows the hot path] → the mux is one hash lookup per capability call
   on top of an existing dynamic dispatch; measure with runlet-bench, but no design concern.

@@ -304,6 +304,42 @@ impl Config {
             .into());
         }
         self.check_trusted_isolation(exposed)?;
+        self.check_ssrf_relaxation(exposed)?;
+        Ok(())
+    }
+
+    /// SSRF escape-hatch guard (D5): the private-IP relaxation (`debug`) and the wildcard `*`
+    /// host allowlist (`engine.allow_wildcard_hosts`) each collapse the host layer down to the
+    /// IP classifier alone, making it the *sole* remaining SSRF defense. Refuse to start with
+    /// either active on a non-loopback bind unless network isolation is asserted — mirroring
+    /// [`Self::check_trusted_isolation`] and reusing the same operator claim
+    /// (`trusted.assert_network_isolation`), so "prod accidentally shipped with the guard
+    /// relaxed" is a startup failure rather than a silent exposure. Loopback binds (local dev)
+    /// and infra-firewalled deployments that assert isolation are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a relaxation is active, the bind is exposed, and isolation is not
+    /// asserted.
+    fn check_ssrf_relaxation(&self, exposed: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let relaxed = self.debug || self.engine.allow_wildcard_hosts;
+        if relaxed && exposed && !self.trusted.assert_network_isolation {
+            let which = if self.debug {
+                "`debug` (relaxes the private-IP SSRF block)"
+            } else {
+                "`engine.allow_wildcard_hosts` (permits a `*` host allowlist)"
+            };
+            return Err(format!(
+                "refusing to start: {which} is active on {host} (non-loopback) but \
+                 `trusted.assert_network_isolation` is unset. That relaxation leaves the IP \
+                 classifier as the sole SSRF defense, so the bind must be reachable only through \
+                 a trusted edge (enforce with a NetworkPolicy). Bind loopback, drop the \
+                 relaxation, or set `trusted.assert_network_isolation: true` once egress is \
+                 firewalled at the infra layer.",
+                host = self.server.host,
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -502,6 +538,61 @@ mod tests {
         assert!(
             cfg.check_exposure().is_ok(),
             "isolation guard applies only when trusted mode is enabled"
+        );
+    }
+
+    /// `debug` (SSRF relaxation) on an exposed bind without asserted isolation refuses to start.
+    #[test]
+    fn debug_relaxation_exposed_fails_closed() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), Some("tok"), false);
+        cfg.debug = true;
+        assert!(
+            cfg.check_exposure().is_err(),
+            "exposed debug (relaxed SSRF) must refuse without asserted isolation"
+        );
+    }
+
+    /// A wildcard `*` host allowlist on an exposed bind without asserted isolation refuses to start.
+    #[test]
+    fn wildcard_hosts_exposed_fails_closed() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), Some("tok"), false);
+        cfg.engine.allow_wildcard_hosts = true;
+        assert!(
+            cfg.check_exposure().is_err(),
+            "exposed wildcard host allowlist must refuse without asserted isolation"
+        );
+    }
+
+    /// The SSRF relaxation is fine on a loopback bind (local development).
+    #[test]
+    fn debug_relaxation_loopback_ok() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), None, false);
+        cfg.debug = true;
+        assert!(
+            cfg.check_exposure().is_ok(),
+            "loopback debug relaxation is fine (local testing)"
+        );
+    }
+
+    /// Asserting network isolation unlocks an exposed bind with the SSRF guard relaxed.
+    #[test]
+    fn ssrf_relaxation_with_isolation_ok() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), Some("tok"), false);
+        cfg.debug = true;
+        cfg.trusted.assert_network_isolation = true;
+        assert!(
+            cfg.check_exposure().is_ok(),
+            "asserted isolation unlocks an exposed relaxed-SSRF bind"
+        );
+    }
+
+    /// A non-relaxed exposed bind (no debug, no wildcard) is unaffected by the SSRF guard.
+    #[test]
+    fn no_relaxation_exposed_ok() {
+        let cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), Some("tok"), false);
+        assert!(
+            cfg.check_exposure().is_ok(),
+            "the SSRF guard applies only when a relaxation is active"
         );
     }
 }

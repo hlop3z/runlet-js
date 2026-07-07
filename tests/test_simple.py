@@ -311,6 +311,19 @@ def test_http_api(t: Runner):
            h(f"var r = api.delete('{url}/delete', {{'X-Req-Id': '42'}}); return json(r.data.headers['X-Req-Id'][0], null);", config=httpbin),
            data_eq("42"))
 
+    # SSRF scheme allowlist: a non-http(s) URL is refused up front with HTTP_SSRF_BLOCKED,
+    # before any host/IP check and independent of the client's supported-scheme set.
+    t.test("non-http scheme blocked up front",
+           h(f"var r = api.get('file:///etc/passwd'); return json({{status:r.status, code:r.error && r.error.code}}, null);", config=httpbin),
+           lambda r: r["data"]["status"] == 0 and r["data"]["code"] == "HTTP_SSRF_BLOCKED")
+    # The scheme allowlist is re-checked on every redirect hop: a redirect to a non-http(s)
+    # target (host allowed, scheme not) is not followed, so the 302 is returned unfollowed
+    # rather than the client dereferencing the cross-protocol Location.
+    redirect_target = f"gopher://{HTTPBIN_HOST}/"
+    t.test("cross-protocol redirect not followed",
+           h(f"var r = api.get('{url}/redirect-to?url=' + encodeURIComponent('{redirect_target}') + '&status_code=302'); return json(r.status, null);", config=httpbin),
+           data_eq(302))
+
 
 # -- Database tests ----------------------------------------------------------
 

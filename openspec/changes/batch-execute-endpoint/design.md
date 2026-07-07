@@ -35,12 +35,18 @@ Offering the flag would blur the "items are independent" invariant that makes th
 no-atomicity contract safe to state. *Alternative*: `"sequential": true` — rejected as
 attractive-nuisance surface.
 
-### D2 — Thin fan-out in the handler; per-item admission
+### D2 — Thin fan-out in the handler; per-item admission, bounded by the partition's fair share
 The endpoint validates batch-level caps, then treats each item exactly as `/execute` does:
 validate → bulkhead admit → `spawn_blocking` → `host.run`. Concurrency emerges from the
 existing permits (min of batch size, free bulkhead slots, per-partition cap) — a batch
-cannot preempt other tenants. *Alternative*: batch-level admission (one permit per batch) —
-rejected: makes a batch cheaper than N requests and starves fairness.
+cannot preempt other tenants. The invariant that makes this safe (and that a test must assert):
+a single batch's items are subject to the **same per-partition concurrency ceiling** as
+independent requests, so one batch can occupy at most its partition's share of the runtime pool,
+never the whole pool. This bounds worst-case connection hold time to
+(items ÷ partition ceiling) × per-item wall-clock timeout — the concrete reason OpenAI/Shopify/
+Stripe refuse *large* synchronous batches and we keep `max_batch_items` small (D3). *Alternative*:
+batch-level admission (one permit per batch) — rejected: makes a batch cheaper than N requests and
+starves fairness.
 
 ### D3 — Batch caps before any admission
 `max_batch_items` (config; default modest, e.g. 25) and a combined-bytes cap reuse the
@@ -56,7 +62,40 @@ Multi-Status — rejected: WebDAV-ism; clients already branch on the envelope.
 ### D5 — Accounting is strictly per item
 Quota debit, usage event, audit event, span: one per item, same code paths as single
 execute; the batch adds only a parent trace/span and a batch `trace_id` in batch `meta`.
-This is the invariant that prevents batching from becoming a billing/quota bypass.
+This is the invariant that prevents batching from becoming a billing/quota bypass. **This
+extends to authorization**: trusted-mode capability/entitlement gating (`authz.rs`) and quota
+(`quota.rs`) are evaluated per item, never once for the batch — the documented GraphQL-batch-attack
+failure is exactly a system that counted the HTTP request instead of the operations inside it
+(batched OTP/2FA brute force). Everything that debits or gates counts N, not 1.
+
+### D6 — Bound response size, not just request size
+`max_batch_items` + a combined-input-bytes cap (D3) bound the *request*; nothing there bounds the
+*response*. N items each returning a large `data`/`meta` blob is a documented amplification/memory
+vector. Add a total-response-bytes cap (and/or per-item output cap); on exceed, truncate the item to
+a classified size-limit error envelope (default) — the per-item envelope makes this expressible
+without failing the whole batch. *Alternative*: bound only inputs — rejected; output size is
+independent of input size for arbitrary JS and is the actual server-memory risk.
+
+### D7 — Optional client-supplied per-item `id`, echoed back (additive now)
+Order-by-index is the correct base contract, but positional-only correlation breaks the moment a
+client retries a subset, filters, or we later add streaming/async out-of-order completion. Accepting
+an optional `id` per item and echoing it is cheap now and expensive to retrofit once clients depend
+on position. It also becomes the join key for per-item usage/audit events (D5) and the natural unit
+for a future per-item idempotency key. The retry contract we document: on partial failure, resubmit
+only the items whose envelope carried an error. *Alternative*: index-only — rejected as a
+known-regret once subset-retry appears.
+
+### Decision: Batch fan-out / response-size / per-item idempotency — Build (reuse existing machinery)
+
+- **Status**: approved
+- **Why**: the fan-out runs over the in-house `LogicHost::run` port and reuses the existing bulkhead,
+  per-partition fairness, quota, events, and byte-size validation; no mature library batches over a
+  private execution port, and v1 idempotency is echoing a client-supplied item `id` (no cached-outcome
+  store yet). Adopting anything would wrap machinery we already own.
+- **Considered**: adopt a batch/idempotency framework — none fit fan-out over an internal port; a
+  Stripe-style cached-outcome idempotency store is a future add, not v1.
+- **Isolation**: confined to `runlet/src/handler.rs` (+ the router in `main.rs`); `LogicHost` and
+  `runlet-core` are untouched.
 
 ## Risks / Trade-offs
 

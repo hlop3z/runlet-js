@@ -8,7 +8,11 @@
 //! Keeping the IP classification here (instead of duplicated per module) means the
 //! blocklist stays consistent across capabilities.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::error::Error;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use tokio::task;
 
 /// Blocks a host that is — or resolves to — a private/internal IP address.
 ///
@@ -58,8 +62,8 @@ pub(crate) fn is_private_ip(addr: &IpAddr) -> bool {
     }
 }
 
-/// Returns `true` for non-public IPv6: loopback, unique-local, link-local, and any form
-/// embedding a private IPv4 (v4-mapped, 6to4, NAT64).
+/// Returns `true` for non-public IPv6: loopback, unique-local, link-local, multicast, and any
+/// form embedding a private IPv4 (v4-mapped, v4-compatible, 6to4, NAT64).
 ///
 /// `std`'s `Ipv6Addr::is_unique_local` / `is_unicast_link_local` are still unstable, so the
 /// ranges are matched directly on the segments — an attacker on an IPv6 network reaches
@@ -78,7 +82,34 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
     let unique_local = (seg0 & 0xfe00) == 0xfc00;
     // Link-local fe80::/10 (the IPv6 path to host-local / metadata services).
     let link_local = (seg0 & 0xffc0) == 0xfe80;
-    unique_local || link_local || v6_embeds_private_v4(ip)
+    // Multicast ff00::/8 — never a legitimate unicast egress target.
+    let multicast = (seg0 & 0xff00) == 0xff00;
+    unique_local
+        || link_local
+        || multicast
+        || v6_v4_compatible_private(ip)
+        || v6_embeds_private_v4(ip)
+}
+
+/// Returns `true` for the deprecated IPv4-compatible IPv6 form `::a.b.c.d` (`::/96`, high 96
+/// bits zero) whose embedded IPv4 is private. `::` (unspecified) and `::1` (loopback) are
+/// classified before this runs, so only a real embedded address reaches it — the same
+/// unwrap-and-re-check `to_ipv4_mapped` does for the `::ffff:` form.
+const fn v6_v4_compatible_private(ip: Ipv6Addr) -> bool {
+    let oct = ip.octets();
+    let high_96_zero = oct[0] == 0
+        && oct[1] == 0
+        && oct[2] == 0
+        && oct[3] == 0
+        && oct[4] == 0
+        && oct[5] == 0
+        && oct[6] == 0
+        && oct[7] == 0
+        && oct[8] == 0
+        && oct[9] == 0
+        && oct[10] == 0
+        && oct[11] == 0;
+    high_96_zero && is_private_v4(Ipv4Addr::new(oct[12], oct[13], oct[14], oct[15]))
 }
 
 /// Returns `true` if `ip` carries a private IPv4 inside a public-looking IPv6 literal via
@@ -110,7 +141,8 @@ const fn v6_embeds_private_v4(ip: Ipv6Addr) -> bool {
     sixtofour || nat64
 }
 
-/// Returns `true` for loopback, private, link-local, and other non-public IPv4.
+/// Returns `true` for loopback, private, link-local, multicast, reserved, and other
+/// non-public IPv4.
 const fn is_private_v4(ip: Ipv4Addr) -> bool {
     let [oct_a, oct_b, _, _] = ip.octets();
     ip.is_loopback()
@@ -119,14 +151,75 @@ const fn is_private_v4(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()
         || ip.is_unspecified()
         || (oct_a == 100 && oct_b >= 64 && oct_b <= 127) // CGNAT 100.64.0.0/10
+        || oct_a >= 224 // multicast 224.0.0.0/4 + reserved/future 240.0.0.0/4
+}
+
+// -- Connect-time pinning (shared by `http` and `s3`) -----------------------
+
+/// A `reqwest` DNS resolver that drops every address failing the SSRF classifier **at the
+/// lookup reqwest connects with**, so a hostname can't resolve public for a pre-check and
+/// private for the actual connection (DNS rebinding). [`block_private_ip`] stays as a
+/// fast-fail for literal IPs and a clean in-band error; this is the authoritative
+/// connect-time backstop. In `debug` mode (`allow_private`) the filter is skipped.
+///
+/// Shared by both script-/operator-controlled capabilities: `http` installs it on its
+/// request client and `s3` on its list/delete/send client, so the same pinning guarantee
+/// covers every capability that opens an outbound connection.
+pub(crate) struct SsrfResolver {
+    /// When `true` (server `debug`), private/internal addresses are allowed (local testing).
+    allow_private: bool,
+}
+
+impl SsrfResolver {
+    /// Builds a resolver honoring the `allow_private` (debug) relaxation.
+    pub(crate) const fn new(allow_private: bool) -> Self {
+        Self { allow_private }
+    }
+}
+
+impl Resolve for SsrfResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        let allow_private = self.allow_private;
+        // Run the blocking `getaddrinfo` off the reactor (the blocking client is a
+        // current-thread runtime) so the request timeout can still fire while DNS is in flight.
+        Box::pin(async move {
+            match task::spawn_blocking(move || resolve_filtered(&host, allow_private)).await {
+                Ok(result) => result,
+                Err(join_err) => Err(join_err.into()),
+            }
+        })
+    }
+}
+
+/// Resolves `host` and keeps only addresses the SSRF classifier permits. Returns an error if
+/// the host doesn't resolve or every address is private/internal (fail closed — never hand
+/// reqwest an empty or unfiltered set). Port `0` is a placeholder; reqwest substitutes the
+/// URL's port.
+pub(crate) fn resolve_filtered(
+    host: &str,
+    allow_private: bool,
+) -> Result<Addrs, Box<dyn Error + Send + Sync>> {
+    let mut kept: Vec<SocketAddr> = Vec::new();
+    for addr in (host, 0_u16).to_socket_addrs()? {
+        if allow_private || !is_private_ip(&addr.ip()) {
+            kept.push(addr);
+        }
+    }
+    if kept.is_empty() {
+        return Err(format!("host '{host}' has no public address (SSRF-filtered)").into());
+    }
+    Ok(Box::new(kept.into_iter()))
 }
 
 #[cfg(test)]
 mod tests {
     //! SSRF classification — the IPv4 ranges plus the IPv6 ranges that the v4-mapped-only
-    //! filter used to miss (ULA, link-local, 6to4 / NAT64 embedded private v4).
+    //! filter used to miss (ULA, link-local, 6to4 / NAT64 embedded private v4), the
+    //! deprecated IPv4-compatible form, multicast, and reserved/future ranges — plus the
+    //! shared connect-time pinning filter.
 
-    use super::{block_private_ip, is_private_ip};
+    use super::{block_private_ip, is_private_ip, resolve_filtered};
     use std::net::IpAddr;
 
     /// Parses a literal into an `IpAddr` for the table-driven cases.
@@ -202,6 +295,63 @@ mod tests {
         assert!(
             !is_private_ip(&ip("2002:0808:0808::1")),
             "6to4 of a public v4 is allowed"
+        );
+    }
+
+    /// The deprecated IPv4-compatible form `::a.b.c.d` (no `ffff`) is unwrapped and blocked
+    /// when the embedded v4 is private — the range `to_ipv4_mapped` misses.
+    #[test]
+    fn v6_v4_compatible_private_blocked() {
+        // ::7f00:1 == ::127.0.0.1 (IPv4-compatible loopback).
+        assert!(
+            is_private_ip(&ip("::7f00:1")),
+            "IPv4-compatible loopback is blocked"
+        );
+        // ::a00:1 == ::10.0.0.1 (IPv4-compatible private).
+        assert!(
+            is_private_ip(&ip("::a00:1")),
+            "IPv4-compatible private is blocked"
+        );
+        // A public v4 in the compatible form stays allowed (consistent with 6to4/NAT64).
+        assert!(
+            !is_private_ip(&ip("::808:808")),
+            "IPv4-compatible public v4 is allowed"
+        );
+    }
+
+    /// Multicast and reserved/future ranges are blocked in both families.
+    #[test]
+    fn multicast_and_reserved_blocked() {
+        for literal in [
+            "224.0.0.1", // IPv4 multicast 224.0.0.0/4
+            "239.1.2.3", // IPv4 multicast upper bound
+            "240.0.0.1", // IPv4 reserved/future 240.0.0.0/4
+            "ff02::1",   // IPv6 link-local all-nodes multicast
+            "ff00::1",   // IPv6 multicast ff00::/8 boundary
+        ] {
+            assert!(is_private_ip(&ip(literal)), "must be blocked: {literal}");
+        }
+    }
+
+    /// The SSRF filter keeps a public literal, rejects a private one, and honors the debug
+    /// relaxation. Literal IPs resolve without network, so this is hermetic.
+    #[test]
+    fn resolve_filtered_drops_private_addresses() {
+        assert_eq!(
+            resolve_filtered("8.8.8.8", false).map(Iterator::count).ok(),
+            Some(1),
+            "a public literal survives the filter"
+        );
+        assert!(
+            resolve_filtered("127.0.0.1", false).is_err(),
+            "a private literal is filtered to empty → error (fail closed)"
+        );
+        assert_eq!(
+            resolve_filtered("127.0.0.1", true)
+                .map(Iterator::count)
+                .ok(),
+            Some(1),
+            "debug relaxation lets a private literal through"
         );
     }
 
