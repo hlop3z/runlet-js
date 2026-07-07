@@ -11,6 +11,10 @@ publish = false
 # Benches the raw QuickJS declare-vs-load primitives that runlet-core's `bytecode-cache`
 # trades on (see runlet-core `engine.rs`: `obtain_declared` / `load_bytecode`).
 rquickjs.workspace = true
+# The `mux` bench drives the real `LogicHost`/capability-mux hot path through the public API.
+# `default-features = false` keeps the bench light — the mux/host/engine need no network stack,
+# so this pulls no `reqwest`/`aws-lc-sys` (the deterministic-only core).
+runlet-core = { path = "../runlet-core", default-features = false }
 
 [dev-dependencies]
 # HTML/plotting backend trimmed to keep the dev-dep graph small.
@@ -18,6 +22,10 @@ criterion = { version = "0.5", default-features = false }
 
 [[bench]]
 name = "bytecode"
+harness = false
+
+[[bench]]
+name = "mux"
 harness = false
 
 # Intentionally NOT `[lints] workspace = true`: this is dev-only benchmark scaffolding, exempt
