@@ -28,10 +28,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use runlet_wire::quic::client_endpoint;
 use runlet_wire::wire::{WireCall, WireInit, WireRequest, WireResponse, read_frame, write_frame};
 use runlet_wire::{BackendMetrics, Egress, EgressError, ErrorOwner, MeteredEgress};
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::net::lookup_host;

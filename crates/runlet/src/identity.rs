@@ -156,7 +156,10 @@ mod tests {
             tenant: "x-trusted-tenant".to_owned(),
             ..TrustedHeaders::default()
         };
-        let map = headers(&[("x-workspace-id", "spoofed"), ("x-trusted-tenant", "ws_real")]);
+        let map = headers(&[
+            ("x-workspace-id", "spoofed"),
+            ("x-trusted-tenant", "ws_real"),
+        ]);
         let id = TrustedIdentity::from_headers(&map, &names);
         assert_eq!(
             id.tenant.as_deref(),

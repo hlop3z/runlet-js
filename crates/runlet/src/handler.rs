@@ -26,11 +26,6 @@ use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::{Status, TraceContextExt as _};
 
-use runlet_wire::wire::WireInit;
-use runlet_wire::{
-    AmqMetric, AuthMetric, BackendMetrics, DbMetric, Egress, MailMetric, MeteredEgress,
-    MongoMetric, RedisMetric, ct_eq,
-};
 use runlet_core::config::EngineConfig;
 use runlet_core::engine::{EngineError, ExecOutcome, Gate};
 use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
@@ -42,6 +37,11 @@ use runlet_core::registry::ScriptRegistry;
 use runlet_core::s3::{S3Config, S3Metric};
 use runlet_core::sandbox;
 use runlet_core::sys::SysConfig;
+use runlet_wire::wire::WireInit;
+use runlet_wire::{
+    AmqMetric, AuthMetric, BackendMetrics, DbMetric, Egress, MailMetric, MeteredEgress,
+    MongoMetric, RedisMetric, ct_eq,
+};
 
 use crate::authz::authorize_capabilities;
 use crate::config::TrustedHeaders;
