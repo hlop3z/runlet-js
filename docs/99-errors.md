@@ -110,7 +110,7 @@ function handler(ctx) {
 }
 ```
 
-`api` is the one exception: it **never throws**. A failed request comes back as data
+`http` is the one exception: it **never throws**. A failed request comes back as data
 (`{ status: 0, error: { ... } }`), so you just check `res.status`.
 
 ## The decoder tables 🗂️
@@ -215,7 +215,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `AMQ_ERROR`           | yes   | operator  | Publish/protocol error (fallback).        |
 
 **`auth`** (OIDC/IAM identity). An invalid token is **not** an error — it comes back
-**in-band** as `{ ok: false, status, code: "AUTH_INVALID_TOKEN" }` (like `api`, never
+**in-band** as `{ ok: false, status, code: "AUTH_INVALID_TOKEN" }` (like `http`, never
 thrown). These codes are only for the failures `auth` **throws**:
 
 | `code`             | retry | owner     | When                                                                          |

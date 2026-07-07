@@ -1,16 +1,17 @@
 (function () {
   // Profile::Deterministic enforcement: neutralize nondeterministic surfaces so the same
   // (code, context, declared-dependency reads) always produce the same result + effects.
-  // Runs AFTER eval/Proxy removal. Overrides throw rather than return a fixed value, so a
-  // handler that depends on wall-clock/randomness fails loudly instead of silently.
-  function disabled(name) {
-    return function () {
-      throw new Error(name + " is disabled in the deterministic profile");
-    };
-  }
+  // Runs AFTER eval/Proxy removal.
+  //
+  // D9 (WASI lesson): the ambient authorities are *removed*, not stubbed. A present-but-gated
+  // authority is one refactor away from being un-gated, so `Math.random`/`Date.now`/`$sys` clock
+  // + entropy are `delete`d outright — the property is simply gone (`typeof x === "undefined"`),
+  // with no closure left holding the real function to re-reach. `new Date()` (no args) is the one
+  // surface that cannot be a property deletion: it is blocked by replacing the constructor, so the
+  // wall clock is still structurally unreachable (there is no residual property to reach).
 
   if (typeof Math !== "undefined") {
-    Math.random = disabled("Math.random");
+    delete Math.random;
   }
 
   if (typeof Date !== "undefined") {
@@ -36,12 +37,13 @@
     SafeDate.prototype = RealDate.prototype;
     SafeDate.parse = RealDate.parse;
     SafeDate.UTC = RealDate.UTC;
-    SafeDate.now = disabled("Date.now");
+    // `SafeDate.now` is intentionally never copied over — `Date.now` is thus absent (removed),
+    // not a throwing stub.
     globalThis.Date = SafeDate;
   }
 
   if (typeof $sys !== "undefined") {
-    if ($sys.date) $sys.date.now = disabled("$sys.date.now");
-    if ($sys.crypto) $sys.crypto.uuid = disabled("$sys.crypto.uuid");
+    if ($sys.date) delete $sys.date.now;
+    if ($sys.crypto) delete $sys.crypto.uuid;
   }
 })();

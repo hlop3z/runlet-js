@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serde_json::value::RawValue;
 
 use crate::bytecode::BytecodeCacheStats;
+use crate::capability::{CapabilityDef, CapabilityRegistry, RegistryError};
 use crate::config::EngineConfig;
 use crate::egress::Egress;
 use crate::engine::{self, EngineError, ExecOutcome, ExecParams, Profile, ReadHook};
@@ -40,17 +41,14 @@ pub struct LogicHost {
     pool: JsPool,
     /// Engine sandbox limits (timeout, `max_ops`, output cap, wildcard policy, …).
     limits: EngineConfig,
-    /// Relax the SSRF private-IP block (`api`/`s3`) — local-dev only.
-    #[cfg_attr(
-        not(any(feature = "http", feature = "s3")),
-        expect(
-            dead_code,
-            reason = "the SSRF relax flag only applies to http/s3 targets"
-        )
-    )]
+    /// Relax the SSRF private-IP block for local-dev — the in-engine `http`/`s3` targets and the
+    /// capability mux's `ScriptControlled` guard.
     allow_private_targets: bool,
     /// Registry resolving `CodeRef::Registered` keys to source.
     registry: Arc<ScriptRegistry>,
+    /// The composed capability set (the mux routing table + the JS wrappers to inject). Empty
+    /// for a host built via [`LogicHost::new`]; populated by [`LogicHost::builder`].
+    capabilities: CapabilityRegistry,
 }
 
 /// Engine-level settings for a [`LogicHost`] (grouped so `new` stays within the
@@ -59,7 +57,7 @@ pub struct LogicHost {
 pub struct HostSettings {
     /// Engine sandbox limits.
     pub limits: EngineConfig,
-    /// Relax the SSRF private-IP block (`api`/`s3`) — local-dev only.
+    /// Relax the SSRF private-IP block (`http`/`s3`) — local-dev only.
     pub allow_private_targets: bool,
 }
 
@@ -74,42 +72,26 @@ pub enum CodeRef<'a> {
 
 /// Which capabilities to inject for an invocation (per-request, opt-in).
 ///
-/// Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) are plain enable
-/// flags — their connection/credentials live in the wired [`Egress`] port, resolved
-/// operator-side from a logical resource name. `http`/`s3`/`sys` still carry their config
-/// here. Under [`Profile::Deterministic`] every I/O capability is withheld regardless (the
-/// boundary is enforced by the engine, not trusted here).
+/// The driver-backed capabilities are named in [`io`](Self::io) (their wrappers come from the
+/// host's registered [`CapabilityDef`]s); the in-engine `http`/`s3`/`sys` still carry their
+/// config here. Under [`Profile::Deterministic`] every I/O capability is withheld regardless
+/// (the boundary is enforced by the engine, not trusted here).
 #[derive(Debug, Clone, Copy)]
 pub struct CapabilitySet<'a> {
-    /// Allowed hosts for the `api` HTTP client (empty = `api` disabled).
+    /// Allowed hosts for the `http` HTTP client (empty = `http` disabled).
     #[cfg(feature = "http")]
     pub allowed_hosts: &'a [String],
-    /// Whether to expose `db`. The connection + credentials live in the wired [`Egress`] port
-    /// (resolved operator-side from a logical resource name), never in the request — so this is
-    /// just an enable flag, no config crosses the engine boundary.
-    #[cfg(feature = "db")]
-    pub db: engine::Gate,
-    /// Whether to expose `mongo` (see [`db`](Self::db)).
-    #[cfg(feature = "mongo")]
-    pub mongo: engine::Gate,
-    /// Whether to expose `mail` (see [`db`](Self::db)).
-    #[cfg(feature = "mail")]
-    pub mail: engine::Gate,
     /// `s3` (object storage) config. Stays in-engine (pure `SigV4` presign, no driver), so it
     /// still carries its config here unlike the driver-backed capabilities.
     #[cfg(feature = "s3")]
     pub s3: Option<&'a S3Config>,
-    /// Whether to expose `redis` (see [`db`](Self::db)).
-    #[cfg(feature = "redis")]
-    pub redis: engine::Gate,
-    /// Whether to expose `amq` (see [`db`](Self::db)).
-    #[cfg(feature = "amq")]
-    pub amq: engine::Gate,
-    /// Whether to expose `auth` (see [`db`](Self::db)).
-    #[cfg(feature = "auth")]
-    pub auth: engine::Gate,
     /// `$sys` env/secrets context.
     pub sys: Option<&'a SysConfig>,
+    /// Names of registered egress capabilities (from the host's builder registry) to enable for
+    /// this request. A registered def's wrapper is injected only if its name appears here — the
+    /// per-request, opt-in gate for every driver-backed capability. The connection + credentials
+    /// live in the wired [`Egress`] port, resolved operator-side from the logical resource name.
+    pub io: &'a [&'a str],
 }
 
 impl CapabilitySet<'_> {
@@ -118,21 +100,10 @@ impl CapabilitySet<'_> {
     pub const NONE: CapabilitySet<'static> = CapabilitySet {
         #[cfg(feature = "http")]
         allowed_hosts: &[],
-        #[cfg(feature = "db")]
-        db: engine::Gate::Off,
-        #[cfg(feature = "mongo")]
-        mongo: engine::Gate::Off,
-        #[cfg(feature = "mail")]
-        mail: engine::Gate::Off,
         #[cfg(feature = "s3")]
         s3: None,
-        #[cfg(feature = "redis")]
-        redis: engine::Gate::Off,
-        #[cfg(feature = "amq")]
-        amq: engine::Gate::Off,
-        #[cfg(feature = "auth")]
-        auth: engine::Gate::Off,
         sys: None,
+        io: &[],
     };
 }
 
@@ -275,7 +246,7 @@ pub struct Outcome {
 // `Copy`; with `http` or `s3` it holds `Vec`s and cannot.
 #[cfg_attr(not(any(feature = "http", feature = "s3")), derive(Clone, Copy))]
 pub struct ExecMetrics {
-    /// HTTP (`api`) request metrics.
+    /// HTTP (`http`) request metrics.
     #[cfg(feature = "http")]
     pub http: Vec<HttpMetric>,
     /// `s3` operation metrics.
@@ -303,19 +274,47 @@ impl ResolvedSource<'_> {
 }
 
 impl LogicHost {
-    /// Builds a host from a runtime pool, the script registry, and the engine [`HostSettings`].
+    /// Builds a host from a runtime pool, the script registry, and the engine [`HostSettings`],
+    /// with **no** registered egress capabilities (the deterministic / `http` / `s3`-only host).
+    /// To compose driver-backed capabilities, use [`builder`](Self::builder).
     ///
     /// As of the resource-egress trust flip the host drives no I/O itself — every driver runs in
     /// the consumer's wired [`Egress`] (a `fabricd` sidecar) — so it no longer takes a tokio
     /// `Handle` or a `db` circuit breaker (see `docs/design/resource-egress.md` step 5).
     #[must_use]
-    pub const fn new(pool: JsPool, registry: Arc<ScriptRegistry>, settings: HostSettings) -> Self {
+    pub fn new(pool: JsPool, registry: Arc<ScriptRegistry>, settings: HostSettings) -> Self {
         Self {
             pool,
             limits: settings.limits,
             allow_private_targets: settings.allow_private_targets,
             registry,
+            capabilities: CapabilityRegistry::default(),
         }
+    }
+
+    /// Starts composing a host from a set of [`CapabilityDef`]s (D1). The built value is a single
+    /// non-generic [`LogicHost`] — capabilities are held as data (a `Vec`/`HashMap`), never a type
+    /// parameter per capability — so adding or removing a capability never changes a downstream
+    /// signature. See [`LogicHostBuilder`].
+    #[must_use]
+    pub fn builder(
+        pool: JsPool,
+        registry: Arc<ScriptRegistry>,
+        settings: HostSettings,
+    ) -> LogicHostBuilder {
+        LogicHostBuilder {
+            pool,
+            registry,
+            settings,
+            capabilities: Vec::new(),
+            fallback: None,
+        }
+    }
+
+    /// The composed capability registry (the mux routing table + registered defs).
+    #[must_use]
+    pub const fn capabilities(&self) -> &CapabilityRegistry {
+        &self.capabilities
     }
 
     /// The script registry, for a consumer that resolves keys itself (e.g. to size or
@@ -397,26 +396,15 @@ impl LogicHost {
                 profile: inv.profile,
                 #[cfg(feature = "http")]
                 allowed_hosts: inv.caps.allowed_hosts,
-                #[cfg(feature = "db")]
-                db_enabled: inv.caps.db,
-                #[cfg(feature = "mongo")]
-                mongo_enabled: inv.caps.mongo,
-                #[cfg(feature = "mail")]
-                mail_enabled: inv.caps.mail,
                 #[cfg(feature = "s3")]
                 s3_config: inv.caps.s3,
-                #[cfg(feature = "redis")]
-                redis_enabled: inv.caps.redis,
-                #[cfg(feature = "amq")]
-                amq_enabled: inv.caps.amq,
-                #[cfg(feature = "auth")]
-                auth_enabled: inv.caps.auth,
                 sys_config: inv.caps.sys,
                 read_hook: inv.read_hook,
+                registry: Some(&self.capabilities),
+                enabled_io: inv.caps.io,
                 egress: inv.egress,
                 max_ops: self.limits.max_ops,
                 max_output_size: self.limits.max_output_size,
-                #[cfg(any(feature = "http", feature = "s3"))]
                 allow_private_targets: self.allow_private_targets,
                 // `*` honored only as explicit opt-in, never in SSRF-relaxed debug mode.
                 #[cfg(feature = "http")]
@@ -439,4 +427,94 @@ impl LogicHost {
             },
         })
     }
+}
+
+/// Composes a [`LogicHost`] from [`CapabilityDef`]s plus an optional fallback egress (D1).
+///
+/// Capabilities accumulate as data; [`build`](Self::build) collapses them into a single
+/// non-generic [`LogicHost`] — there is deliberately no capability type parameter, so a
+/// downstream signature never changes when the capability set does.
+pub struct LogicHostBuilder {
+    /// Pre-warmed runtime pool for the built host.
+    pool: JsPool,
+    /// Script registry for `CodeRef::Registered` resolution.
+    registry: Arc<ScriptRegistry>,
+    /// Engine sandbox limits + the SSRF-relax flag.
+    settings: HostSettings,
+    /// Accumulated capability definitions, in registration order.
+    capabilities: Vec<CapabilityDef>,
+    /// Optional fallback egress for names without a locally-bound backend.
+    fallback: Option<Arc<dyn Egress>>,
+}
+
+impl fmt::Debug for LogicHostBuilder {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "descriptive name over the trait's terse `f`, matching the crate's min-ident lint"
+    )]
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LogicHostBuilder")
+            .field("limits", &self.settings.limits)
+            .field("capabilities", &self.capabilities)
+            .field(
+                "fallback",
+                &self.fallback.as_ref().map(|_egress| "<fallback>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl LogicHostBuilder {
+    /// Registers a capability. Duplicate names are rejected at [`build`](Self::build), not here,
+    /// so the whole set is reported together.
+    #[must_use]
+    pub fn capability(mut self, def: CapabilityDef) -> Self {
+        self.capabilities.push(def);
+        self
+    }
+
+    /// Registers every capability in an iterator (e.g. a preset from `runlet-caps`).
+    #[must_use]
+    pub fn capabilities<I: IntoIterator<Item = CapabilityDef>>(mut self, defs: I) -> Self {
+        self.capabilities.extend(defs);
+        self
+    }
+
+    /// Sets the fallback egress consulted for any capability name without a locally-bound
+    /// backend (e.g. a `fabricd` sidecar serving the brokered capabilities).
+    #[must_use]
+    pub fn fallback_egress(mut self, egress: Arc<dyn Egress>) -> Self {
+        self.fallback = Some(egress);
+        self
+    }
+
+    /// Builds the host, validating the capability set (D1: duplicate names fail here, before any
+    /// request is served).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] if two capabilities share a name.
+    pub fn build(self) -> Result<LogicHost, RegistryError> {
+        let capabilities = CapabilityRegistry::build(self.capabilities, self.fallback)?;
+        Ok(LogicHost {
+            pool: self.pool,
+            limits: self.settings.limits,
+            allow_private_targets: self.settings.allow_private_targets,
+            registry: self.registry,
+            capabilities,
+        })
+    }
+}
+
+/// D1 compile-time guard: the built value is a single, non-generic [`LogicHost`]. This function
+/// exists only to be type-checked — its signature names `LogicHost` with **no** capability type
+/// parameter, so a future refactor that reintroduced a `LogicHost<Db, Http, …>` generic would
+/// fail to compile here (and, more importantly, in every consumer's signatures). Never called.
+#[expect(
+    dead_code,
+    reason = "D1 type-level guard: proves LogicHost stays non-generic over capabilities"
+)]
+const fn assert_logic_host_is_not_capability_generic(host: LogicHost) -> LogicHost {
+    host
 }

@@ -151,7 +151,258 @@ declare const $: DecimalFactory;
 declare const Decimal: DecimalFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `api` — SSRF-guarded HTTP client (present when `config.allowed_hosts` is set)
+// Response `meta` — per-capability op metrics keyed by name (`meta.io.<name>`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** One capability operation's metric. Shape varies by capability; a fragment may narrow it. */
+type IoMetric = Record<string, unknown>;
+
+/**
+ * The `meta` object the server attaches to every response. `io` carries one entry per capability
+ * the request actually used, keyed by capability name (`meta.io.db`, `meta.io.http`, …), each an
+ * array of that capability's per-operation metrics. Empty capabilities are omitted.
+ */
+interface ResponseMeta {
+  /** Correlation id — also logged server-side with the raw cause. */
+  trace_id: string;
+  /** Registered-script key, echoed back in key mode. */
+  key?: string;
+  /** Partition key, echoed back when supplied. */
+  partition?: string;
+  /** Script size in bytes. */
+  script_bytes: number;
+  /** Context payload size in bytes. */
+  context_bytes: number;
+  /** Total input size in bytes (script + context). */
+  total_input_bytes: number;
+  /** Execution time in microseconds. */
+  exec_time_us: number;
+  /** Per-capability operation metrics, keyed by capability name. */
+  io: Record<string, IoMetric[]>;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// `$sys` — runtime stdlib: crypto + date (always on); env/secrets when config.sys set
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** HMAC hash algorithm. */
+type SysHmacAlgo = "sha256" | "sha512";
+
+/** Output encoding for an HMAC digest. */
+type SysEncoding = "hex" | "base64" | "base64url";
+
+/** A reversible encode/decode pair (UTF-8 string ⇄ encoded string). */
+interface SysCodec {
+  /** Encodes a UTF-8 string. */
+  encode(input: string): string;
+  /** Decodes back to a UTF-8 string (throws on invalid input). */
+  decode(input: string): string;
+}
+
+/**
+ * Pure crypto + encoding helpers (always available). Hashing/HMAC are one-way;
+ * the codecs are reversible. A {@link SysSecret} handle may be passed **only** as the
+ * `key` of {@link hmac} — every other helper takes a plain `string` and so rejects it.
+ */
+interface SysCrypto {
+  /** SHA-256 of `data`, hex-encoded. */
+  sha256(data: string): string;
+  /** SHA-512 of `data`, hex-encoded. */
+  sha512(data: string): string;
+  /**
+   * HMAC of `msg` under `key`, `encoding`-encoded (default `"hex"`). `key` may be a
+   * {@link SysSecret} handle — it is resolved server-side; the plaintext never enters JS.
+   * @example $sys.crypto.hmac("sha256", $sys.secrets.SIGNING_KEY, body);
+   */
+  hmac(
+    algo: SysHmacAlgo,
+    key: string | SysSecret,
+    msg: string,
+    encoding?: SysEncoding,
+  ): string;
+  /** A time-ordered v7 UUID (millisecond timestamp prefix + random tail). */
+  uuid(): string;
+  /** Standard base64 codec. */
+  base64: SysCodec;
+  /** URL-safe base64 (no padding) codec. */
+  base64url: SysCodec;
+  /** Hex codec. */
+  hex: SysCodec;
+  /** Percent-encoding (URL escape) codec. */
+  url: SysCodec;
+}
+
+/**
+ * A fixed-length duration for {@link SysDate.add} / {@link SysDate.sub}, like Python's
+ * `timedelta`. Only constant-length units — no months/years (ambiguous length).
+ */
+interface SysDuration {
+  weeks?: number;
+  days?: number;
+  hours?: number;
+  minutes?: number;
+  seconds?: number;
+  ms?: number;
+}
+
+/** The gap between two dates, from {@link SysDate.diff}. */
+interface SysDateDiff {
+  /** Signed total milliseconds (`this - other`). */
+  total_ms: number;
+  /** Signed total seconds. */
+  total_seconds: number;
+  /** Whole days in the absolute gap. */
+  days: number;
+  /** Remaining whole hours (0–23). */
+  hours: number;
+  /** Remaining whole minutes (0–59). */
+  minutes: number;
+  /** Remaining whole seconds (0–59). */
+  seconds: number;
+}
+
+/**
+ * An immutable UTC instant. Arithmetic is method-based and returns a new instance;
+ * serializes as its RFC 3339 string inside {@link json} / `JSON.stringify`.
+ */
+interface SysDate {
+  /** A new instant shifted forward by `delta`. */
+  add(delta: SysDuration): SysDate;
+  /** A new instant shifted backward by `delta`. */
+  sub(delta: SysDuration): SysDate;
+  /** Breakdown of `this - other` (accepts another instant or epoch millis). */
+  diff(other: SysDate | number): SysDateDiff;
+  /** RFC 3339 string in UTC, e.g. `"2026-06-08T00:00:00Z"`. */
+  iso(): string;
+  /** Epoch seconds. */
+  unix(): number;
+  /** Epoch milliseconds (the canonical value). */
+  epochMs(): number;
+  /** Serializes as {@link iso}. */
+  toJSON(): string;
+  /** Serializes as {@link iso}. */
+  toString(): string;
+}
+
+/** Date helpers (always available). Parsing normalizes everything to UTC. */
+interface SysDateFactory {
+  /** The current instant (UTC). */
+  now(): SysDate;
+  /**
+   * Parses an ISO 8601 / RFC 3339 string (offset-aware), a `YYYY-MM-DD` date, or epoch
+   * millis → a UTC {@link SysDate}. Throws on unparseable input.
+   * @example $sys.date.parse(ctx.when).add({ days: 3 }).iso();
+   */
+  parse(input: string | number | SysDate): SysDate;
+}
+
+/**
+ * An opaque secret handle from {@link Sys.secrets}. The plaintext **never enters JS** —
+ * pass it as the `key` of {@link SysCrypto.hmac}; any coercion (`String(x)`, a template
+ * literal, `JSON.stringify`) yields `"[secret:NAME]"`, never the value.
+ */
+interface SysSecret {
+  /** Yields `"[secret:NAME]"` — never the plaintext. */
+  toString(): string;
+  /** Yields `"[secret:NAME]"` — never the plaintext. */
+  toJSON(): string;
+}
+
+/**
+ * The `$sys` runtime standard library. `crypto` and `date` are pure and **always**
+ * available; `env` and `secrets` are populated only when `config.sys` is supplied
+ * (otherwise they are empty objects).
+ */
+interface Sys {
+  /** Pure crypto + encoding (always available). */
+  crypto: SysCrypto;
+  /** Date parse + timedelta math (always available). */
+  date: SysDateFactory;
+  /**
+   * Plain, returnable operator config values from `config.sys.env`. Typed as possibly
+   * `undefined` so you can probe optional keys (`$sys.env.FLAG === undefined`); a key
+   * you know is set can be used directly.
+   */
+  env: { readonly [key: string]: string | undefined };
+  /**
+   * Opaque secret handles from `config.sys.secrets` (see {@link SysSecret}). Typed as
+   * always-present (you reference the keys you provisioned) so a handle drops straight
+   * into {@link SysCrypto.hmac} without a null check; an unprovisioned key is `undefined`
+   * at runtime.
+   */
+  secrets: { readonly [key: string]: SysSecret };
+}
+
+/** Runtime stdlib. `$sys.crypto` / `$sys.date` always available; `env` / `secrets` need `config.sys`. */
+declare const $sys: Sys;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `hasura/client` — injectable module: GraphQL client over `api` (not a global)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Type surface for the operator-deployed injectable module `modules/hasura/client.mjs`.
+ * Unlike the capability globals above, this is **imported**, not ambient:
+ * `import { hasura } from "hasura/client";`. It resolves only when the file is deployed
+ * under `config.modules_dir`; see {@link https://github.com/hlop3z/runlet-js/blob/main/docs/modules.md modules.md}.
+ */
+declare module "hasura/client" {
+  /** Options for {@link hasura}. */
+  interface HasuraOptions {
+    /** Base URL; defaults to `$sys.env.HASURA_ENDPOINT`. */
+    endpoint?: string;
+    /** End-user JWT → `Authorization: Bearer`, so Hasura enforces row-level permissions. */
+    token?: string;
+    /** Admin secret; defaults to `$sys.env.HASURA_ADMIN_SECRET`. Ignored when `token` is set. */
+    adminSecret?: string;
+    /** Sent as `x-hasura-role` to select a permission role. */
+    role?: string;
+    /** Extra headers merged onto every request. */
+    headers?: HttpHeaders;
+  }
+
+  /** A GraphQL error entry from Hasura. */
+  interface HasuraError {
+    /** Human-readable message. */
+    message: string;
+    /** Hasura error extensions (e.g. `{ code: "validation-failed" }`). */
+    extensions?: Record<string, unknown>;
+  }
+
+  /** Hasura's raw response envelope from {@link HasuraClient.raw}. */
+  interface HasuraEnvelope<T = any> {
+    /** The operation result (absent when only `errors` are present). */
+    data?: T;
+    /** GraphQL/transport errors (absent on full success). */
+    errors?: HasuraError[];
+  }
+
+  /** A Hasura client bound to a set of credentials / a role. */
+  interface HasuraClient {
+    /**
+     * Runs a GraphQL query and returns **only** `data`. Throws on a GraphQL or transport
+     * error (the Error carries `.graphql` = the errors array, `.code` = the first code).
+     * @example const d = h.query(`query ($id: uuid!){ users_by_pk(id:$id){ email } }`, { id });
+     */
+    query<T = any>(query: string, variables?: Record<string, unknown>): T;
+    /** Same wire call as {@link query} — named for mutations so call sites read right. */
+    mutate<T = any>(query: string, variables?: Record<string, unknown>): T;
+    /**
+     * Runs a GraphQL operation and returns Hasura's raw `{ data?, errors? }` envelope.
+     * Never throws on a GraphQL-level error — inspect `.errors` inline.
+     */
+    raw<T = any>(
+      query: string,
+      variables?: Record<string, unknown>,
+    ): HasuraEnvelope<T>;
+  }
+
+  /** Creates a {@link HasuraClient}. Reads `$sys.env` for defaults when options are omitted. */
+  export function hasura(opts?: HasuraOptions): HasuraClient;
+  export default hasura;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `http` — SSRF-guarded HTTP client (present when `config.allowed_hosts` is set)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Request/response header map. */
@@ -159,12 +410,12 @@ interface HttpHeaders {
   [name: string]: string;
 }
 
-/** Query-string parameters for `api.get` (values are stringified). */
+/** Query-string parameters for `http.get` (values are stringified). */
 interface QueryParams {
   [name: string]: string | number | boolean;
 }
 
-/** Result of an `api.*` call. */
+/** Result of an `http.*` call. */
 interface ApiResponse<T = any> {
   /** HTTP status code, or `0` if the request failed before a response (transport error). */
   status: number;
@@ -172,12 +423,12 @@ interface ApiResponse<T = any> {
   data?: T;
   /**
    * In-band transport error — present only when `status === 0` (the request never reached
-   * a response). `api` never throws (§13): inspect this inline instead of `try/catch`.
+   * a response). `http` never throws (§13): inspect this inline instead of `try/catch`.
    */
   error?: ApiTransportError;
 }
 
-/** Structured transport error on an `api.*` call (`status: 0`). */
+/** Structured transport error on an `http.*` call (`status: 0`). */
 interface ApiTransportError {
   /** Stable code: `HTTP_TIMEOUT` | `HTTP_CONNECT` | `HTTP_SSRF_BLOCKED` | `HTTP_BODY_TOO_LARGE` | `HTTP_OP_LIMIT` | `HTTP_ERROR`. */
   code: string;
@@ -199,7 +450,7 @@ interface ApiTransportError {
 interface HttpClient {
   /**
    * `GET url`, with optional query params appended.
-   * @example api.get("https://api.example.com/items", { page: 2 });
+   * @example http.get("https://api.example.com/items", { page: 2 });
    */
   get<T = any>(
     url: string,
@@ -229,7 +480,124 @@ interface HttpClient {
 }
 
 /** HTTP client. Present only when `config.allowed_hosts` is non-empty. */
-declare const api: HttpClient;
+declare const http: HttpClient;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `s3` — presigned URLs + folder usage (present when `config.s3` is set)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** HTTP method a presigned URL is signed for. */
+type S3Method = "PUT" | "GET" | "HEAD" | "DELETE";
+
+/** Options for {@link S3.upload_url} / {@link S3.download_url}. */
+interface S3PresignOptions {
+  /** Object key (path within the bucket), e.g. `"uploads/photo.jpg"`. */
+  key: string;
+  /** Link lifetime in seconds. Defaults to `config.s3.expires`; capped at `max_expires`. */
+  expires?: number;
+}
+
+/** Options for the general {@link S3.sign_url}. */
+interface S3PresignGeneralOptions extends S3PresignOptions {
+  /** HTTP method to sign for. Defaults to `"PUT"`. */
+  method?: S3Method;
+}
+
+/** Result of {@link S3.sign_url} / {@link S3.upload_url} / {@link S3.download_url}. */
+interface S3PresignResult {
+  /** The signed URL the browser uses directly. */
+  url: string;
+  /** The method the URL is signed for. */
+  method: S3Method;
+  /** The link's lifetime in seconds. */
+  expires: number;
+}
+
+/** Options for {@link S3.upload_form}. */
+interface S3PresignPostOptions {
+  /** Object key the upload will be stored under. */
+  key: string;
+  /** Link lifetime in seconds. Defaults to `config.s3.expires`. */
+  expires?: number;
+}
+
+/**
+ * Result of {@link S3.upload_form} — a browser POST policy whose size limit the
+ * object store enforces (the cap comes from `config.s3.max_upload_size`).
+ */
+interface S3PresignPostResult {
+  /** The POST target URL. */
+  url: string;
+  /** Form fields to send before the `file` part. */
+  fields: { [field: string]: string };
+  /** The enforced maximum object size in bytes. */
+  max_bytes: number;
+  /** The policy's lifetime in seconds. */
+  expires: number;
+}
+
+/** Options for {@link S3.usage}. */
+interface S3UsageOptions {
+  /** Key prefix to total, e.g. `"user-a/"`. Omit to total the whole bucket. */
+  prefix?: string;
+}
+
+/** Result of {@link S3.usage}. */
+interface S3UsageResult {
+  /** The prefix that was totalled (empty string = whole bucket). */
+  prefix: string;
+  /** Total size in bytes of all objects under the prefix. */
+  bytes: number;
+  /** Number of objects under the prefix. */
+  objects: number;
+}
+
+/** Options for {@link S3.delete}. */
+interface S3DeleteOptions {
+  /** Object key to delete, e.g. `"user-a/photo.jpg"`. */
+  key: string;
+}
+
+/** Result of {@link S3.delete}. */
+interface S3DeleteResult {
+  /** The key that was deleted. */
+  key: string;
+  /** Always `true` on success (S3 delete is idempotent — a missing key still succeeds). */
+  deleted: boolean;
+}
+
+/**
+ * S3-compatible storage helper for `config.s3` (AWS S3, Cloudflare R2, MinIO,
+ * Backblaze B2, …). Signing a URL is pure crypto — the server never touches your
+ * files; `usage` and `delete` are the calls that connect. The `endpoint` is
+ * operator-config and SSRF-guarded. The sign helpers / `delete` throw on an empty `key`.
+ */
+interface S3 {
+  /** Signs a `PUT` upload link. */
+  upload_url(opts: S3PresignOptions): S3PresignResult;
+  /** Signs a `GET` download link. */
+  download_url(opts: S3PresignOptions): S3PresignResult;
+  /** Signs a size-limited browser POST upload form (cap from `config.s3.max_upload_size`). */
+  upload_form(opts: S3PresignPostOptions): S3PresignPostResult;
+  /** Signs a URL for any `method` (default `"PUT"`). `DELETE` needs `config.s3.allow_delete`. */
+  sign_url(opts: S3PresignGeneralOptions): S3PresignResult;
+  /**
+   * Totals the bytes and object count under a key prefix by listing the bucket.
+   * No native "folder size" exists in S3, so this walks every object under the
+   * prefix; each 1000-object page counts against `max_ops`.
+   * @example const u = s3.usage({ prefix: "user-a/" }); // { prefix, bytes, objects }
+   */
+  usage(opts?: S3UsageOptions): S3UsageResult;
+  /**
+   * Deletes one object. **Destructive and opt-in** — throws unless the operator
+   * set `config.s3.allow_delete = true`, even when `s3` is otherwise configured.
+   * @example const d = s3.delete({ key: "user-a/old.jpg" }); // { key, deleted: true }
+   */
+  delete(opts: S3DeleteOptions): S3DeleteResult;
+}
+
+/** S3 storage helper. Present only when `config.s3` is supplied. */
+declare const s3: S3;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // `db` — Postgres / CockroachDB (present when `config.io.db` names a resource)
@@ -454,123 +822,6 @@ interface Mail {
 declare const mail: Mail;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `s3` — presigned URLs + folder usage (present when `config.s3` is set)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** HTTP method a presigned URL is signed for. */
-type S3Method = "PUT" | "GET" | "HEAD" | "DELETE";
-
-/** Options for {@link S3.upload_url} / {@link S3.download_url}. */
-interface S3PresignOptions {
-  /** Object key (path within the bucket), e.g. `"uploads/photo.jpg"`. */
-  key: string;
-  /** Link lifetime in seconds. Defaults to `config.s3.expires`; capped at `max_expires`. */
-  expires?: number;
-}
-
-/** Options for the general {@link S3.sign_url}. */
-interface S3PresignGeneralOptions extends S3PresignOptions {
-  /** HTTP method to sign for. Defaults to `"PUT"`. */
-  method?: S3Method;
-}
-
-/** Result of {@link S3.sign_url} / {@link S3.upload_url} / {@link S3.download_url}. */
-interface S3PresignResult {
-  /** The signed URL the browser uses directly. */
-  url: string;
-  /** The method the URL is signed for. */
-  method: S3Method;
-  /** The link's lifetime in seconds. */
-  expires: number;
-}
-
-/** Options for {@link S3.upload_form}. */
-interface S3PresignPostOptions {
-  /** Object key the upload will be stored under. */
-  key: string;
-  /** Link lifetime in seconds. Defaults to `config.s3.expires`. */
-  expires?: number;
-}
-
-/**
- * Result of {@link S3.upload_form} — a browser POST policy whose size limit the
- * object store enforces (the cap comes from `config.s3.max_upload_size`).
- */
-interface S3PresignPostResult {
-  /** The POST target URL. */
-  url: string;
-  /** Form fields to send before the `file` part. */
-  fields: { [field: string]: string };
-  /** The enforced maximum object size in bytes. */
-  max_bytes: number;
-  /** The policy's lifetime in seconds. */
-  expires: number;
-}
-
-/** Options for {@link S3.usage}. */
-interface S3UsageOptions {
-  /** Key prefix to total, e.g. `"user-a/"`. Omit to total the whole bucket. */
-  prefix?: string;
-}
-
-/** Result of {@link S3.usage}. */
-interface S3UsageResult {
-  /** The prefix that was totalled (empty string = whole bucket). */
-  prefix: string;
-  /** Total size in bytes of all objects under the prefix. */
-  bytes: number;
-  /** Number of objects under the prefix. */
-  objects: number;
-}
-
-/** Options for {@link S3.delete}. */
-interface S3DeleteOptions {
-  /** Object key to delete, e.g. `"user-a/photo.jpg"`. */
-  key: string;
-}
-
-/** Result of {@link S3.delete}. */
-interface S3DeleteResult {
-  /** The key that was deleted. */
-  key: string;
-  /** Always `true` on success (S3 delete is idempotent — a missing key still succeeds). */
-  deleted: boolean;
-}
-
-/**
- * S3-compatible storage helper for `config.s3` (AWS S3, Cloudflare R2, MinIO,
- * Backblaze B2, …). Signing a URL is pure crypto — the server never touches your
- * files; `usage` and `delete` are the calls that connect. The `endpoint` is
- * operator-config and SSRF-guarded. The sign helpers / `delete` throw on an empty `key`.
- */
-interface S3 {
-  /** Signs a `PUT` upload link. */
-  upload_url(opts: S3PresignOptions): S3PresignResult;
-  /** Signs a `GET` download link. */
-  download_url(opts: S3PresignOptions): S3PresignResult;
-  /** Signs a size-limited browser POST upload form (cap from `config.s3.max_upload_size`). */
-  upload_form(opts: S3PresignPostOptions): S3PresignPostResult;
-  /** Signs a URL for any `method` (default `"PUT"`). `DELETE` needs `config.s3.allow_delete`. */
-  sign_url(opts: S3PresignGeneralOptions): S3PresignResult;
-  /**
-   * Totals the bytes and object count under a key prefix by listing the bucket.
-   * No native "folder size" exists in S3, so this walks every object under the
-   * prefix; each 1000-object page counts against `max_ops`.
-   * @example const u = s3.usage({ prefix: "user-a/" }); // { prefix, bytes, objects }
-   */
-  usage(opts?: S3UsageOptions): S3UsageResult;
-  /**
-   * Deletes one object. **Destructive and opt-in** — throws unless the operator
-   * set `config.s3.allow_delete = true`, even when `s3` is otherwise configured.
-   * @example const d = s3.delete({ key: "user-a/old.jpg" }); // { key, deleted: true }
-   */
-  delete(opts: S3DeleteOptions): S3DeleteResult;
-}
-
-/** S3 storage helper. Present only when `config.s3` is supplied. */
-declare const s3: S3;
-
-// ─────────────────────────────────────────────────────────────────────────────
 // `redis` — key/value store (present when `config.io.redis` names a resource)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -692,224 +943,3 @@ interface Auth {
 
 /** OIDC/IAM identity helper. Present only when `config.io.auth` names a resource. */
 declare const auth: Auth;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// `$sys` — runtime stdlib: crypto + date (always on); env/secrets when config.sys set
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** HMAC hash algorithm. */
-type SysHmacAlgo = "sha256" | "sha512";
-
-/** Output encoding for an HMAC digest. */
-type SysEncoding = "hex" | "base64" | "base64url";
-
-/** A reversible encode/decode pair (UTF-8 string ⇄ encoded string). */
-interface SysCodec {
-  /** Encodes a UTF-8 string. */
-  encode(input: string): string;
-  /** Decodes back to a UTF-8 string (throws on invalid input). */
-  decode(input: string): string;
-}
-
-/**
- * Pure crypto + encoding helpers (always available). Hashing/HMAC are one-way;
- * the codecs are reversible. A {@link SysSecret} handle may be passed **only** as the
- * `key` of {@link hmac} — every other helper takes a plain `string` and so rejects it.
- */
-interface SysCrypto {
-  /** SHA-256 of `data`, hex-encoded. */
-  sha256(data: string): string;
-  /** SHA-512 of `data`, hex-encoded. */
-  sha512(data: string): string;
-  /**
-   * HMAC of `msg` under `key`, `encoding`-encoded (default `"hex"`). `key` may be a
-   * {@link SysSecret} handle — it is resolved server-side; the plaintext never enters JS.
-   * @example $sys.crypto.hmac("sha256", $sys.secrets.SIGNING_KEY, body);
-   */
-  hmac(
-    algo: SysHmacAlgo,
-    key: string | SysSecret,
-    msg: string,
-    encoding?: SysEncoding,
-  ): string;
-  /** A time-ordered v7 UUID (millisecond timestamp prefix + random tail). */
-  uuid(): string;
-  /** Standard base64 codec. */
-  base64: SysCodec;
-  /** URL-safe base64 (no padding) codec. */
-  base64url: SysCodec;
-  /** Hex codec. */
-  hex: SysCodec;
-  /** Percent-encoding (URL escape) codec. */
-  url: SysCodec;
-}
-
-/**
- * A fixed-length duration for {@link SysDate.add} / {@link SysDate.sub}, like Python's
- * `timedelta`. Only constant-length units — no months/years (ambiguous length).
- */
-interface SysDuration {
-  weeks?: number;
-  days?: number;
-  hours?: number;
-  minutes?: number;
-  seconds?: number;
-  ms?: number;
-}
-
-/** The gap between two dates, from {@link SysDate.diff}. */
-interface SysDateDiff {
-  /** Signed total milliseconds (`this - other`). */
-  total_ms: number;
-  /** Signed total seconds. */
-  total_seconds: number;
-  /** Whole days in the absolute gap. */
-  days: number;
-  /** Remaining whole hours (0–23). */
-  hours: number;
-  /** Remaining whole minutes (0–59). */
-  minutes: number;
-  /** Remaining whole seconds (0–59). */
-  seconds: number;
-}
-
-/**
- * An immutable UTC instant. Arithmetic is method-based and returns a new instance;
- * serializes as its RFC 3339 string inside {@link json} / `JSON.stringify`.
- */
-interface SysDate {
-  /** A new instant shifted forward by `delta`. */
-  add(delta: SysDuration): SysDate;
-  /** A new instant shifted backward by `delta`. */
-  sub(delta: SysDuration): SysDate;
-  /** Breakdown of `this - other` (accepts another instant or epoch millis). */
-  diff(other: SysDate | number): SysDateDiff;
-  /** RFC 3339 string in UTC, e.g. `"2026-06-08T00:00:00Z"`. */
-  iso(): string;
-  /** Epoch seconds. */
-  unix(): number;
-  /** Epoch milliseconds (the canonical value). */
-  epochMs(): number;
-  /** Serializes as {@link iso}. */
-  toJSON(): string;
-  /** Serializes as {@link iso}. */
-  toString(): string;
-}
-
-/** Date helpers (always available). Parsing normalizes everything to UTC. */
-interface SysDateFactory {
-  /** The current instant (UTC). */
-  now(): SysDate;
-  /**
-   * Parses an ISO 8601 / RFC 3339 string (offset-aware), a `YYYY-MM-DD` date, or epoch
-   * millis → a UTC {@link SysDate}. Throws on unparseable input.
-   * @example $sys.date.parse(ctx.when).add({ days: 3 }).iso();
-   */
-  parse(input: string | number | SysDate): SysDate;
-}
-
-/**
- * An opaque secret handle from {@link Sys.secrets}. The plaintext **never enters JS** —
- * pass it as the `key` of {@link SysCrypto.hmac}; any coercion (`String(x)`, a template
- * literal, `JSON.stringify`) yields `"[secret:NAME]"`, never the value.
- */
-interface SysSecret {
-  /** Yields `"[secret:NAME]"` — never the plaintext. */
-  toString(): string;
-  /** Yields `"[secret:NAME]"` — never the plaintext. */
-  toJSON(): string;
-}
-
-/**
- * The `$sys` runtime standard library. `crypto` and `date` are pure and **always**
- * available; `env` and `secrets` are populated only when `config.sys` is supplied
- * (otherwise they are empty objects).
- */
-interface Sys {
-  /** Pure crypto + encoding (always available). */
-  crypto: SysCrypto;
-  /** Date parse + timedelta math (always available). */
-  date: SysDateFactory;
-  /**
-   * Plain, returnable operator config values from `config.sys.env`. Typed as possibly
-   * `undefined` so you can probe optional keys (`$sys.env.FLAG === undefined`); a key
-   * you know is set can be used directly.
-   */
-  env: { readonly [key: string]: string | undefined };
-  /**
-   * Opaque secret handles from `config.sys.secrets` (see {@link SysSecret}). Typed as
-   * always-present (you reference the keys you provisioned) so a handle drops straight
-   * into {@link SysCrypto.hmac} without a null check; an unprovisioned key is `undefined`
-   * at runtime.
-   */
-  secrets: { readonly [key: string]: SysSecret };
-}
-
-/** Runtime stdlib. `$sys.crypto` / `$sys.date` always available; `env` / `secrets` need `config.sys`. */
-declare const $sys: Sys;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// `hasura/client` — injectable module: GraphQL client over `api` (not a global)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Type surface for the operator-deployed injectable module `modules/hasura/client.mjs`.
- * Unlike the capability globals above, this is **imported**, not ambient:
- * `import { hasura } from "hasura/client";`. It resolves only when the file is deployed
- * under `config.modules_dir`; see {@link https://github.com/hlop3z/runlet-js/blob/main/docs/modules.md modules.md}.
- */
-declare module "hasura/client" {
-  /** Options for {@link hasura}. */
-  interface HasuraOptions {
-    /** Base URL; defaults to `$sys.env.HASURA_ENDPOINT`. */
-    endpoint?: string;
-    /** End-user JWT → `Authorization: Bearer`, so Hasura enforces row-level permissions. */
-    token?: string;
-    /** Admin secret; defaults to `$sys.env.HASURA_ADMIN_SECRET`. Ignored when `token` is set. */
-    adminSecret?: string;
-    /** Sent as `x-hasura-role` to select a permission role. */
-    role?: string;
-    /** Extra headers merged onto every request. */
-    headers?: HttpHeaders;
-  }
-
-  /** A GraphQL error entry from Hasura. */
-  interface HasuraError {
-    /** Human-readable message. */
-    message: string;
-    /** Hasura error extensions (e.g. `{ code: "validation-failed" }`). */
-    extensions?: Record<string, unknown>;
-  }
-
-  /** Hasura's raw response envelope from {@link HasuraClient.raw}. */
-  interface HasuraEnvelope<T = any> {
-    /** The operation result (absent when only `errors` are present). */
-    data?: T;
-    /** GraphQL/transport errors (absent on full success). */
-    errors?: HasuraError[];
-  }
-
-  /** A Hasura client bound to a set of credentials / a role. */
-  interface HasuraClient {
-    /**
-     * Runs a GraphQL query and returns **only** `data`. Throws on a GraphQL or transport
-     * error (the Error carries `.graphql` = the errors array, `.code` = the first code).
-     * @example const d = h.query(`query ($id: uuid!){ users_by_pk(id:$id){ email } }`, { id });
-     */
-    query<T = any>(query: string, variables?: Record<string, unknown>): T;
-    /** Same wire call as {@link query} — named for mutations so call sites read right. */
-    mutate<T = any>(query: string, variables?: Record<string, unknown>): T;
-    /**
-     * Runs a GraphQL operation and returns Hasura's raw `{ data?, errors? }` envelope.
-     * Never throws on a GraphQL-level error — inspect `.errors` inline.
-     */
-    raw<T = any>(
-      query: string,
-      variables?: Record<string, unknown>,
-    ): HasuraEnvelope<T>;
-  }
-
-  /** Creates a {@link HasuraClient}. Reads `$sys.env` for defaults when options are omitted. */
-  export function hasura(opts?: HasuraOptions): HasuraClient;
-  export default hasura;
-}

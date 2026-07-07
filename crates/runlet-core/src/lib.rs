@@ -11,19 +11,15 @@
 //! during the workspace extraction; a curated [`LogicHost`]-style facade narrows it once
 //! the callable port lands.
 
-// The driver-backed capability modules (`amq`/`auth`/`db`/`kv`/`mail`/`mongo`) are now thin:
-// each only injects its JS wrapper (the driver dispatch lives in `fabric-backends`). They expose
-// no public API, so they are private `mod` — the engine reaches `inject_wrapper` via `crate::`.
-#[cfg(feature = "amq")]
-mod amq;
-#[cfg(feature = "auth")]
-mod auth;
+// The six driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) are no longer
+// baked into core: they moved to the `runlet-caps` preset crate as composable `CapabilityDef`s
+// (JS wrapper + `.d.ts` + trust declaration), injected through the capability registry. Only the
+// in-engine, code-carrying capabilities (`http`, SSRF-guarded; `s3`, pure signing) stay here.
 pub mod breaker;
 pub mod bytecode;
 pub mod bytesize;
+pub mod capability;
 pub mod config;
-#[cfg(feature = "db")]
-mod db;
 pub mod decimal;
 pub mod egress;
 pub mod engine;
@@ -31,28 +27,27 @@ pub mod errors;
 pub mod host;
 #[cfg(feature = "http")]
 pub mod http;
-#[cfg(feature = "redis")]
-mod kv;
-#[cfg(feature = "mail")]
-mod mail;
 pub mod metrics;
 pub mod modules;
-#[cfg(feature = "mongo")]
-mod mongo;
 pub mod partition;
 pub mod pool;
 pub mod registry;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod sandbox;
-// Only the script-controlled capabilities (`api`/`s3`) need the SSRF guard.
-#[cfg(any(feature = "http", feature = "s3"))]
+pub mod types;
+// The SSRF classifier (`is_private_ip`/`block_private_ip`) is always compiled: the always-on
+// capability mux applies it to every `ScriptControlled` egress capability. Only the
+// `reqwest`-based connect-time resolver inside is gated to the in-engine `http`/`s3` clients.
 pub mod ssrf;
 pub mod sys;
 
 // ── Curated public port ──────────────────────────────────────────────────────
 // The blessed entry point; the module surface above stays public during the
 // extraction but consumers should prefer these.
+pub use crate::capability::{
+    CapabilityDef, CapabilityRegistry, RegistryError, SsrfPolicy, Target, TargetExtractor, Trust,
+};
 pub use crate::config::EngineConfig;
 pub use crate::egress::{Egress, EgressError};
 pub use crate::engine::{EngineError, ExecOutcome, Gate, Profile, ReadHook};
@@ -60,3 +55,6 @@ pub use crate::host::{
     CapabilitySet, CodeRef, ExecMetrics, HostSettings, Invocation, LogicHost, Outcome,
 };
 pub use crate::pool::PoolStats;
+pub use crate::types::{
+    BASE_TYPES_DTS, HTTP_TYPES_DTS, S3_TYPES_DTS, def_fragments, generate_types_dts,
+};

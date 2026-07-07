@@ -1,8 +1,8 @@
-# 2. `api` — Talk to the Internet 🌐
+# 2. `http` — Talk to the Internet 🌐
 
 [← Back to the guide](README.md)
 
-`api` lets your script visit other websites and ask them for data — like a phone
+`http` lets your script visit other websites and ask them for data — like a phone
 that can only call numbers you've allowed.
 
 ## Turn it on first 🔑
@@ -19,7 +19,7 @@ Tell the robot which websites it's allowed to visit, using `allowed_hosts`:
 
 - `["api.example.com"]` → only that website is allowed.
 - `["*"]` → **any** website (the star means "all").
-- `[]` or missing → `api` is turned off.
+- `[]` or missing → `http` is turned off.
 
 If your script tries a website that isn't on the list, the robot says no. 🚫
 
@@ -27,11 +27,11 @@ If your script tries a website that isn't on the list, the robot says no. 🚫
 
 | Call                            | When you use it          |
 | ------------------------------- | ------------------------ |
-| `api.get(url, params, headers)` | Ask for something / read |
-| `api.post(url, body, headers)`  | Create something new     |
-| `api.put(url, body, headers)`   | Replace something        |
-| `api.patch(url, body, headers)` | Change part of something |
-| `api.delete(url, headers)`      | Remove something         |
+| `http.get(url, params, headers)` | Ask for something / read |
+| `http.post(url, body, headers)`  | Create something new     |
+| `http.put(url, body, headers)`   | Replace something        |
+| `http.patch(url, body, headers)` | Change part of something |
+| `http.delete(url, headers)`      | Remove something         |
 
 `params`, `body`, and `headers` are all optional.
 
@@ -39,7 +39,7 @@ If your script tries a website that isn't on the list, the robot says no. 🚫
 
 ```js
 function handler(ctx) {
-  var res = api.get("https://api.example.com/users", { page: 1 });
+  var res = http.get("https://api.example.com/users", { page: 1 });
   // res looks like: { status: 200, data: [ ...users... ] }
   return json(res.data, null);
 }
@@ -56,7 +56,7 @@ The `{ page: 1 }` becomes `?page=1` on the end of the web address.
 
 ```js
 function handler(ctx) {
-  var created = api.post("https://api.example.com/users", { name: ctx.name });
+  var created = http.post("https://api.example.com/users", { name: ctx.name });
   return json(created.data, null);
 }
 ```
@@ -69,7 +69,7 @@ Some websites need a password called a "token". You add it as **headers** (the l
 
 ```js
 function handler(ctx) {
-  var me = api.get("https://api.example.com/me", null, {
+  var me = http.get("https://api.example.com/me", null, {
     Authorization: "Bearer " + ctx.token,
   });
   return json(me.data, null);
@@ -80,7 +80,7 @@ function handler(ctx) {
 
 ## Only real web addresses work 🛡️
 
-`api` can only reach **`http://` and `https://`** addresses. Anything else — `file://`,
+`http` can only reach **`http://` and `https://`** addresses. Anything else — `file://`,
 `gopher://`, `ftp://`, `data:` — is turned away before the robot even dials, and a website
 that tries to *bounce* you to one of those (a redirect) is not followed either. The same
 door is checked on every hop, so there's no sneaking through a redirect.

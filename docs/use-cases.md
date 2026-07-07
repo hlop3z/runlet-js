@@ -39,8 +39,8 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 ```
 
 - **Auth & token validation** — Decode JWTs, validate API keys, check permissions against `db.query` — reject before hitting upstream.
-- **Request transformation** — Reshape incoming payloads, inject headers, normalize formats before proxying via `api.post`.
-- **Response aggregation** — Fan out to multiple upstreams with `api.get`, merge into one response, return to client.
+- **Request transformation** — Reshape incoming payloads, inject headers, normalize formats before proxying via `http.post`.
+- **Response aggregation** — Fan out to multiple upstreams with `http.get`, merge into one response, return to client.
 - **Rate limiting** — Query a counter in DB, increment it, reject if over quota. Custom rules per tenant, endpoint, or plan tier.
 - **Routing logic** — Script decides which upstream to call based on path, headers, tenant config, or A/B test assignment.
 - **Request validation** — Validate body schema, required fields, content types before forwarding. Return structured errors.
@@ -77,8 +77,8 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 
 - **Upload processing** — On asset upload, script generates metadata: extracts dimensions from context, assigns tags, sets expiration dates.
 - **Access control rules** — Script evaluates who can download what: check user role, asset license type, region restrictions via `db.query`.
-- **Auto-tagging & classification** — Call an external AI tagging API via `api.post`, write results back to DB. Per-tenant tagging rules.
-- **Asset transformation requests** — Script composes a transformation order (resize, watermark, format) and dispatches to a processing service via `api.post`.
+- **Auto-tagging & classification** — Call an external AI tagging API via `http.post`, write results back to DB. Per-tenant tagging rules.
+- **Asset transformation requests** — Script composes a transformation order (resize, watermark, format) and dispatches to a processing service via `http.post`.
 - **Expiration & lifecycle** — Scheduled script queries DB for assets past retention date, flags for archival or deletion.
 
 ## CMS — Content Management
@@ -92,7 +92,7 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 ## CRM — Customer Relationship Management
 
 - **Lead scoring** — Script evaluates lead attributes (company size, engagement, source) and computes a score. Rules update without deploys.
-- **Contact enrichment** — On new contact, script calls enrichment APIs (`api.get` to Clearbit, etc.) and writes results to DB.
+- **Contact enrichment** — On new contact, script calls enrichment APIs (`http.get` to Clearbit, etc.) and writes results to DB.
 - **Assignment rules** — Script routes leads to sales reps based on territory, deal size, product interest, or round-robin from DB state.
 - **Lifecycle triggers** — When a contact moves stages, script fires actions: send email via API, create task in project tool, update forecast in DB.
 - **Duplicate detection** — Script queries DB for fuzzy matches on email/phone/company, returns merge candidates with confidence scores.
@@ -113,7 +113,7 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 - **Seller automation** — Marketplace sellers define inventory sync, repricing, or order routing scripts.
 - **Loyalty & rewards** — Compute points, tiers, and rewards based on program rules that change without deploys.
 - **Receipt customization** — Script generates receipt data: applies store-specific formatting, promo messages, return policy text.
-- **Inventory sync** — On sale, script decrements stock in DB and pushes update to e-commerce channel via `api.put`.
+- **Inventory sync** — On sale, script decrements stock in DB and pushes update to e-commerce channel via `http.put`.
 - **Multi-location pricing** — Script resolves price by store location, currency, and local tax rules from DB lookups.
 - **Return & refund rules** — Script evaluates return eligibility: time window, item condition, customer history — returns approval or denial with reason.
 

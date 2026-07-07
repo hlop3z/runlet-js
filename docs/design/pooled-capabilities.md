@@ -94,7 +94,7 @@ PgBouncer sits between jsbox and Postgres; `config.db.host` points at it.
 - **HTTP**: the lost keep-alive reuse is real but small, and the per-request reqwest
   client exists because the redirect policy closes over per-request `allowed_hosts`
   (`http.rs`). Changing it means restructuring redirect validation — only worth it if
-  profiling shows connection setup dominating `api` latency.
+  profiling shows connection setup dominating `http` latency.
 
 ## Rejected alternative: in-process named pools
 

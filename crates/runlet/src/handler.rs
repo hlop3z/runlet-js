@@ -1,6 +1,6 @@
 //! HTTP handler for the `/execute` endpoint.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -27,21 +27,20 @@ use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::{Status, TraceContextExt as _};
 
 use runlet_core::config::EngineConfig;
-use runlet_core::engine::{EngineError, ExecOutcome, Gate};
+use runlet_core::engine::{EngineError, ExecOutcome};
 use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 use runlet_core::host::{CapabilitySet, ExecMetrics, Invocation, LogicHost, Outcome};
-use runlet_core::http::HttpMetric;
 use runlet_core::metrics::{Capability, Metrics};
 use runlet_core::partition::PartitionLimiter;
 use runlet_core::registry::ScriptRegistry;
-use runlet_core::s3::{S3Config, S3Metric};
+use runlet_core::s3::S3Config;
 use runlet_core::sandbox;
 use runlet_core::sys::SysConfig;
 use runlet_wire::wire::WireInit;
-use runlet_wire::{
-    AmqMetric, AuthMetric, BackendMetrics, DbMetric, Egress, MailMetric, MeteredEgress,
-    MongoMetric, RedisMetric, ct_eq,
-};
+// The per-capability metric types (`DbMetric`/`HttpMetric`/…) are no longer named here — the
+// dynamic `meta.io` map serializes them generically — but `BackendMetrics` (the sidecar drain),
+// the `Egress`/`MeteredEgress` ports, and `ct_eq` are still used directly.
+use runlet_wire::{BackendMetrics, Egress, MeteredEgress, ct_eq};
 
 use crate::authz::authorize_capabilities;
 use crate::config::TrustedHeaders;
@@ -164,7 +163,7 @@ impl ScriptSource {
 /// script-controlled/in-engine and keep their config.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RequestConfig {
-    /// Allowed hosts for the `api` HTTP client.
+    /// Allowed hosts for the `http` HTTP client.
     #[serde(default)]
     pub(crate) allowed_hosts: Vec<String>,
     /// S3 presigning config (omit to disable `s3` in JS). Stays in-engine (pure `SigV4` presign).
@@ -205,24 +204,6 @@ pub(crate) struct RequestIo {
     pub(crate) auth: Vec<String>,
 }
 
-/// Per-capability gates derived from `config.io` — which capability wrapper the engine injects.
-/// `Copy` so it can move into the blocking task.
-#[derive(Debug, Clone, Copy)]
-struct CapabilityGates {
-    /// Expose `db`.
-    db: Gate,
-    /// Expose `mongo`.
-    mongo: Gate,
-    /// Expose `mail`.
-    mail: Gate,
-    /// Expose `redis`.
-    redis: Gate,
-    /// Expose `amq`.
-    amq: Gate,
-    /// Expose `auth`.
-    auth: Gate,
-}
-
 impl RequestIo {
     /// `true` if any driver capability is requested (so a `fabricd` session is needed).
     fn any(&self) -> bool {
@@ -238,16 +219,30 @@ impl RequestIo {
         .any(|names| !names.is_empty())
     }
 
-    /// The engine-side capability gates — a kind is exposed iff the request named a resource for it.
-    const fn gates(&self) -> CapabilityGates {
-        CapabilityGates {
-            db: Gate::from_enabled(!self.db.is_empty()),
-            mongo: Gate::from_enabled(!self.mongo.is_empty()),
-            mail: Gate::from_enabled(!self.mail.is_empty()),
-            redis: Gate::from_enabled(!self.redis.is_empty()),
-            amq: Gate::from_enabled(!self.amq.is_empty()),
-            auth: Gate::from_enabled(!self.auth.is_empty()),
+    /// The registered capability names to enable for this request — a kind is enabled iff the
+    /// request named a resource for it. Passed to the engine as `CapabilitySet.io`; a registered
+    /// def's wrapper is injected only for a name in this list.
+    fn enabled_names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if !self.db.is_empty() {
+            names.push("db");
         }
+        if !self.mongo.is_empty() {
+            names.push("mongo");
+        }
+        if !self.mail.is_empty() {
+            names.push("mail");
+        }
+        if !self.redis.is_empty() {
+            names.push("redis");
+        }
+        if !self.amq.is_empty() {
+            names.push("amq");
+        }
+        if !self.auth.is_empty() {
+            names.push("auth");
+        }
+        names
     }
 
     /// The `fabricd` session-open message: the first named resource per kind, the per-execution
@@ -297,22 +292,12 @@ struct Meta {
     total_input_bytes: usize,
     /// Execution time in microseconds.
     exec_time_us: u128,
-    /// HTTP requests made by the script.
-    http_requests: Vec<HttpMetric>,
-    /// Database operations made by the script.
-    db_requests: Vec<DbMetric>,
-    /// Mongo operations made by the script.
-    mongo_requests: Vec<MongoMetric>,
-    /// Mail operations made by the script.
-    mail_requests: Vec<MailMetric>,
-    /// S3 presign operations made by the script.
-    s3_requests: Vec<S3Metric>,
-    /// Redis operations made by the script.
-    redis_requests: Vec<RedisMetric>,
-    /// `RabbitMQ` operations made by the script.
-    amq_requests: Vec<AmqMetric>,
-    /// Auth operations made by the script.
-    auth_requests: Vec<AuthMetric>,
+    /// Per-capability operation metrics, keyed by capability name — one entry per capability the
+    /// request actually used (empty ones omitted). `http`/`s3` come from the engine outcome, the
+    /// driver-backed capabilities from the egress adapter; every entry is the same per-op metric
+    /// shape (`meta.io.<name>`). The dynamic replacement for the former fixed `<cap>_requests`
+    /// fields (**BREAKING**, D8), so custom dev-registered capabilities meter identically.
+    io: BTreeMap<String, Value>,
 }
 
 impl Meta {
@@ -331,14 +316,7 @@ impl Meta {
             context_bytes,
             total_input_bytes: script_bytes.saturating_add(context_bytes),
             exec_time_us,
-            http_requests: Vec::new(),
-            db_requests: Vec::new(),
-            mongo_requests: Vec::new(),
-            mail_requests: Vec::new(),
-            s3_requests: Vec::new(),
-            redis_requests: Vec::new(),
-            amq_requests: Vec::new(),
-            auth_requests: Vec::new(),
+            io: BTreeMap::new(),
         }
     }
 
@@ -354,19 +332,36 @@ impl Meta {
         self
     }
 
-    /// Attaches the per-capability metrics: `http`/`s3` from the engine outcome, the
-    /// driver-backed capabilities from the egress adapter.
+    /// Attaches the per-capability metrics into the dynamic `meta.io` map: `http`/`s3` from the
+    /// engine outcome, the driver-backed capabilities from the egress adapter. Only capabilities
+    /// that actually ran get an entry.
     fn with_metrics(mut self, metrics: ExecMetrics, backend: BackendMetrics) -> Self {
-        self.http_requests = metrics.http;
-        self.s3_requests = metrics.s3;
-        self.db_requests = backend.db;
-        self.mongo_requests = backend.mongo;
-        self.mail_requests = backend.mail;
-        self.redis_requests = backend.redis;
-        self.amq_requests = backend.amq;
-        self.auth_requests = backend.auth;
+        insert_io(&mut self.io, "http", metrics.http);
+        insert_io(&mut self.io, "s3", metrics.s3);
+        insert_io(&mut self.io, "db", backend.db);
+        insert_io(&mut self.io, "mongo", backend.mongo);
+        insert_io(&mut self.io, "mail", backend.mail);
+        insert_io(&mut self.io, "redis", backend.redis);
+        insert_io(&mut self.io, "amq", backend.amq);
+        insert_io(&mut self.io, "auth", backend.auth);
         self
     }
+}
+
+/// Serializes a capability's per-op metrics into the `meta.io` map under `name`, skipping the
+/// entry entirely when the capability made no calls (so `meta.io` carries only used capabilities).
+fn insert_io<T: Serialize>(io: &mut BTreeMap<String, Value>, name: &str, metrics: Vec<T>) {
+    if metrics.is_empty() {
+        return;
+    }
+    if let Ok(value) = serde_json::to_value(metrics) {
+        let _prev = io.insert(name.to_owned(), value);
+    }
+}
+
+/// Counts the operations recorded for capability `name` in the `meta.io` map (0 if absent).
+fn io_count(io: &BTreeMap<String, Value>, name: &str) -> usize {
+    io.get(name).and_then(Value::as_array).map_or(0, Vec::len)
 }
 
 /// Success response: JS-produced `{data, error}` as borrowed `RawValue` + Rust meta.
@@ -663,7 +658,6 @@ async fn run_execute(
     }
 
     let context_json: String = context.get().into();
-    let gates = config.io.gates();
 
     // Per-tenant quota (trusted mode): attribute this execution to the trusted tenant and enforce
     // the plan's hard cap. The guard is held across the execution span (released on drop) and
@@ -732,7 +726,7 @@ async fn run_execute(
     // The blocking task wraps the pre-connected `fabricd` session as the egress, runs the
     // invocation, then drains the session's metrics — the UDS round-trips and the drain `block_on`,
     // which must run on the `spawn_blocking` thread, not a runtime worker. The driver metrics come
-    // back with the outcome so the response `meta.<cap>_requests` is unchanged.
+    // back with the outcome and are folded into the response `meta.io` map by capability name.
     let host = state.host.clone();
     let handle = Handle::current();
     let timeout = engine_cfg.timeout();
@@ -753,17 +747,15 @@ async fn run_execute(
         });
         // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
         // HTTP front always runs the full-capability profile (the default) with no read-hook,
-        // so only `caps`, the egress port, and the cache namespace differ from the defaults.
+        // so only `caps`, the egress port, and the cache namespace differ from the defaults. The
+        // enabled driver-capability names drive registry wrapper injection; their calls route to
+        // the per-request sidecar egress (the mux fallback).
+        let enabled_io = config.io.enabled_names();
         let caps = CapabilitySet {
             allowed_hosts: &config.allowed_hosts,
-            db: gates.db,
-            mongo: gates.mongo,
-            mail: gates.mail,
             s3: config.s3.as_ref(),
-            redis: gates.redis,
-            amq: gates.amq,
-            auth: gates.auth,
             sys: config.sys.as_ref(),
+            io: &enabled_io,
         };
         let mut invocation = Invocation::inline(source.as_str(), &context_json).caps(caps);
         if let Some(port) = egress {
@@ -835,14 +827,14 @@ fn emit_executed(state: &AppState, identity: Option<&TrustedIdentity>, meta: &Me
     };
     let (tenant, user, plan) = identity_fields(identity);
     let ops = CapabilityOps {
-        db: meta.db_requests.len(),
-        mongo: meta.mongo_requests.len(),
-        http: meta.http_requests.len(),
-        mail: meta.mail_requests.len(),
-        s3: meta.s3_requests.len(),
-        redis: meta.redis_requests.len(),
-        amq: meta.amq_requests.len(),
-        auth: meta.auth_requests.len(),
+        db: io_count(&meta.io, "db"),
+        mongo: io_count(&meta.io, "mongo"),
+        http: io_count(&meta.io, "http"),
+        mail: io_count(&meta.io, "mail"),
+        s3: io_count(&meta.io, "s3"),
+        redis: io_count(&meta.io, "redis"),
+        amq: io_count(&meta.io, "amq"),
+        auth: io_count(&meta.io, "auth"),
     };
     let usage = EventBody::Usage(UsageBody {
         outcome: outcome.to_owned(),
@@ -1529,17 +1521,20 @@ mod request_io_tests {
         }
     }
 
-    /// `any()` is true iff some kind is named; `gates()` mirror per-kind presence.
+    /// `any()` is true iff some kind is named; `enabled_names()` mirrors per-kind presence.
     #[test]
-    fn any_and_gates_track_named_kinds() {
+    fn any_and_enabled_names_track_named_kinds() {
         let io = io_db("orders-db");
         assert!(io.any(), "a named db means a session is needed");
-        assert!(io.gates().db.is_on(), "db gate on");
-        assert!(!io.gates().mongo.is_on(), "unnamed kinds stay off");
+        assert_eq!(
+            io.enabled_names(),
+            vec!["db"],
+            "only the named kind is enabled"
+        );
 
         let empty = RequestIo::default();
         assert!(!empty.any(), "no names → no session");
-        assert!(!empty.gates().db.is_on());
+        assert!(empty.enabled_names().is_empty(), "no names enabled");
     }
 
     /// `wire_init` carries the first name per kind and the deadline.

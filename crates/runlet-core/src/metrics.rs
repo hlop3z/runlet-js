@@ -120,7 +120,7 @@ pub enum Capability {
     Db,
     /// `mongo` (document database).
     Mongo,
-    /// `api` (outbound HTTP).
+    /// `http` (outbound HTTP).
     Http,
     /// `mail` (SMTP).
     Mail,
@@ -142,7 +142,7 @@ struct CapabilityLatencies {
     db: LatencyHistogram,
     /// `mongo` op latency.
     mongo: LatencyHistogram,
-    /// `api` request latency.
+    /// `http` request latency.
     http: LatencyHistogram,
     /// `mail` op latency.
     mail: LatencyHistogram,

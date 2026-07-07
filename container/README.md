@@ -77,7 +77,7 @@ curl -X POST http://localhost:4172/execute \
 
 This folder ships `types.d.ts` and `tsconfig.json` so your editor gives you
 **autocomplete and type-checking** for the sandbox globals (`json`, `$`,
-`api`, `db`, `mail`, `s3`) with zero setup — just write a `.js` file here:
+`http`, `db`, `mail`, `s3`) with zero setup — just write a `.js` file here:
 
 ```js
 /** @type {Handler} */
@@ -93,9 +93,9 @@ jsbox runs your `.js` as-is in QuickJS; `tsconfig.json` is editor-only
 (`noEmit`). Keep one handler script per file at the top level (each declares a
 global `handler`). The `tests/` examples are excluded for that reason.
 
-> `api`, `db`, `mail`, and `s3` are typed as always-present for convenience, but
+> `http`, `db`, `mail`, and `s3` are typed as always-present for convenience, but
 > at runtime each exists only when the request enables it — guard optional ones
-> with `typeof`. `api` is enabled by `config.allowed_hosts` and `s3` by
+> with `typeof`. `http` is enabled by `config.allowed_hosts` and `s3` by
 > `config.s3`; the driver-backed capabilities are enabled by naming a resource
 > in `config.io` (next section).
 
@@ -112,7 +112,7 @@ the I/O. Endpoints and passwords never appear in the request or in the box.
   (see the commented service in `docker-compose.yml` and
   [docs/deployment.md §5](../docs/deployment.md)).
 - Without a sidecar, a request naming a driver resource gets
-  `503 EGRESS_UNAVAILABLE`. Deterministic scripts, `api`, and `s3` need no sidecar.
+  `503 EGRESS_UNAVAILABLE`. Deterministic scripts, `http`, and `s3` need no sidecar.
 
 ## Notes
 

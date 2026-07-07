@@ -111,6 +111,39 @@ only the internal token identity is typed, not the JS surface.
 *Alternative*: keep the fixture test alone — weaker; it catches drift at test time, not at compile
 time, and not at all between the wrapper and its own dispatch.
 
+### D11 — Type surface travels with the capability; `container/types.d.ts` is generated + golden-tested
+The editor-facing `types.d.ts` is today a hand-maintained monolith — the tooling-layer twin of the
+hard-coded `inject_apis` list this change removes, and a wall a third-party capability author cannot
+compose against. So the `.d.ts` decomposes exactly like the `.js`: `CapabilityDef` gains a
+`types: &'static str` field (`include_str!("js/<cap>.d.ts")`, sibling to `js_wrapper`) — a wrapper
+cannot be added without its type fragment. Core keeps a `base.d.ts` for the always-on, non-capability
+surface (`json`/`Handler`/`Decimal`/`$`/`$sys`). A generator concatenates `base.d.ts` + each
+**registered** def's fragment into `container/types.d.ts`; a golden `#[test]` regenerates and diffs so
+the checked-in file cannot rot — the same drift-guard discipline as the D10 action-token fixture, and
+the registry stays the single source of truth for injection *and* IntelliSense. This refines D6/D10's
+"hand-authored `types.d.ts`" note: still hand-authored **per fragment**, but machine-assembled, not a
+monolith. Collision policy: fragments share one global TS namespace, so each fragment prefixes its
+interface names by convention (keeps autocomplete flat — `db.query(...)`, not `Db.Row`); third-party
+authors own their own naming. `meta.io` typing (D8): `base.d.ts` declares `meta.io: Record<string,
+IoMetric>`; a fragment MAY narrow its own entry — start generic.
+*Alternative*: keep the monolith and ask extension authors to fork it — rejected; it blocks the
+composable-author story this whole change exists to enable.
+
+### D12 — Rename the script-facing HTTP global `api` → `http`
+The internals are already `http` end to end — module `http.rs`, native hook `__http`, cargo feature
+`http`; only the JS global `globalThis.api` and its wrapper file `js/api.js` still say `api`. Finish
+the rename: `globalThis.api` → `globalThis.http`, `js/api.js` → `js/http.js`, its D11 `.d.ts`
+fragment, and `HttpClient`/`declare const api` → `declare const http`. Why: accuracy (it does HTTP),
+discoverability (callers look for `http`/`fetch`/`request`, never `api`), and uniformity — every other
+global names its resource/protocol (`db`/`mongo`/`mail`/`s3`/`redis`/`amq`/`auth`); `api` was the lone
+vague outlier. Ride the D8 clean-break window: pre-publish, single known consumer, no alias — free now,
+a breaking change with real users post-publish. `http` stays in core (D7); `config.allowed_hosts`
+gating name is unchanged; no behavior change, a label only.
+*Alternative*: rename to `fetch` — rejected; `fetch` implies the web-standard Promise/`Request`/
+`Response` shape, but ours is method-based (`.get`/`.post`/`.request`). *Alternative*: keep `api` for
+familiarity — rejected; there is no installed base to be familiar with yet, and the inconsistency is
+permanent once published.
+
 ### Decision: Capability registry / plugin composition — Build (hand-written builder)
 
 - **Status**: approved

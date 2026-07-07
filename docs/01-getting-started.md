@@ -98,4 +98,4 @@ The robot is careful. It will stop your script if it:
 You don't need to worry about these for normal scripts — they're just there so one
 script can't hog everything.
 
-**Next:** [`api` — talk to the internet →](02-api.md)
+**Next:** [`http` — talk to the internet →](02-api.md)

@@ -5,9 +5,9 @@
 ### Requirement: Capability registration at host construction
 
 The logic host SHALL be composed at construction time from a set of capability definitions,
-each carrying a unique name, a JS wrapper surface, and a backend implementing the shared
-egress port. A capability name that was never registered SHALL NOT exist in any execution
-context, regardless of request config.
+each carrying a unique name, a JS wrapper surface, an editor type-declaration fragment, and a
+backend implementing the shared egress port. A capability name that was never registered SHALL
+NOT exist in any execution context, regardless of request config.
 
 #### Scenario: Registered capability is callable
 
@@ -23,6 +23,25 @@ context, regardless of request config.
 
 - **WHEN** a host is built with two capability definitions sharing one name
 - **THEN** host construction fails with a configuration error before serving any request
+
+### Requirement: Capability-owned editor type surface
+
+Each capability definition SHALL carry its own editor type-declaration (`.d.ts`) fragment
+alongside its JS wrapper, so a capability cannot be added without its types. The single
+`container/types.d.ts` consumed by editors SHALL be machine-assembled from an always-on core
+base fragment plus the fragment of each registered capability — never hand-maintained as a
+monolith — and a build-time check SHALL fail if the checked-in file diverges from what the
+registered set generates.
+
+#### Scenario: Type fragment ships with the capability
+
+- **WHEN** the generated `container/types.d.ts` is assembled for a host
+- **THEN** it contains the core base declarations plus exactly the type fragment of each registered capability, and no fragment for an unregistered capability
+
+#### Scenario: Drift between registry and checked-in types is caught
+
+- **WHEN** a capability's JS surface changes but its `.d.ts` fragment (or the regenerated `container/types.d.ts`) is not updated
+- **THEN** the drift-guard check fails in CI rather than shipping stale autocomplete
 
 ### Requirement: Mandatory trust-model declaration
 

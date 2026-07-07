@@ -45,31 +45,21 @@ moka.workspace = true
 reqwest = { workspace = true, optional = true }
 
 # ── Capability features ──
-# Each capability is a cargo feature. `http`/`s3` gate the in-engine client; the driver-backed
-# capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) now gate only their JS wrapper +
-# engine inject gate — the connection/driver lives in `fabric-backends` behind the egress port,
-# so these pull no crates. A deterministic-only host builds with `default-features = false` and
-# links nothing here. `runlet` (the HTTP front) enables `full`.
+# The core now exposes exactly two capability features — `http` (SSRF-guarded) and `s3` (pure
+# SigV4 signing) — the only two in-engine, code-carrying capabilities. The six driver-backed
+# capabilities moved to the `runlet-caps` preset crate as composable `CapabilityDef`s (no cargo
+# feature: registration replaces feature gating). A deterministic-only host builds with
+# `default-features = false` and links nothing here. `runlet` (the HTTP front) enables `full`.
 [features]
 default = ["full"]
-full = ["http", "db", "mongo", "mail", "s3", "redis", "amq", "auth"]
-# Internal markers (not for direct use): `_io` is enabled by every capability and gates the
-# engine's `inject_apis` (which injects the JS wrappers + the in-engine `http`/`s3` collectors);
-# `_throws` is enabled only by `s3` (the lone in-engine *throwing* capability) and gates the
-# `capability_fault_json` tag machinery. The driver-backed capabilities map their errors to the
-# `__runlet` tag via the egress port's always-on `dynamic_fault_json`, not that machinery.
+full = ["http", "s3"]
+# Internal markers (not for direct use): `_io` is enabled by `http`/`s3` and gates the engine's
+# `inject_apis` (the in-engine `http`/`s3` collectors); `_throws` is enabled only by `s3` (the
+# lone in-engine *throwing* capability) and gates the `capability_fault_json` tag machinery.
 _io = []
 _throws = []
 http = ["dep:reqwest", "_io"]
-# The driver-backed capabilities gate only their JS wrapper (`<cap>.rs`'s `inject_wrapper`) and
-# the engine inject gate — no driver crate, no `_throws`.
-db = ["_io"]
-mongo = ["_io"]
-mail = ["_io"]
 s3 = ["dep:reqwest", "_io", "_throws"]
-redis = ["_io"]
-amq = ["_io"]
-auth = ["_io"]
 # The always-on compiled-bytecode cache (bytecode.rs) is unconditional — `moka` is a normal
 # dependency above, not a feature. It covers the ES-module source path only (classic scripts
 # still recompile). The declare-vs-load microbenchmark lives in the sibling `runlet-bench` crate

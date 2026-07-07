@@ -1,14 +1,14 @@
-// Thin GraphQL client for Hasura, layered on jsbox's SSRF-guarded `api` capability.
+// Thin GraphQL client for Hasura, layered on jsbox's SSRF-guarded `http` capability.
 //
 // It absorbs the three things every Hasura-from-jsbox handler otherwise repeats:
 //   1. building the `/v1/graphql` URL,
 //   2. attaching auth headers (admin secret, or a forwarded end-user JWT + role),
 //   3. surfacing the GraphQL errors Hasura returns *inside an HTTP 200* body — the
-//      part naive `api` code misses because it only checks `res.status`.
+//      part naive `http` code misses because it only checks `res.status`.
 //
 // Operator config (kept out of the handler — see docs/09-sys.md and docs/02-api.md):
-//   - config.allowed_hosts              must include the Hasura host (api is SSRF-guarded;
-//                                       no `config.io` entry needed — `api` is in-engine).
+//   - config.allowed_hosts              must include the Hasura host (http is SSRF-guarded;
+//                                       no `config.io` entry needed — `http` is in-engine).
 //   - config.sys.env.HASURA_ENDPOINT    e.g. "https://hasura.internal"
 //   - config.sys.env.HASURA_ADMIN_SECRET  (optional; omit when forwarding a user JWT)
 //   - config.modules_dir                must point at the folder holding this file, so
@@ -52,10 +52,10 @@ export function hasura(opts = {}) {
   }
 
   // Run an operation and return Hasura's raw envelope ({ data?, errors? }). Never throws
-  // on a GraphQL-level error — inspect `.errors` yourself. A transport failure (api's
+  // on a GraphQL-level error — inspect `.errors` yourself. A transport failure (http's
   // in-band `status: 0`) is normalized into the same `errors` shape so one check covers both.
   function raw(query, variables) {
-    const res = api.post(url, { query, variables: variables || {} }, headers());
+    const res = http.post(url, { query, variables: variables || {} }, headers());
     if (res.status === 0) {
       const code = (res.error && res.error.code) || "HASURA_TRANSPORT";
       return {

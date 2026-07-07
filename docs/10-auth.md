@@ -75,7 +75,7 @@ function handler(ctx) {
 
 **It does _not_ throw** for a bad token — an unknown person knocking on the door is
 normal, everyday business, so you just check `u.ok` and branch. (This mirrors how
-`api` never throws.) See [the in-band vs. throw idea below](#why-bad-tokens-dont-throw).
+`http` never throws.) See [the in-band vs. throw idea below](#why-bad-tokens-dont-throw).
 
 ## Look closer: `auth.introspect` 🔎
 

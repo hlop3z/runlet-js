@@ -2,7 +2,7 @@
 //
 // Module-mode handler (note the top-level `import` + `export default`). Deploy
 // `modules/hasura/client.mjs` under config.modules_dir, add the Hasura host to
-// config.api.allowed_hosts, and set config.sys.env.HASURA_ENDPOINT (+ either a
+// config.allowed_hosts, and set config.sys.env.HASURA_ENDPOINT (+ either a
 // forwarded ctx.token or config.sys.env.HASURA_ADMIN_SECRET).
 
 import { hasura } from "hasura/client";

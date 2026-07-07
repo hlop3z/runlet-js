@@ -13,7 +13,7 @@ the **attack** it closes, and the **control**. Status is tracked here as work la
    `allowed_hosts`). Today: **no authN in jsbox**; relies entirely on a gateway/NetworkPolicy.
 2. **Script → host process** — QuickJS sandbox (mem/stack/timeout/op caps; `eval`/`Proxy`
    removed). Design is trending toward *untrusted, customer-authored* scripts.
-3. **Script-chosen target → outside world** — `api`/`s3` SSRF-guarded (script picks URL);
+3. **Script-chosen target → outside world** — `http`/`s3` SSRF-guarded (script picks URL);
    `db`/`mail`/`redis`/`amq` trusted (operator picks host).
 
 ## Work items
@@ -26,7 +26,7 @@ the **attack** it closes, and the **control**. Status is tracked here as work la
 | 5 | Cap handler returned-output size (`max_output_size` → `OUTPUT_TOO_LARGE`) | 2 | Medium | ✅ done |
 | 6 | Fail-closed auth on `/execute` (`access_token` bearer + refuse exposed bind w/o it) | 1 | Critical | ✅ done |
 | 9 | Document `Function`/`AsyncFunction` survive `eval` removal (isolation-only) | 2 | Low | ✅ done |
-| 2 | Pin resolved IP through reqwest (close DNS-rebind TOCTOU on `api`) | 3 | High | ✅ done |
+| 2 | Pin resolved IP through reqwest (close DNS-rebind TOCTOU on `http`) | 3 | High | ✅ done |
 | 7 | Mail: operator recipient-domain allowlist + per-exec send cap | 3 | Medium | ✅ done |
 | 8 | Verify: ReDoS catastrophic-backtrack is preempted by the wall-clock interrupt | 2 | Low | ✅ verified |
 

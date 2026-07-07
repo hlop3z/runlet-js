@@ -1,6 +1,6 @@
 {
   // Editor support for jsbox handler scripts: autocomplete + type-checking for
-  // the sandbox globals (json, $, api, db, mail, s3) declared in types.d.ts.
+  // the sandbox globals (json, $, http, db, mail, s3) declared in types.d.ts.
   // Nothing is ever emitted — jsbox runs your .js as-is in QuickJS.
   "compilerOptions": {
     "noEmit": true,

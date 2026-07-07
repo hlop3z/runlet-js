@@ -12,7 +12,7 @@ services:
   # `fabricd` egress sidecar — it holds the credential table (resources config) and
   # all the network drivers; the box only forwards logical names from `config.io`.
   # Without it, requests naming a driver resource get `503 EGRESS_UNAVAILABLE`;
-  # deterministic / `api` / `s3` requests work with the box alone.
+  # deterministic / `http` / `s3` requests work with the box alone.
   #
   # No prebuilt fabricd image is published yet — build it from its own repo
   # (github.com/hlop3z/fabricd) and uncomment, sharing the UDS socket dir

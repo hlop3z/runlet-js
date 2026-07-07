@@ -31,3 +31,16 @@ single known consumer; tests and typings updated in the same change).
 
 - **WHEN** any request completes after this change
 - **THEN** `meta` carries no `<capability>_requests` fields; per-capability metrics appear only under `meta.io`
+
+### Requirement: HTTP capability global name
+
+The in-engine, SSRF-guarded HTTP capability SHALL be exposed to scripts as the global `http`
+(previously `api`). The rename aligns the script-facing name with the already-`http` internals
+(module, native hook, cargo feature) and with the resource-named convention of every other
+capability global. This is **BREAKING** (pre-publish, single known consumer, no alias). Its
+operator-supplied gating config key (`allowed_hosts`) is unchanged.
+
+#### Scenario: HTTP calls go through the `http` global
+
+- **WHEN** a script performs an HTTP request in a request whose config permits it
+- **THEN** it calls `http.get`/`http.post`/`http.put`/`http.patch`/`http.delete` (method names unchanged), and the global `api` does not exist (`typeof api === "undefined"`)

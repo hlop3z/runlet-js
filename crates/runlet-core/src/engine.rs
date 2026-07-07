@@ -22,25 +22,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
 
-#[cfg(feature = "amq")]
-use crate::amq;
-#[cfg(feature = "auth")]
-use crate::auth;
 use crate::bytecode::{self, BytecodeCache};
-#[cfg(feature = "db")]
-use crate::db;
+use crate::capability::{CapabilityRegistry, MuxCall};
 use crate::decimal;
 use crate::egress::Egress;
 use crate::errors::{self, ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 #[cfg(feature = "http")]
 use crate::http::{self, HttpMetric};
-#[cfg(feature = "redis")]
-use crate::kv;
-#[cfg(feature = "mail")]
-use crate::mail;
 use crate::modules;
-#[cfg(feature = "mongo")]
-use crate::mongo;
 #[cfg(feature = "s3")]
 use crate::s3::{self, S3Config, S3Metric};
 // The metric collector apparatus is needed only by the in-engine capabilities (`http`/`s3`); the
@@ -77,7 +66,7 @@ pub enum Profile {
     /// The full jsbox capability set (per-request, opt-in) plus `emit`. The post-commit /
     /// action tier — essentially jsbox's existing behavior.
     Full,
-    /// No I/O capabilities are injected (`db`/`api`/`mongo`/`mail`/`s3`/`redis`/`amq`/
+    /// No I/O capabilities are injected (`db`/`http`/`mongo`/`mail`/`s3`/`redis`/`amq`/
     /// `auth` are all withheld) and nondeterminism is neutralized on top of the existing
     /// `eval`/`Proxy` removal. Only the pure `$`/`$sys` helpers, `emit`, and a
     /// consumer-supplied read-of-declared-dependencies hook are available. The
@@ -144,46 +133,34 @@ pub(crate) struct ExecParams<'a> {
     /// Allowed HTTP hosts (empty = disabled).
     #[cfg(feature = "http")]
     pub(crate) allowed_hosts: &'a [String],
-    /// Whether the `db` capability wrapper is injected (the logical-resource gate). The
-    /// connection + credentials live in the wired [`Egress`] port, not here — so this is
-    /// just an on/off flag, no config crosses the engine boundary.
-    #[cfg(feature = "db")]
-    pub(crate) db_enabled: Gate,
-    /// Whether the `mongo` capability wrapper is injected (see `db_enabled`).
-    #[cfg(feature = "mongo")]
-    pub(crate) mongo_enabled: Gate,
-    /// Whether the `mail` capability wrapper is injected (see `db_enabled`).
-    #[cfg(feature = "mail")]
-    pub(crate) mail_enabled: Gate,
     /// S3 config (None = disabled). Stays in-engine (pure `SigV4` presign, no driver), so unlike
     /// the driver-backed capabilities it still carries its config across the boundary.
     #[cfg(feature = "s3")]
     pub(crate) s3_config: Option<&'a S3Config>,
-    /// Whether the `redis` capability wrapper is injected (see `db_enabled`).
-    #[cfg(feature = "redis")]
-    pub(crate) redis_enabled: Gate,
-    /// Whether the `amq` capability wrapper is injected (see `db_enabled`).
-    #[cfg(feature = "amq")]
-    pub(crate) amq_enabled: Gate,
-    /// Whether the `auth` capability wrapper is injected (see `db_enabled`).
-    #[cfg(feature = "auth")]
-    pub(crate) auth_enabled: Gate,
     /// `$sys` env/secrets context (None = no env/secrets injected).
     pub(crate) sys_config: Option<&'a SysConfig>,
     /// Read-of-declared-dependencies hook (the deterministic-profile seam). `None` = no
     /// `read` global is injected.
     pub(crate) read_hook: Option<Arc<ReadHook>>,
-    /// I/O egress seam (the `io.call` global). `None` = no `io` global is injected.
-    /// Withheld under [`Profile::Deterministic`] (it performs I/O). Not feature-gated.
+    /// The composed capability registry (the mux's per-name routing table + the JS wrappers to
+    /// inject). `None` = no registered capabilities. Under [`Profile::Deterministic`] the mux and
+    /// every wrapper are withheld (they perform I/O), regardless of registration.
+    pub(crate) registry: Option<&'a CapabilityRegistry>,
+    /// Names of registered egress capabilities to enable for this request (per-request, opt-in).
+    /// A registered def's wrapper is injected only if its name appears here.
+    pub(crate) enabled_io: &'a [&'a str],
+    /// Per-request fallback egress for the mux (the `fabricd` sidecar). Consulted for any name
+    /// without a local backend. `None` = no per-request fallback. Withheld under
+    /// [`Profile::Deterministic`] (it performs I/O).
     pub(crate) egress: Option<Arc<dyn Egress>>,
     /// Max operations per execution (also caps the number of `emit` effects).
     pub(crate) max_ops: usize,
     /// Max bytes the handler may return (`0` = off, bounded only by `memory_limit`).
     pub(crate) max_output_size: usize,
-    /// Debug mode: relax the SSRF private-IP block (`api`/`s3`) for local testing.
-    #[cfg(any(feature = "http", feature = "s3"))]
+    /// Debug mode: relax the SSRF private-IP block for local testing — the in-engine `http`/`s3`
+    /// targets and the capability mux's `ScriptControlled` guard.
     pub(crate) allow_private_targets: bool,
-    /// Whether the `api` client honors an `allowed_hosts: ["*"]` wildcard. Resolved in the
+    /// Whether the `http` client honors an `allowed_hosts: ["*"]` wildcard. Resolved in the
     /// handler as `allow_wildcard_hosts && !debug` — a wildcard is never honored in the
     /// SSRF-relaxed debug mode.
     #[cfg(feature = "http")]
@@ -339,13 +316,11 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         if let Some(hook) = &params.read_hook {
             inject_read(&qctx, Arc::clone(hook)).map_err(EngineError::internal)?;
         }
-        // The egress is I/O, so it is gated to `Profile::Full` exactly like the capabilities —
-        // the boundary is enforced here, never trusted to the caller's `Invocation`.
-        if params.profile == Profile::Full
-            && let Some(egress) = &params.egress
-        {
-            inject_egress(&qctx, Arc::clone(egress), params.max_ops)
-                .map_err(EngineError::internal)?;
+        // The capability mux + its wrappers are I/O, so gated to `Profile::Full` exactly like the
+        // in-engine capabilities — the boundary is enforced here, never trusted to the caller's
+        // `Invocation` (D9: the deterministic profile removes this authority, it is not gated).
+        if params.profile == Profile::Full {
+            inject_registry(&qctx, params).map_err(EngineError::internal)?;
         }
         #[cfg(feature = "_io")]
         inject_apis(
@@ -431,13 +406,13 @@ fn inject_bridge(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     Ok(())
 }
 
-/// Injects the per-request capabilities (subject to the profile).
+/// Injects the in-engine capabilities `http`/`s3` (subject to the profile).
 ///
-/// The in-engine capabilities (`http`/`s3`) build their client and return a metric collector
-/// (captured into the `*_collector` slots). The driver-backed capabilities (`db`/`mongo`/`mail`/
-/// `redis`/`amq`/`auth`) inject only their JS wrapper — every call routes through the wired
-/// [`Egress`] port (injected before this), whose adapter owns the connection, resilience, and
-/// metrics; the engine never sees their credentials or records their ops.
+/// These are the enumerated mux-bypass surface (D9): they carry their own in-engine code
+/// (`http`'s SSRF-guarded client, `s3`'s `SigV4` signing) rather than routing through the egress
+/// mux, and each returns a metric collector captured into the `*_collector` slots. The
+/// driver-backed capabilities inject their JS wrappers through the capability registry
+/// (`inject_registry`), not here.
 #[cfg(feature = "_io")]
 fn inject_apis(
     qctx: &Ctx<'_>,
@@ -454,7 +429,7 @@ fn inject_apis(
     #[cfg(feature = "http")]
     if !params.allowed_hosts.is_empty() {
         *http_collector = Some(
-            http::inject_api(
+            http::inject_http(
                 qctx,
                 params.allowed_hosts,
                 params.max_ops,
@@ -464,40 +439,12 @@ fn inject_apis(
             .map_err(EngineError::internal)?,
         );
     }
-    // Each driver-backed capability below routes through the wired [`Egress`] port: inject only
-    // its JS wrapper (which calls `io.call("<cap>", …)`); the connection, deps, and metrics live
-    // in the adapter, not the engine. The presence gate is the logical-resource flag — no config
-    // crosses the engine boundary.
-    #[cfg(feature = "db")]
-    if params.db_enabled.is_on() {
-        db::inject_wrapper(qctx).map_err(EngineError::internal)?;
-    }
-    #[cfg(feature = "mongo")]
-    if params.mongo_enabled.is_on() {
-        mongo::inject_wrapper(qctx).map_err(EngineError::internal)?;
-    }
-    #[cfg(feature = "mail")]
-    if params.mail_enabled.is_on() {
-        mail::inject_wrapper(qctx).map_err(EngineError::internal)?;
-    }
     #[cfg(feature = "s3")]
     if let Some(s3_cfg) = params.s3_config {
         *s3_collector = Some(
             s3::inject_s3(qctx, s3_cfg, params.max_ops, params.allow_private_targets)
                 .map_err(EngineError::internal)?,
         );
-    }
-    #[cfg(feature = "redis")]
-    if params.redis_enabled.is_on() {
-        kv::inject_wrapper(qctx).map_err(EngineError::internal)?;
-    }
-    #[cfg(feature = "amq")]
-    if params.amq_enabled.is_on() {
-        amq::inject_wrapper(qctx).map_err(EngineError::internal)?;
-    }
-    #[cfg(feature = "auth")]
-    if params.auth_enabled.is_on() {
-        auth::inject_wrapper(qctx).map_err(EngineError::internal)?;
     }
     Ok(())
 }
@@ -635,20 +582,50 @@ fn inject_read(qctx: &Ctx<'_>, hook: Arc<ReadHook>) -> Result<(), rquickjs::Erro
     Ok(())
 }
 
-/// Injects the consumer-supplied `io.call(name, action, payload)` egress global.
+/// Injects the capability mux (`io.call` via `__io`) plus each enabled registered capability's
+/// JS wrapper.
 ///
-/// The native `__io` forwards `(name, action, payload_json)` to the [`Egress`] hook and
-/// returns either the JSON result verbatim or a `__runlet` tagged error; the JS wrapper
-/// (`js/io.js`) throws on the latter so the engine classifies it as a capability error
-/// exactly like a built-in capability. Calls are capped at `max_ops` per execution (a shared
-/// counter, mirroring `emit`), so the egress can't be used to bypass the op budget.
-fn inject_egress(
+/// The mux routes by name through the registry (local backend → per-request fallback → builder
+/// fallback), applies the SSRF guard to `ScriptControlled` capabilities, and fails closed. It is
+/// injected only when there is I/O to do — an active registry or a per-request fallback egress;
+/// otherwise the `io` global is withheld entirely. A registered def's wrapper is `eval`'d only if
+/// its name is in `enabled_io` (per-request, opt-in).
+fn inject_registry(qctx: &Ctx<'_>, params: &ExecParams<'_>) -> Result<(), rquickjs::Error> {
+    let registry = params.registry.cloned().unwrap_or_default();
+    if !registry.is_active() && params.egress.is_none() {
+        return Ok(());
+    }
+    inject_mux(
+        qctx,
+        registry.clone(),
+        params.egress.clone(),
+        params.max_ops,
+        params.allow_private_targets,
+    )?;
+    for def in registry.defs() {
+        if params.enabled_io.contains(&def.name()) {
+            let wrapper: JsValue<'_> = qctx.eval(def.js_wrapper())?;
+            drop(wrapper);
+        }
+    }
+    Ok(())
+}
+
+/// Injects the native `__io(name, action, payload_json)` + the `io.call` JS wrapper (`js/io.js`).
+///
+/// `__io` forwards to [`CapabilityRegistry::dispatch`] and returns either the backend JSON
+/// verbatim or a `__runlet` tagged error; the JS wrapper throws on the latter so the engine
+/// classifies it as a capability error. Calls are capped at `max_ops` per execution (a shared
+/// counter, mirroring `emit`), so the mux can't be used to bypass the op budget.
+fn inject_mux(
     qctx: &Ctx<'_>,
-    egress: Arc<dyn Egress>,
+    registry: CapabilityRegistry,
+    fallback: Option<Arc<dyn Egress>>,
     max_ops: usize,
+    allow_private: bool,
 ) -> Result<(), rquickjs::Error> {
     let used = Arc::new(AtomicUsize::new(0));
-    let egress_fn = Function::new(
+    let io_fn = Function::new(
         qctx.clone(),
         move |name: String, action: String, payload: String| -> String {
             if used.load(Ordering::Relaxed) >= max_ops {
@@ -663,14 +640,17 @@ fn inject_egress(
                 });
             }
             let _prev = used.fetch_add(1, Ordering::Relaxed);
-            match egress.call(&name, &action, &payload) {
-                Ok(json) => json,
-                Err(err) => err.to_tag_json(),
-            }
+            registry.dispatch(&MuxCall {
+                name: &name,
+                action: &action,
+                payload: &payload,
+                allow_private,
+                fallback: fallback.as_ref(),
+            })
         },
     )?
     .with_name("__io")?;
-    qctx.globals().set("__io", egress_fn)?;
+    qctx.globals().set("__io", io_fn)?;
     let wrapper: JsValue<'_> = qctx.eval(IO_WRAPPER)?;
     drop(wrapper);
     Ok(())
@@ -1170,9 +1150,12 @@ mod bytecode_cache_tests {
             profile: Profile::Full,
             sys_config: None,
             read_hook: None,
+            registry: None,
+            enabled_io: &[],
             egress: None,
             max_ops: 64,
             max_output_size: 0,
+            allow_private_targets: false,
         }
     }
 
@@ -1236,17 +1219,21 @@ mod bytecode_cache_tests {
     }
 }
 
-/// The `Egress` egress seam: a wired egress exposes `io.call`, success JSON flows
-/// back to the script, a `EgressError` round-trips as a classified capability error, and the
-/// seam is withheld under `Profile::Deterministic`. Gated to the capability-free build so
-/// `ExecParams` has no I/O fields to populate.
+/// The capability mux (`io.call`) + registry: a wired egress/registry exposes `io.call`, success
+/// JSON flows back, a `EgressError` round-trips as a classified capability error, and the seam is
+/// withheld under `Profile::Deterministic`. Gated to the capability-free build so `ExecParams`
+/// has no in-engine (`http`/`s3`) fields to populate.
 #[cfg(test)]
 #[cfg(not(feature = "_io"))]
 mod egress_tests {
     use super::{EngineError, ExecOutcome, ExecParams, Profile, run};
+    use crate::capability::{
+        CapabilityDef, CapabilityRegistry, SsrfPolicy, Target, TargetExtractor, Trust,
+    };
     use crate::egress::{Egress, EgressError};
     use rquickjs::Runtime;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     /// A stub egress: action `"fail"` returns a retryable `db` error; anything else echoes the
@@ -1267,11 +1254,78 @@ mod egress_tests {
         }
     }
 
-    /// Builds `ExecParams` for the no-capability build with an optional egress port wired.
+    /// An egress that flips a shared flag when reached and replies with a fixed marker — proves
+    /// whether the mux dispatched to the backend or blocked before it.
+    struct RecordingEgress {
+        /// Set to `true` the first time [`Egress::call`] runs.
+        called: Arc<AtomicBool>,
+        /// Fixed JSON reply on success.
+        reply: String,
+    }
+
+    impl Egress for RecordingEgress {
+        fn call(
+            &self,
+            _name: &str,
+            _action: &str,
+            _payload_json: &str,
+        ) -> Result<String, EgressError> {
+            self.called.store(true, Ordering::Relaxed);
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// A `ScriptControlled` policy whose extractor reads `payload.host` (port 80), with an empty
+    /// allowlist so only the private-IP block decides.
+    fn host_policy() -> SsrfPolicy {
+        let extractor: Arc<TargetExtractor> = Arc::new(|payload: &str| {
+            let value: serde_json::Value =
+                serde_json::from_str(payload).map_err(|err| err.to_string())?;
+            let host = value
+                .get("host")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "missing host".to_owned())?;
+            Ok(Some(Target {
+                host: host.to_owned(),
+                port: 80,
+            }))
+        });
+        SsrfPolicy::new(Arc::from(Vec::<String>::new()), extractor)
+    }
+
+    /// The registry wiring for a test run: an optional registry plus the enabled capability names
+    /// (bundled to keep [`params`] within the argument-count lint).
+    #[derive(Clone, Copy)]
+    struct Reg<'a> {
+        /// The host's composed registry, or `None` for a fallback-only run.
+        registry: Option<&'a CapabilityRegistry>,
+        /// Registered names whose wrappers to inject for this request.
+        enabled: &'a [&'a str],
+    }
+
+    impl<'a> Reg<'a> {
+        /// No registry and no enabled names (a raw `io.call` / fallback-only run).
+        const NONE: Reg<'static> = Reg {
+            registry: None,
+            enabled: &[],
+        };
+
+        /// A registry with the given enabled names.
+        const fn new(registry: &'a CapabilityRegistry, enabled: &'a [&'a str]) -> Self {
+            Self {
+                registry: Some(registry),
+                enabled,
+            }
+        }
+    }
+
+    /// Builds `ExecParams` for the no-capability build with a registry wiring and an optional
+    /// per-request fallback egress.
     fn params<'a>(
         runtime: &'a Runtime,
         script: &'a str,
         profile: Profile,
+        reg: Reg<'a>,
         egress: Option<Arc<dyn Egress>>,
     ) -> ExecParams<'a> {
         ExecParams {
@@ -1284,24 +1338,39 @@ mod egress_tests {
             profile,
             sys_config: None,
             read_hook: None,
+            registry: reg.registry,
+            enabled_io: reg.enabled,
             egress,
             max_ops: 8,
             max_output_size: 0,
+            allow_private_targets: false,
         }
     }
 
-    /// A successful `io.call` returns the backend JSON to the script.
+    /// Runs `script` and returns the success JSON, failing the test on a non-success outcome.
+    fn run_ok(params: &ExecParams<'_>) -> String {
+        let exec = run(params).unwrap_or_else(|_err| unreachable!());
+        let ExecOutcome::Success(json) = exec.outcome else {
+            unreachable!("expected a success outcome");
+        };
+        json
+    }
+
+    /// A successful `io.call` (served by the per-request fallback egress) returns the backend
+    /// JSON to the script — an unregistered name routes to the fallback.
     #[test]
     fn resource_call_returns_backend_json() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
         let script =
             "function handler(ctx) { return json(io.call('orders', 'ping', { x: ctx.n })); }";
         let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
-        let exec = run(&params(&runtime, script, Profile::Full, Some(egress)))
-            .unwrap_or_else(|_err| unreachable!());
-        let ExecOutcome::Success(json) = exec.outcome else {
-            unreachable!("expected a success outcome");
-        };
+        let json = run_ok(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::NONE,
+            Some(egress),
+        ));
         assert!(
             json.contains("echoed"),
             "backend JSON flows to the script: {json}"
@@ -1319,34 +1388,297 @@ mod egress_tests {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
         let script = "function handler(ctx) { return json(io.call('orders', 'fail', {})); }";
         let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
-        let exec = run(&params(&runtime, script, Profile::Full, Some(egress)))
-            .unwrap_or_else(|_err| unreachable!());
+        let exec = run(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::NONE,
+            Some(egress),
+        ))
+        .unwrap_or_else(|_err| unreachable!());
         assert!(
             matches!(exec.outcome, ExecOutcome::Error(EngineError::Capability(_))),
             "a EgressError must surface as a classified capability error"
         );
     }
 
-    /// Under `Profile::Deterministic` the egress is withheld: `egress` is undefined even when
-    /// one is wired (the boundary is enforced by the engine, not the caller).
+    /// Under `Profile::Deterministic` the mux is withheld: the `io` global is undefined even
+    /// when an egress is wired (the boundary is enforced by the engine, not the caller).
     #[test]
     fn resource_withheld_under_deterministic_profile() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
-        let script = "function handler() { return json(typeof egress); }";
+        let script = "function handler() { return json(typeof io); }";
         let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
-        let exec = run(&params(
+        let json = run_ok(&params(
             &runtime,
             script,
             Profile::Deterministic,
+            Reg::NONE,
             Some(egress),
-        ))
-        .unwrap_or_else(|_err| unreachable!());
-        let ExecOutcome::Success(json) = exec.outcome else {
-            unreachable!("expected a success outcome");
-        };
+        ));
         assert!(
             json.contains("undefined"),
-            "egress withheld under deterministic: {json}"
+            "io withheld under deterministic: {json}"
+        );
+    }
+
+    /// D9/1.7: under the deterministic profile the ambient nondeterministic authorities are
+    /// *removed* (`typeof === "undefined"`), not stubbed — a stub would report `"function"`, and
+    /// a present-but-gated authority is one refactor from being un-gated.
+    #[test]
+    fn deterministic_profile_removes_ambient_authority() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let script = "function handler() { return json({ \
+            random: typeof Math.random, \
+            dateNow: typeof Date.now }); }";
+        let json = run_ok(&params(
+            &runtime,
+            script,
+            Profile::Deterministic,
+            Reg::NONE,
+            None,
+        ));
+        assert!(
+            json.contains("\"random\":\"undefined\""),
+            "Math.random removed: {json}"
+        );
+        assert!(
+            json.contains("\"dateNow\":\"undefined\""),
+            "Date.now removed: {json}"
+        );
+    }
+
+    /// A registered def's wrapper is injected only when its name is enabled; an unregistered /
+    /// disabled name has no global (`typeof x === "undefined"`).
+    #[test]
+    fn registered_wrapper_injected_only_when_enabled() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let wrapper =
+            "globalThis.widget = { ping: function () { return io.call('widget', 'ping', {}); } };";
+        let def = CapabilityDef::new("widget", wrapper, "", Trust::OperatorSupplied);
+        let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
+        let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
+        let script = "function handler() { return json({ widget: typeof widget, missing: typeof gadget }); }";
+        let json = run_ok(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::new(&reg, &["widget"]),
+            Some(egress),
+        ));
+        assert!(
+            json.contains("\"widget\":\"object\""),
+            "enabled wrapper is present: {json}"
+        );
+        assert!(
+            json.contains("\"missing\":\"undefined\""),
+            "unregistered name is absent: {json}"
+        );
+    }
+
+    /// D1: two defs sharing a name are rejected at build time, before any request.
+    #[test]
+    fn duplicate_registration_is_rejected() {
+        let one = CapabilityDef::new("db", "", "", Trust::OperatorSupplied);
+        let two = CapabilityDef::new("db", "", "", Trust::OperatorSupplied);
+        assert!(
+            CapabilityRegistry::build(vec![one, two], None).is_err(),
+            "duplicate capability names must fail host construction"
+        );
+    }
+
+    /// D4/1.5: a `ScriptControlled` def targeting a private IP is rejected *before* the backend
+    /// is reached — the SSRF guard runs pre-connect, inside the mux.
+    #[test]
+    fn script_controlled_private_ip_rejected_pre_connect() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let called = Arc::new(AtomicBool::new(false));
+        let backend: Arc<dyn Egress> = Arc::new(RecordingEgress {
+            called: Arc::clone(&called),
+            reply: "{\"ok\":true}".to_owned(),
+        });
+        let def = CapabilityDef::new("db", "", "", Trust::ScriptControlled(host_policy()))
+            .with_backend(backend);
+        let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
+        let script =
+            "function handler() { return json(io.call('db', 'get', { host: '10.0.0.1' })); }";
+        let exec = run(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::new(&reg, &[]),
+            None,
+        ))
+        .unwrap_or_else(|_err| unreachable!());
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "a private-IP target must be rejected"
+        );
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "the backend must never be reached (pre-connect block)"
+        );
+    }
+
+    /// A `ScriptControlled` def targeting a public host is permitted through to the backend.
+    #[test]
+    fn script_controlled_public_host_reaches_backend() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let called = Arc::new(AtomicBool::new(false));
+        let backend: Arc<dyn Egress> = Arc::new(RecordingEgress {
+            called: Arc::clone(&called),
+            reply: "{\"ok\":true}".to_owned(),
+        });
+        let def = CapabilityDef::new("db", "", "", Trust::ScriptControlled(host_policy()))
+            .with_backend(backend);
+        let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
+        let script =
+            "function handler() { return json(io.call('db', 'get', { host: '93.184.216.34' })); }";
+        let json = run_ok(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::new(&reg, &[]),
+            None,
+        ));
+        assert!(
+            json.contains("\"ok\":true"),
+            "public host reaches the backend: {json}"
+        );
+        assert!(called.load(Ordering::Relaxed), "the backend was reached");
+    }
+
+    /// D9/1.6: when the trust-policy hook itself errors, the mux denies the call rather than
+    /// falling through to the I/O.
+    #[test]
+    fn mux_fails_closed_on_policy_error() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let called = Arc::new(AtomicBool::new(false));
+        let backend: Arc<dyn Egress> = Arc::new(RecordingEgress {
+            called: Arc::clone(&called),
+            reply: "{}".to_owned(),
+        });
+        // A policy whose extractor always fails — the enforcement cannot be evaluated.
+        let extractor: Arc<TargetExtractor> =
+            Arc::new(|_payload: &str| Err("policy hook exploded".to_owned()));
+        let policy = SsrfPolicy::new(Arc::from(Vec::<String>::new()), extractor);
+        let def =
+            CapabilityDef::new("db", "", "", Trust::ScriptControlled(policy)).with_backend(backend);
+        let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
+        let script = "function handler() { return json(io.call('db', 'get', {})); }";
+        let exec = run(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::new(&reg, &[]),
+            None,
+        ))
+        .unwrap_or_else(|_err| unreachable!());
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "a failing policy hook must deny the call"
+        );
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "the backend must never be reached when enforcement fails"
+        );
+    }
+
+    /// D9: a *panicking* enforcement hook also denies (fail-closed), never reaching the backend.
+    #[test]
+    fn mux_fails_closed_on_policy_panic() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let called = Arc::new(AtomicBool::new(false));
+        let backend: Arc<dyn Egress> = Arc::new(RecordingEgress {
+            called: Arc::clone(&called),
+            reply: "{}".to_owned(),
+        });
+        let extractor: Arc<TargetExtractor> =
+            Arc::new(|_payload: &str| unreachable!("policy hook panics"));
+        let policy = SsrfPolicy::new(Arc::from(Vec::<String>::new()), extractor);
+        let def =
+            CapabilityDef::new("db", "", "", Trust::ScriptControlled(policy)).with_backend(backend);
+        let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
+        let script = "function handler() { return json(io.call('db', 'get', {})); }";
+        let exec = run(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::new(&reg, &[]),
+            None,
+        ))
+        .unwrap_or_else(|_err| unreachable!());
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "a panicking policy hook must deny the call"
+        );
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "the backend must never be reached on a panic"
+        );
+    }
+
+    /// D5/1.8: mixed topology — one name served by a local backend, another falling through to
+    /// the per-request fallback egress, in the same execution.
+    #[test]
+    fn mixed_topology_local_and_fallback() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let local_called = Arc::new(AtomicBool::new(false));
+        let local: Arc<dyn Egress> = Arc::new(RecordingEgress {
+            called: Arc::clone(&local_called),
+            reply: "{\"served\":\"local\"}".to_owned(),
+        });
+        // `orders` is bound locally; `amq` is registered without a backend → the fallback serves it.
+        let orders =
+            CapabilityDef::new("orders", "", "", Trust::OperatorSupplied).with_backend(local);
+        let amq = CapabilityDef::new("amq", "", "", Trust::OperatorSupplied);
+        let reg = CapabilityRegistry::build(vec![orders, amq], None)
+            .unwrap_or_else(|_err| unreachable!());
+        let fallback: Arc<dyn Egress> = Arc::new(EchoEgress);
+        let script = "function handler() { return json({ \
+            a: io.call('orders', 'ping', {}), \
+            b: io.call('amq', 'publish', { m: 1 }) }); }";
+        let json = run_ok(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::new(&reg, &[]),
+            Some(fallback),
+        ));
+        assert!(
+            json.contains("\"served\":\"local\""),
+            "orders served in-process: {json}"
+        );
+        assert!(
+            json.contains("echoed"),
+            "amq served by the fallback: {json}"
+        );
+        assert!(
+            local_called.load(Ordering::Relaxed),
+            "the local backend was used"
+        );
+    }
+
+    /// A registered name with neither a local backend nor a fallback fails with
+    /// `EGRESS_UNAVAILABLE`.
+    #[test]
+    fn no_backend_no_fallback_is_egress_unavailable() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let def = CapabilityDef::new("db", "", "", Trust::OperatorSupplied);
+        let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
+        let script = "function handler() { \
+            try { io.call('db', 'query', {}); return json('no throw'); } \
+            catch (e) { return json(e.__runlet ? e.__runlet.code : 'untagged'); } }";
+        let json = run_ok(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::new(&reg, &[]),
+            None,
+        ));
+        assert!(
+            json.contains("EGRESS_UNAVAILABLE"),
+            "no backend + no fallback: {json}"
         );
     }
 }

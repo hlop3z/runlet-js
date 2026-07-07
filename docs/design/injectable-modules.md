@@ -11,7 +11,7 @@ Companion to [script-registry.md](script-registry.md) and
 
 Injectable modules let internal developers author reusable JS libraries that
 customer scripts compose with inside the sandbox: validation helpers, a pricing
-engine, a company-SDK wrapper around `db`/`api`, formatting utilities. Customers
+engine, a company-SDK wrapper around `db`/`http`, formatting utilities. Customers
 write less boilerplate; internal teams ship a tool once instead of pasting snippets
 into every handler.
 
@@ -75,7 +75,7 @@ property. The specific rules:
   format cost years of migration and a compatibility-flag regime they still carry.)
 
 - **Reserved-name validation at load; no inter-module dependency graph.** A module may not
-  shadow `db`, `api`, `$`, `json`, `handler`, and similar globals. (Salesforce's global
+  shadow `db`, `http`, `$`, `json`, `handler`, and similar globals. (Salesforce's global
   namespace pollution and implicit cross-package dependencies — "Happy Soup" — produced a
   decade-long 1GP→2GP repackaging.)
 

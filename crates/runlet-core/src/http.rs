@@ -1,6 +1,6 @@
-//! Controlled `api` HTTP client for the `QuickJS` sandbox.
+//! Controlled `http` HTTP client for the `QuickJS` sandbox.
 //!
-//! JS API: `api.get/post/put/patch/delete(url, ...)`
+//! JS API: `http.get/post/put/patch/delete(url, ...)`
 //! Access controlled per-request via `allowed_hosts`.
 //! Each call is metered in `HttpMetric` for auditing.
 
@@ -35,8 +35,8 @@ const PROTECTED_HEADERS: &[&str] = &[
     "transfer-encoding",
 ];
 
-/// JS wrapper — loaded from `src/js/api.js` at compile time.
-const API_WRAPPER: &str = include_str!("js/api.js");
+/// JS wrapper — loaded from `src/js/http.js` at compile time.
+const HTTP_WRAPPER: &str = include_str!("js/http.js");
 
 /// Fallback fault for an HTTP transport error with no specific predicate.
 const HTTP_FALLBACK: Fault = Fault::new("HTTP_ERROR", true, ErrorOwner::Operator);
@@ -49,7 +49,7 @@ const HTTP_BODY_TOO_LARGE: Fault = Fault::new("HTTP_BODY_TOO_LARGE", false, Erro
 
 /// An HTTP error carrying its classified [`Fault`] plus the raw message.
 ///
-/// Unlike `db`/`mail`/`s3`, `api` never throws (§13): the closure turns this into an
+/// Unlike `db`/`mail`/`s3`, `http` never throws (§13): the closure turns this into an
 /// **in-band** `{ status: 0, error }` value the script inspects.
 #[derive(Debug)]
 struct HttpError {
@@ -110,12 +110,12 @@ impl HttpMetric {
     }
 }
 
-/// Injects the `api` global and returns a metrics collector.
+/// Injects the `http` global and returns a metrics collector.
 ///
 /// # Errors
 ///
 /// Returns an error if client creation, registration, or JS eval fails.
-pub fn inject_api(
+pub fn inject_http(
     qctx: &Ctx<'_>,
     allowed_hosts: &[String],
     max_ops: usize,
@@ -189,7 +189,7 @@ pub fn inject_api(
 
     qctx.globals().set("__http", http_fn)?;
 
-    let wrapper: JsValue<'_> = qctx.eval(API_WRAPPER)?;
+    let wrapper: JsValue<'_> = qctx.eval(HTTP_WRAPPER)?;
     drop(wrapper);
 
     Ok(metrics)

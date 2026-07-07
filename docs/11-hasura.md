@@ -3,7 +3,7 @@
 [← Back to the guide](README.md)
 
 Hasura turns your database into a GraphQL API. jsbox can talk to it like any other
-website (with [`api`](02-api.md)) — but every handler ends up repeating the same three
+website (with [`http`](02-api.md)) — but every handler ends up repeating the same three
 chores. The **`hasura/client`** module does them for you.
 
 ## What the module saves you
@@ -11,7 +11,7 @@ chores. The **`hasura/client`** module does them for you.
 1. Building the `/v1/graphql` web address.
 2. Adding the right password headers (an admin secret, or a logged-in user's token).
 3. **Catching GraphQL errors** — the sneaky part. Hasura often replies `200 OK` even
-   when your query was wrong, hiding the real problem _inside_ the answer. Plain `api`
+   when your query was wrong, hiding the real problem _inside_ the answer. Plain `http`
    code that only checks the status thinks it worked. The module turns those hidden
    errors into real errors so you can't miss them. 🎣
 
@@ -21,7 +21,7 @@ This is a **module**, so it's wired up in two places:
 
 - The operator drops the file `modules/hasura/client.mjs` into the folder named by
   `modules_dir` in the server's `config.json` (loaded once at startup).
-- Each request turns on `api` for the Hasura host and tells the module where Hasura is.
+- Each request turns on `http` for the Hasura host and tells the module where Hasura is.
   The secret lives in config — **never in your script**:
 
 ```jsonc

@@ -13,7 +13,7 @@ CONFIG_FILE="tests/$DIR/secrets.json"
 # (e.g. {"io":{"db":["local-db"]}}) — the credentials live in the fabricd
 # sidecar's resources config (see fabricd.example.json in the fabricd repo,
 # github.com/hlop3z/fabricd), never in the
-# request. Only `api` (allowed_hosts), `s3`, and `sys` keep request-side
+# request. Only `http` (allowed_hosts), `s3`, and `sys` keep request-side
 # config, which is why this file can still hold secrets and stays gitignored.
 if [ -f "$CONFIG_FILE" ]; then
   CONFIG_JSON="$(cat "$CONFIG_FILE")"

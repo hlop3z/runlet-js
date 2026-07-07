@@ -46,7 +46,7 @@ These are the difference between "internal demo" and "safe to point traffic at."
   explicitly set `allow_unauthenticated: true` to assert auth is terminated upstream
   (gateway/mesh). `/health` and `/metrics` stay open for probes/scrape. This is defense in
   depth *behind* the gateway, not a replacement for it.
-- **`debug: false`.** `debug: true` relaxes the SSRF private-IP block so `api`/`s3` can reach
+- **`debug: false`.** `debug: true` relaxes the SSRF private-IP block so `http`/`s3` can reach
   localhost/LAN targets — it exists for local testing only. In production it would let a
   script-controlled URL reach your internal network. The default is already `false`; just
   make sure no production `config.json` sets it `true`.
@@ -101,7 +101,7 @@ it's pooler config.
 | `memory_limit`                         | Per-execution heap cap.                                         | Human sizes (`"32mb"`). A fat handler/module eats its own request's budget.                                                                                                                                                                  |
 | `max_stack_size`                       | Per-execution stack cap.                                        | Guards runaway recursion.                                                                                                                                                                                                                    |
 | `max_script_size` / `max_context_size` | Max bytes for the script and the context payload.               | Validated before execution. `max_context_size` left at `0` auto-derives to `memory_limit / 8`; an explicit value is **capped at `memory_limit / 4`** (the ~4× JSON-parse heap cost), so a max-size context always parses instead of OOM-ing. |
-| `max_ops`                              | Cap on total external operations (db/api/mail/…) per execution. | Bounds a handler's downstream fan-out.                                                                                                                                                                                                       |
+| `max_ops`                              | Cap on total external operations (db/http/mail/…) per execution. | Bounds a handler's downstream fan-out.                                                                                                                                                                                                       |
 | `max_output_size`                      | Max bytes of JSON the handler may return.                       | `0` = off (bounded by `memory_limit`). Set it for untrusted scripts so one handler can't return a `memory_limit`-sized blob; over-cap fails `OUTPUT_TOO_LARGE` (422).                                                                         |
 
 Sizes accept human-readable byte strings (`"32mb"`, `"1mb"`). The body limit is derived from
@@ -130,11 +130,11 @@ The box↔`fabricd` hop itself is either a local Unix-domain socket (same host �
 needed, gated by filesystem permissions) or QUIC with TLS 1.3, a pinned server certificate,
 and client auth — see §5.
 
-(`api`/`s3` are the exception: they stay **in-box** — SSRF-guarded HTTP / pure SigV4
+(`http`/`s3` are the exception: they stay **in-box** — SSRF-guarded HTTP / pure SigV4
 presigning — so their egress originates from the box. See
 [resilience.md](design/resilience.md) on the two trust models.)
 
-**The `api` host allowlist.** A request's `allowed_hosts` names the hosts the `api` client may
+**The `http` host allowlist.** A request's `allowed_hosts` names the hosts the `http` client may
 reach; the SSRF guard additionally blocks any host that resolves to a private/internal IP
 (IPv4 **and** IPv6 — loopback, RFC1918, link-local incl. cloud-metadata, ULA, and private v4
 smuggled via 6to4/NAT64). The wildcard `allowed_hosts: ["*"]` collapses the allowlist to that
@@ -154,7 +154,7 @@ that used to exist). Full rationale: [resource-egress.md](design/resource-egress
 QUIC transport details: [network-fabric.md](design/network-fabric.md).
 
 **No `fabricd`, no drivers — by design.** A deployment serving only deterministic /
-`api` / `s3` requests needs no sidecar at all. If a request names a driver resource and
+`http` / `s3` requests needs no sidecar at all. If a request names a driver resource and
 neither `fabricd_socket` nor `fabricd_quic` is configured, it is rejected
 `503 EGRESS_UNAVAILABLE`; a name the operator never bound (or bound to another tenant)
 is a `400 RESOURCE_NOT_FOUND`.
@@ -289,7 +289,7 @@ Scrape `GET /metrics` (Prometheus text, no client library). The series and sugge
 | `runlet_db_breaker_trips_total`                     | Box-side series only — reports `0` since the breaker runs in `fabricd`. Scrape `fabricd`'s `metrics_listen` endpoint instead: any increase in `fabricd_db_breaker_trips_total` = a database is flapping/down; a spike in `fabricd_auth_failures_total` = someone is probing the QUIC listener. |
 | `runlet_bulkhead_permits_available` / `_total`      | Available trending toward 0 = at capacity (scale).                                   |
 | `runlet_execution_duration_seconds`                 | SLO latency objectives via `histogram_quantile` (p95/p99).                           |
-| `runlet_capability_op_duration_seconds{capability}` | Which downstream (db/api/…) is slow, not just total.                                 |
+| `runlet_capability_op_duration_seconds{capability}` | Which downstream (db/http/…) is slow, not just total.                                 |
 
 Every response also carries `meta.trace_id`, logged server-side with the raw cause — grep one
 ID across the mesh for support.

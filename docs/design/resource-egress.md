@@ -103,7 +103,7 @@ even name a real endpoint or credential.** The binding inverts:
 This is the existing [two-trust-models](../../CLAUDE.md) rule made physical. `db`/`mail` were
 "trusted because operator-supplied"; now that operator supply lives in `fabricd`, and the box's
 job shrinks to a per-invocation **allowlist of logical resource names** — exactly how
-`allowed_hosts` already gates the `api` client. `http` stays in-box and stays SSRF-guarded,
+`allowed_hosts` already gates the `http` client. `http` stays in-box and stays SSRF-guarded,
 because its target is still script-controlled.
 
 `ResourceBinding` is the allowlist entry (logical name + an optional capability-scoped token),

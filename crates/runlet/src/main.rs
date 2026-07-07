@@ -175,15 +175,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let registry = Arc::new(script_registry);
     // The callable logic host owns the pool + engine limits; the HTTP front is one consumer of it
     // (a non-HTTP scheduler could be another). It drives no I/O itself — driver capabilities run in
-    // the wired `fabricd` egress.
-    let host = LogicHost::new(
+    // the wired `fabricd` egress. The stock server composes the `runlet-caps` preset (the six
+    // driver-backed `CapabilityDef`s); their wrappers inject through the registry when named in
+    // `config.io`, and their calls route to the per-request sidecar egress (the mux fallback).
+    let host = LogicHost::builder(
         js_pool,
         Arc::clone(&registry),
         HostSettings {
             limits: engine_cfg,
             allow_private_targets: config.debug,
         },
-    );
+    )
+    .capabilities(runlet_caps::preset())
+    .build()
+    .map_err(|err| err.to_string())?;
     // A cheap clone (all `Arc`-backed) kept out of `AppState` so the warm runtime pool can be
     // disposed after axum has drained in-flight requests.
     let host_lifecycle = host.clone();

@@ -5,7 +5,7 @@ A sandboxed JavaScript execution engine built in Rust. Send a JS handler functio
 Powered by QuickJS (via rquickjs), axum, and mimalloc.
 
 > 🧒 **New here?** Start with the friendly, beginner-first guide in **[`docs/`](docs/README.md)** —
-> it explains `api`, `db`, `mail`, `s3`, and how to handle money/decimals in plain language.
+> it explains `http`, `db`, `mail`, `s3`, and how to handle money/decimals in plain language.
 
 The driver-backed capabilities are brokered by the **`fabricd` egress sidecar**, which lives
 in its own repo: [github.com/hlop3z/fabricd](https://github.com/hlop3z/fabricd). This repo is
@@ -66,7 +66,7 @@ server holds no credentials and the request never carries a host or a password. 
 | `script`               | one of   | JS source defining a `handler(ctx)` function                             |
 | `key`                  | one of   | Registered-script key (see [Registered scripts](#registered-scripts))    |
 | `context`              | no       | JSON object passed as `ctx` to the handler                               |
-| `config.allowed_hosts` | no       | Hosts the script can reach via `api.*` (`["*"]` = any, `[]` = disabled)  |
+| `config.allowed_hosts` | no       | Hosts the script can reach via `http.*` (`["*"]` = any, `[]` = disabled)  |
 | `config.io`            | no       | Logical resource names per capability, e.g. `{"db":["orders-db"]}` — names resolved operator-side, no creds (omit a kind to disable it) |
 | `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (in-engine; omit to disable `s3.*`) |
 | `config.sys`           | no       | `$sys.env` / `$sys.secrets` context                                      |
@@ -257,19 +257,19 @@ function handler(ctx) {
 defaults to 2). Holds ~28–29 significant digits. Divide-by-zero and overflow throw.
 See [`docs/05-decimal.md`](docs/05-decimal.md).
 
-### api.get / post / put / patch / delete
+### http.get / post / put / patch / delete
 
 HTTP client (requires `config.allowed_hosts`):
 
 ```js
 function handler(ctx) {
-  var users = api.get("https://api.example.com/users", { page: 1 });
+  var users = http.get("https://api.example.com/users", { page: 1 });
   // users = { status: 200, data: [...] }
 
-  var created = api.post("https://api.example.com/users", { name: ctx.name });
+  var created = http.post("https://api.example.com/users", { name: ctx.name });
 
   // Optional headers (last arg) — cannot override Content-Type
-  var auth = api.get("https://api.example.com/me", null, {
+  var auth = http.get("https://api.example.com/me", null, {
     Authorization: "Bearer " + ctx.token,
   });
 
@@ -409,7 +409,7 @@ The signed URL goes back to the script, which hands it to the frontend; the brow
 does the actual transfer. `expires` is in seconds (clamped to `[1, max_expires]`,
 default 15 min, SigV4 max 7 days).
 
-**SSRF-guarded like `api`/`http`:** the `endpoint` must use the `http`/`https` scheme
+**SSRF-guarded like `http`:** the `endpoint` must use the `http`/`https` scheme
 (no `file://`), and its host is checked against the same private/internal-IP blocklist
 ([`src/ssrf.rs`](src/ssrf.rs)) — `localhost`, `127.0.0.1`, `10.x`, `192.168.x`,
 link-local, etc. are **rejected** (one DNS lookup resolves hostnames). So a presigned
@@ -680,7 +680,7 @@ function handler(ctx) {
 
 **Hybrid error surface:** an invalid/expired/under-scoped token is the _caller's_ business
 flow, so it returns **in-band** (`{ ok:false, status, code:"AUTH_INVALID_TOKEN" }`, never
-thrown — like `api`). Infra failures the handler can't act on (issuer down → retryable
+thrown — like `http`). Infra failures the handler can't act on (issuer down → retryable
 `AUTH_UNAVAILABLE`; misconfig → `AUTH_REQUEST`) **throw** a tagged capability error (like
 `db`/`mail`). Per-token results are cached within a request (a repeat lookup makes no round
 trip and costs no op). Each call is metered in `meta.auth_requests`.
@@ -724,7 +724,7 @@ Optional `config.json` in the working directory. All fields have defaults:
 
 | Field                          | Default       | Description                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------ | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `debug`                        | `false`       | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`api` so localhost/LAN targets (e.g. MinIO) work. Never enable in production.                                                                                                                                                                                          |
+| `debug`                        | `false`       | **Dev only.** Relaxes the SSRF private-IP block for `s3`/`http` so localhost/LAN targets (e.g. MinIO) work. Never enable in production.                                                                                                                                                                                          |
 | `error_debug`                  | `false`       | Include `error.debug` (stack traces + raw driver causes) in system-error responses. **Off by default** (secure by default) — the raw cause can carry internal hostnames/driver detail. `meta.trace_id` is always present and the raw cause is always logged server-side, so support can correlate without it.                    |
 | `server.host` / `server.port`  | `127.0.0.1` / `3000` | Bind address and port.                                                                                                                                                                                                                                                                                                   |
 | `memory_limit`                 | `"32mb"`      | Max JS heap per execution                                                                                                                                                                                                                                                                                                       |
@@ -788,7 +788,7 @@ HTTP request
       -> acquire pooled QuickJS runtime
         -> fresh Context per request
           -> inject json() bridge
-          -> inject api.* (if allowed_hosts)
+          -> inject http.* (if allowed_hosts)
           -> inject db.*/mongo.*/mail.*/redis.*/amq.*/auth.* (per config.io names,
              resolved operator-side -> wired Egress port; script-facing global: io.call)
           -> inject s3.* (if config.s3)

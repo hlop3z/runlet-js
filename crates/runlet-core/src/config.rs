@@ -82,7 +82,7 @@ pub struct EngineConfig {
     /// Number of hashed partition buckets, used only when per-partition fairness is on.
     /// More buckets = fewer key collisions, more semaphores. `0` = default 256.
     pub partition_buckets: usize,
-    /// Whether a request may use the `allowed_hosts: ["*"]` wildcard for the `api` client.
+    /// Whether a request may use the `allowed_hosts: ["*"]` wildcard for the `http` client.
     /// Default `false`: a `*` is ignored (matches nothing), so a request must name each host
     /// explicitly. `*` is dangerous because it removes the host allowlist and leaves only the
     /// private-IP filter — so it is honored only when this is `true` **and** `debug` is off

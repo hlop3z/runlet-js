@@ -1,0 +1,21 @@
+[package]
+name = "runlet-caps"
+description = "The standard capability preset for runlet-core — the six driver-backed capabilities (db/mongo/mail/redis/amq/auth) as composable CapabilityDefs (JS wrappers + trust declarations + .d.ts fragments), no drivers"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Data-only preset: the six standard driver-backed capabilities as `CapabilityDef`s (JS wrapper +
+# trust declaration + `.d.ts` fragment). Links no driver and no network stack — it depends on
+# `runlet-core` with `default-features = false` (only the always-on `capability` surface), so a
+# consumer composing the preset pulls no `reqwest`/`aws-lc-sys`. The backends live in `fabricd`.
+[dependencies]
+runlet-core = { path = "../runlet-core", default-features = false }
+
+[lints]
+workspace = true

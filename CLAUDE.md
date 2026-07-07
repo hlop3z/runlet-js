@@ -73,7 +73,7 @@ as a sibling checkout `../fabricd` for dev/tests) and are **replaceable at any t
 repo owns the entire contract (`crates/runlet-wire`), and anything that speaks it can stand in
 for `fabricd`. Nothing here depends on the fabricd repo — the dependency points the other way.
 
-**Cargo workspace (three crates + a bench crate):**
+**Cargo workspace (four crates + a bench crate):**
 
 - **`runlet-wire`** (`crates/runlet-wire/`) — the shared, driver-free, QuickJS-free egress
   contract, depended on by every other crate (including, cross-repo, the fabricd repo's
@@ -92,12 +92,20 @@ for `fabricd`. Nothing here depends on the fabricd repo — the dependency point
 - **`runlet-core`** (`crates/runlet-core/`) — the reusable logic host: the QuickJS engine,
   runtime pool, sandbox, resilience, error taxonomy, capabilities, and the callable
   [`LogicHost`] port (`Invocation` → `Outcome`). Knows nothing about HTTP. The public entry
-  is `runlet_core::host::LogicHost`; each capability is a cargo **feature** (`db`, `http`,
-  `mongo`, `mail`, `s3`, `redis`, `amq`, `auth`), so a deterministic-only consumer builds with
-  `default-features = false` and links nothing. **Links no network driver even with `full`** —
-  the driver-backed capabilities keep only their JS wrapper (`<cap>.rs`'s `inject_wrapper` +
-  `js/*.js`) here and route through the egress port; only `http` (SSRF-guarded) and `s3` (pure
-  SigV4 signing) stay in-engine. See `docs/design/` for the design.
+  is `runlet_core::host::LogicHost`. Capabilities are **composed as `CapabilityDef` values** via
+  `LogicHost::builder(...)` (the capability registry + egress mux — `capability.rs`), not baked in;
+  a deterministic-only consumer builds with `default-features = false` and links nothing. **Links
+  no network driver even with `full`** — the driver-backed capabilities are no longer here at all
+  (they moved to `runlet-caps`); core keeps only the two in-engine, code-carrying capabilities as
+  cargo features: `http` (SSRF-guarded) and `s3` (pure SigV4 signing). The mux enforces the sandbox
+  invariants centrally and **fails closed**; `Profile::Deterministic` *removes* ambient authority.
+  See `docs/design/composable-core.md`.
+- **`runlet-caps`** (`crates/runlet-caps/`) — the standard capability preset: the six driver-backed
+  capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) as composable `CapabilityDef`s (JS wrapper
+  + `.d.ts` fragment + `Trust::OperatorSupplied` + action-token list). **Data only, no drivers** —
+  depends on `runlet-core` with `default-features = false`. The stock `runlet` bin composes
+  `runlet_caps::preset()`; a custom box picks a subset or adds its own defs. Carries the D10
+  action-token fixture and the D11 `types.d.ts` golden drift test.
 - **`runlet`** (`crates/runlet/`) — the binary: the axum HTTP `/execute` front + server config,
   a thin adapter over `LogicHost::run`. **Links no network driver and holds no credentials**
   (it does not depend on `fabric-backends`): when a request names a driver resource in
@@ -176,15 +184,40 @@ Module paths below are under `crates/runlet-core/src/` unless prefixed with `run
 
 `config.rs` (core) owns `EngineConfig` (engine sandbox limits, human-readable byte sizes like `"32mb"`: memory, stack, wall-clock timeout, max script/context bytes, `max_ops`). The server `Config` (bind address, `/execute` auth token, `scripts_dir`/`modules_dir`) lives in `runlet/src/config.rs` and embeds `EngineConfig`.
 
-### The capability pattern (how `api`, `db`, `mail` work)
+### The capability pattern — two kinds (post composable-capability-core)
 
-Each capability is a near-identical module. To add or modify one, follow the existing shape:
+A capability is now a **first-class value**, not a hard-wired module. There are two kinds; pick by
+whether it needs in-engine code (see `docs/design/composable-core.md`).
 
-- A native function registered with `Function::new` named `__<cap>`, with a **string-in / string-out JSON FFI contract** (no rich types cross the QuickJS boundary). The matching JS wrapper lives in `crates/runlet-core/src/js/<cap>.js`, embedded via `include_str!` and `eval`'d after registration to expose a clean global (`api`, `db`, `mail`, `$`).
-- **Per-request, opt-in:** the capability is injected only if its config block is present in the request (`engine.rs::inject_apis`) **and** the `Profile` allows I/O. No config → the global simply doesn't exist (`typeof mail === "undefined"`). `$`/Decimal/`$sys` are the exception — pure (no I/O), **always injected**, no config.
-- **Metered:** each op goes through `sandbox.rs` (`check_op_limit`, `record`); metrics collect into a `Collector<T>` and drain into the response `meta.<cap>_requests`.
-- **Cargo-feature gated:** each I/O capability is a feature on `runlet-core`. A new capability adds a `[features]` entry (with `"_io"` and any `dep:` driver crates) and `#[cfg(feature = "<cap>")]` on its module, its `ExecParams`/`ExecResult`/`Collectors`/`CapabilitySet`/`ExecMetrics` fields, and its `inject_apis` block.
-- Files touched when adding a capability: new `crates/runlet-core/src/<cap>.rs` + `src/js/<cap>.js`, a `#[cfg]`'d `pub mod` in `lib.rs`, the feature in `crates/runlet-core/Cargo.toml`, a `#[cfg]`'d branch in `engine.rs::inject_apis` + cfg'd fields in `ExecParams`/`ExecResult`/`Collectors`, cfg'd fields in `host.rs` (`CapabilitySet`/`ExecMetrics` + the `run` wiring), and `RequestConfig` + `Meta` in `runlet/src/handler.rs`.
+**1. Driver-backed / egress capability (`db`, `mongo`, `mail`, `redis`, `amq`, `auth`, or your own)** —
+the common case. It is a [`CapabilityDef`](crates/runlet-core/src/capability.rs) composed onto the
+host via `LogicHost::builder(...).capability(def)`; **no core change, no cargo feature**.
+- A hand-written JS wrapper (`js/<cap>.js`) that routes every op through `io.call('<cap>', '<action>', payload)`
+  — the **string-in / string-out JSON FFI contract** (no rich types cross the QuickJS boundary).
+  Its editor `.d.ts` fragment (`js/<cap>.d.ts`) travels with it (D11), prefixing its interface
+  names by convention (`Db`, `Mongo`, …) to keep the shared TS namespace flat.
+- A mandatory `Trust` declaration: `OperatorSupplied` (targets from operator config, no SSRF — the
+  db/mail model) or `ScriptControlled(SsrfPolicy)` (targets from script input — the framework
+  applies the SSRF guard pre-connect).
+- **Per-request, opt-in:** the wrapper is injected only when the request names the capability in
+  `config.io` **and** the `Profile` allows I/O; the name routes through the egress mux to a
+  locally-bound backend, else the per-request/registry fallback (the `fabricd` sidecar), else
+  `EGRESS_UNAVAILABLE`. **Metered + limited + deadline-propagated + fail-closed centrally** by the
+  mux — an author cannot opt out.
+- The stock six live in **`runlet-caps`** (`preset()`); each is a `CapabilityDef::new(name, js, d.ts, Trust)`.
+  Files touched to add one there: `crates/runlet-caps/src/js/<cap>.js` + `<cap>.d.ts`, a `pub fn <cap>()`
+  + a `preset()` entry + an `actions::<CAP>` token list + the fixture assertion in
+  `crates/runlet-caps/src/lib.rs`. Metrics surface automatically under `meta.io.<name>` (the sidecar's
+  `BackendMetrics`); the D11 golden test (`types_dts_is_up_to_date`) regenerates `container/types.d.ts`.
+  **`runlet-core` is not touched.**
+
+**2. In-engine capability (`http`, `s3`)** — the rare case that carries real in-engine Rust code
+(the SSRF-guarded reqwest client; the SigV4 signing), so it stays in `runlet-core` and is the
+enumerated **mux-bypass surface** (`engine.rs::inject_apis`, gated by the `http`/`s3` cargo features,
+metered via `sandbox.rs` `Collector<T>` → `ExecMetrics` → `meta.io.http`/`meta.io.s3`). Adding one is
+a core change (module + feature + `inject_apis` block + `ExecParams`/`CapabilitySet` config field +
+its `js/<cap>.d.ts` fragment wired into `types.rs`) and must be justified against composing it as an
+egress capability instead.
 
 ### Two trust models — pick the right one
 

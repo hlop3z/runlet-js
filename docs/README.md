@@ -20,7 +20,7 @@ Read these in order. Each one is short.
 
 1. **[Getting Started](01-getting-started.md)** — your very first script, and the
    shape of every answer.
-2. **[`api` — talk to the internet](02-api.md)** — fetch data from other websites.
+2. **[`http` — talk to the internet](02-api.md)** — fetch data from other websites.
 3. **[`db` — talk to a database](03-database.md)** — read and save rows.
 4. **[`mail` — send email](04-mail.md)** — send a real email.
 5. **[`$` — Exact Decimal Math](05-decimal.md)** — the built-in money helper. Do exact
@@ -49,7 +49,7 @@ little `config` to your message. That keeps things safe.
 
 | Super-power             | What it does                | Turn it on with               |
 | ----------------------- | --------------------------- | ----------------------------- |
-| `api`                   | Talk to other websites      | `config.allowed_hosts`        |
+| `http`                  | Talk to other websites      | `config.allowed_hosts`        |
 | `db`                    | Talk to a database          | `config.io.db: ["nickname"]`  |
 | `mongo`                 | Talk to a document database | `config.io.mongo: ["nickname"]` |
 | `mail`                  | Send email                  | `config.io.mail: ["nickname"]` |
@@ -63,7 +63,7 @@ The database/mail/redis/etc. **nicknames** point at resources the grown-up (oper
 set up in the `resources` config of **`fabricd`** — a little key-keeper helper that runs
 next to jsbox and does the actual connecting. The keys and passwords live there, never in
 your request and never in the robot's box. You just ask by nickname (e.g.
-`config.io.db: ["orders-db"]`). `api` (`allowed_hosts`) and `s3` keep their settings in
+`config.io.db: ["orders-db"]`). `http` (`allowed_hosts`) and `s3` keep their settings in
 the request.
 
 (`$` — exact decimal math — and **`$sys.crypto` / `$sys.date`** are the exceptions:

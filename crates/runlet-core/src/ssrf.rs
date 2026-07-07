@@ -8,10 +8,18 @@
 //! Keeping the IP classification here (instead of duplicated per module) means the
 //! blocklist stays consistent across capabilities.
 
-use std::error::Error;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
+// The connect-time resolver below is `reqwest`-backed, so its imports are gated to the
+// in-engine capabilities that install it (`http`/`s3`); the pure-std classifier is always on.
+#[cfg(any(feature = "http", feature = "s3"))]
+use std::error::Error;
+#[cfg(any(feature = "http", feature = "s3"))]
+use std::net::SocketAddr;
+
+#[cfg(any(feature = "http", feature = "s3"))]
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+#[cfg(any(feature = "http", feature = "s3"))]
 use tokio::task;
 
 /// Blocks a host that is — or resolves to — a private/internal IP address.
@@ -155,6 +163,9 @@ const fn is_private_v4(ip: Ipv4Addr) -> bool {
 }
 
 // -- Connect-time pinning (shared by `http` and `s3`) -----------------------
+//
+// `reqwest`-backed, so each item is gated to the in-engine capabilities that install it. The
+// pure-std classifier above is always compiled (the mux uses it for `ScriptControlled` caps).
 
 /// A `reqwest` DNS resolver that drops every address failing the SSRF classifier **at the
 /// lookup reqwest connects with**, so a hostname can't resolve public for a pre-check and
@@ -165,11 +176,13 @@ const fn is_private_v4(ip: Ipv4Addr) -> bool {
 /// Shared by both script-/operator-controlled capabilities: `http` installs it on its
 /// request client and `s3` on its list/delete/send client, so the same pinning guarantee
 /// covers every capability that opens an outbound connection.
+#[cfg(any(feature = "http", feature = "s3"))]
 pub(crate) struct SsrfResolver {
     /// When `true` (server `debug`), private/internal addresses are allowed (local testing).
     allow_private: bool,
 }
 
+#[cfg(any(feature = "http", feature = "s3"))]
 impl SsrfResolver {
     /// Builds a resolver honoring the `allow_private` (debug) relaxation.
     pub(crate) const fn new(allow_private: bool) -> Self {
@@ -177,6 +190,7 @@ impl SsrfResolver {
     }
 }
 
+#[cfg(any(feature = "http", feature = "s3"))]
 impl Resolve for SsrfResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
@@ -196,6 +210,7 @@ impl Resolve for SsrfResolver {
 /// the host doesn't resolve or every address is private/internal (fail closed — never hand
 /// reqwest an empty or unfiltered set). Port `0` is a placeholder; reqwest substitutes the
 /// URL's port.
+#[cfg(any(feature = "http", feature = "s3"))]
 pub(crate) fn resolve_filtered(
     host: &str,
     allow_private: bool,
@@ -219,7 +234,9 @@ mod tests {
     //! deprecated IPv4-compatible form, multicast, and reserved/future ranges — plus the
     //! shared connect-time pinning filter.
 
-    use super::{block_private_ip, is_private_ip, resolve_filtered};
+    #[cfg(any(feature = "http", feature = "s3"))]
+    use super::resolve_filtered;
+    use super::{block_private_ip, is_private_ip};
     use std::net::IpAddr;
 
     /// Parses a literal into an `IpAddr` for the table-driven cases.
@@ -335,6 +352,7 @@ mod tests {
 
     /// The SSRF filter keeps a public literal, rejects a private one, and honors the debug
     /// relaxation. Literal IPs resolve without network, so this is hermetic.
+    #[cfg(any(feature = "http", feature = "s3"))]
     #[test]
     fn resolve_filtered_drops_private_addresses() {
         assert_eq!(

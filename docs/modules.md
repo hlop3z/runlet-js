@@ -71,7 +71,7 @@ A module is **plain JS in the same sandbox as the handler** — it is exactly as
 customer's own code, and a customer script can read or patch it (`Function.prototype.toString`).
 So:
 
-- I/O, secrets, a real security boundary → a **Rust capability** (`db`, `api`, …). Only Rust is
+- I/O, secrets, a real security boundary → a **Rust capability** (`db`, `http`, …). Only Rust is
   outside the sandbox.
 - Logic the customer must not read or alter → a **registered script** (called by `key`).
 - In-script helpers the customer composes with → an **injectable module**.

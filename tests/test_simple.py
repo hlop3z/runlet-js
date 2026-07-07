@@ -271,10 +271,10 @@ def test_http_api(t: Runner):
     url = HTTPBIN_URL
 
     t.test("disabled when no config",
-           h("return json(typeof api, null);"),
+           h("return json(typeof http, null);"),
            data_eq("undefined"))
     t.test("available with wildcard",
-           h("return json(typeof api, null);", config=wildcard),
+           h("return json(typeof http, null);", config=wildcard),
            data_eq("object"))
     # A `*` wildcard host is intentionally INERT in SSRF-relaxed debug mode. The box runs with
     # debug:true so these api tests can reach the private-IP httpbin; under that relaxation `*`
@@ -282,46 +282,46 @@ def test_http_api(t: Runner):
     # (host.rs: `allow_wildcard_hosts && !allow_private`). The request is blocked in-band â†’ the
     # private host is unreachable via `*` (status 0), even though a specific-host config reaches it.
     t.test("wildcard host inert under debug (private-IP relax) -> blocked",
-           h(f"var r = api.get('{url}/get', {{foo:'bar'}}); return json({{status:r.status}}, null);", config=wildcard),
+           h(f"var r = http.get('{url}/get', {{foo:'bar'}}); return json({{status:r.status}}, null);", config=wildcard),
            lambda r: r["data"]["status"] == 0)
     t.test("get with specific host",
-           h(f"var r = api.get('{url}/get'); return json(r.status, null);", config=httpbin),
+           h(f"var r = http.get('{url}/get'); return json(r.status, null);", config=httpbin),
            data_eq(200))
     t.test("get blocked by host",
-           h(f"var r = api.get('{url}/get'); return json(r, null);", config=blocked),
+           h(f"var r = http.get('{url}/get'); return json(r, null);", config=blocked),
            lambda r: r["data"]["status"] == 0)
     t.test("post with body",
-           h(f'var r = api.post("{url}/post", {{hello:"world"}}); return json(r.status, null);', config=httpbin),
+           h(f'var r = http.post("{url}/post", {{hello:"world"}}); return json(r.status, null);', config=httpbin),
            data_eq(200))
     t.test("delete works",
-           h(f"var r = api.delete('{url}/delete'); return json(r.status, null);", config=httpbin),
+           h(f"var r = http.delete('{url}/delete'); return json(r.status, null);", config=httpbin),
            data_eq(200))
 
     # Headers (go-httpbin echoes header values as arrays of strings)
     t.test("get with auth header",
-           h(f"var r = api.get('{url}/get', null, {{'Authorization': 'Bearer test123'}}); return json(r.data.headers.Authorization[0], null);", config=httpbin),
+           h(f"var r = http.get('{url}/get', null, {{'Authorization': 'Bearer test123'}}); return json(r.data.headers.Authorization[0], null);", config=httpbin),
            data_eq("Bearer test123"))
     t.test("post with custom header",
-           h(f'var r = api.post("{url}/post", {{a:1}}, {{"X-Custom": "foo"}}); return json(r.data.headers["X-Custom"][0], null);', config=httpbin),
+           h(f'var r = http.post("{url}/post", {{a:1}}, {{"X-Custom": "foo"}}); return json(r.data.headers["X-Custom"][0], null);', config=httpbin),
            data_eq("foo"))
     t.test("content-type cannot be overridden",
-           h(f'var r = api.post("{url}/post", {{a:1}}, {{"Content-Type": "text/plain"}}); return json(r.data.headers["Content-Type"][0], null);', config=httpbin),
+           h(f'var r = http.post("{url}/post", {{a:1}}, {{"Content-Type": "text/plain"}}); return json(r.data.headers["Content-Type"][0], null);', config=httpbin),
            data_eq("application/json"))
     t.test("delete with header",
-           h(f"var r = api.delete('{url}/delete', {{'X-Req-Id': '42'}}); return json(r.data.headers['X-Req-Id'][0], null);", config=httpbin),
+           h(f"var r = http.delete('{url}/delete', {{'X-Req-Id': '42'}}); return json(r.data.headers['X-Req-Id'][0], null);", config=httpbin),
            data_eq("42"))
 
     # SSRF scheme allowlist: a non-http(s) URL is refused up front with HTTP_SSRF_BLOCKED,
     # before any host/IP check and independent of the client's supported-scheme set.
     t.test("non-http scheme blocked up front",
-           h(f"var r = api.get('file:///etc/passwd'); return json({{status:r.status, code:r.error && r.error.code}}, null);", config=httpbin),
+           h(f"var r = http.get('file:///etc/passwd'); return json({{status:r.status, code:r.error && r.error.code}}, null);", config=httpbin),
            lambda r: r["data"]["status"] == 0 and r["data"]["code"] == "HTTP_SSRF_BLOCKED")
     # The scheme allowlist is re-checked on every redirect hop: a redirect to a non-http(s)
     # target (host allowed, scheme not) is not followed, so the 302 is returned unfollowed
     # rather than the client dereferencing the cross-protocol Location.
     redirect_target = f"gopher://{HTTPBIN_HOST}/"
     t.test("cross-protocol redirect not followed",
-           h(f"var r = api.get('{url}/redirect-to?url=' + encodeURIComponent('{redirect_target}') + '&status_code=302'); return json(r.status, null);", config=httpbin),
+           h(f"var r = http.get('{url}/redirect-to?url=' + encodeURIComponent('{redirect_target}') + '&status_code=302'); return json(r.status, null);", config=httpbin),
            data_eq(302))
 
 
@@ -584,7 +584,7 @@ def test_db_engine(t: Runner, label: str, db: str):
     # Metrics tracked
     t.test(f"{label}: metrics tracked",
            h("db.query('SELECT 1'); db.query('SELECT 2'); return json(1, null);", config=_db_io(db)),
-           lambda r: len(r["meta"]["db_requests"]) == 2)
+           lambda r: len(r["meta"]["io"]["db"]) == 2)
 
     # Cleanup
     _post(h("db.execute('DROP TABLE IF EXISTS test_types'); db.execute('DROP TABLE IF EXISTS test_txn'); return json('ok', null);", config=_db_io(db)))
@@ -1034,8 +1034,8 @@ def test_esm(t: Runner):
 
 def test_hasura(t: Runner):
     """The `hasura/client` injectable module (modules/hasura/client.mjs). Hermetic: each
-    handler stubs `globalThis.api` so the module's request-shaping and error-handling are
-    exercised without a live Hasura â€” the module reads whatever `api.post` returns."""
+    handler stubs `globalThis.http` so the module's request-shaping and error-handling are
+    exercised without a live Hasura â€” the module reads whatever `http.post` returns."""
     t.section("Hasura module (hasura/client)")
 
     # Probe: the module must be registered (merged modules_dir). Self-skip otherwise so a
@@ -1054,7 +1054,7 @@ def test_hasura(t: Runner):
                "import { hasura } from 'hasura/client';\n"
                "export default function handler(ctx){\n"
                "  var cap = {};\n"
-               "  globalThis.api = { post: function(url, body, headers){\n"
+               "  globalThis.http = { post: function(url, body, headers){\n"
                "    cap = { url: url, body: body, headers: headers };\n"
                "    return { status: 200, data: { data: { users: [{ id: 7 }] } } };\n"
                "  }};\n"
@@ -1074,7 +1074,7 @@ def test_hasura(t: Runner):
                "import { hasura } from 'hasura/client';\n"
                "export default function handler(ctx){\n"
                "  var cap = {};\n"
-               "  globalThis.api = { post: function(url, body, headers){ cap.h = headers;\n"
+               "  globalThis.http = { post: function(url, body, headers){ cap.h = headers;\n"
                "    return { status: 200, data: { data: { ok: true } } }; }};\n"
                "  hasura({ endpoint: 'https://hasura.test', token: 'jwt123', adminSecret: 'sek' }).raw('query { ok }');\n"
                "  return json({ auth: cap.h['authorization'], hasSecret: ('x-hasura-admin-secret' in cap.h) }, null);\n"
@@ -1086,7 +1086,7 @@ def test_hasura(t: Runner):
            h_raw(
                "import { hasura } from 'hasura/client';\n"
                "export default function handler(ctx){\n"
-               "  globalThis.api = { post: function(){ return { status: 200, data: { errors: [\n"
+               "  globalThis.http = { post: function(){ return { status: 200, data: { errors: [\n"
                "    { message: 'boom', extensions: { code: 'validation-failed' } }] } }; }};\n"
                "  var h = hasura({ endpoint: 'https://hasura.test' });\n"
                "  try { h.query('query { x }'); return json('no-throw', null); }\n"
@@ -1100,7 +1100,7 @@ def test_hasura(t: Runner):
            h_raw(
                "import { hasura } from 'hasura/client';\n"
                "export default function handler(ctx){\n"
-               "  globalThis.api = { post: function(){ return { status: 0, error: { code: 'HTTP_CONNECT', retryable: true } }; }};\n"
+               "  globalThis.http = { post: function(){ return { status: 0, error: { code: 'HTTP_CONNECT', retryable: true } }; }};\n"
                "  var h = hasura({ endpoint: 'https://hasura.test' });\n"
                "  var env = h.raw('query { x }');\n"
                "  var threw = '';\n"
@@ -1372,13 +1372,13 @@ def test_auth_provider(t: Runner, label: str, token: str, has_introspect: bool):
                      and r["error"] is None)
 
     # Metered + per-request cache (two calls for one token = one round trip).
-    t.test(f"{label}: metered in auth_requests",
+    t.test(f"{label}: metered in meta.io.auth",
            h("auth.user_info(ctx.token); return json(1, null);", ctx, cfg),
-           lambda r: len(r["meta"]["auth_requests"]) == 1
-                     and r["meta"]["auth_requests"][0]["action"] == "user_info")
+           lambda r: len(r["meta"]["io"]["auth"]) == 1
+                     and r["meta"]["io"]["auth"][0]["action"] == "user_info")
     t.test(f"{label}: per-token cache (2 calls, 1 op)",
            h("auth.user_info(ctx.token); auth.user_info(ctx.token); return json(1, null);", ctx, cfg),
-           lambda r: len(r["meta"]["auth_requests"]) == 1)
+           lambda r: len(r["meta"]["io"]["auth"]) == 1)
 
     # Infra/misconfig throws a tagged capability error (here: introspect w/o creds).
     t.test(f"{label}: introspect without creds throws",
