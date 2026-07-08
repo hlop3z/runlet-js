@@ -115,7 +115,7 @@ binding)` where `internal_dev_settings_json` is operator-bound and unreachable f
 
 | Stays (pure compute / signing — no vendor driver) | Moves to `fabricd` (heavy driver) |
 | --- | --- |
-| `$`/`Decimal`, determinism shims, `emit`, `read` | `db` (`tokio-postgres`) |
+| `$`/`Decimal`, determinism shims, `emit` | `db` (`tokio-postgres`) |
 | `http` (`reqwest` + rustls, SSRF-guarded) | `mongo` (`mongodb` + `mongocrypt`) |
 | `s3` **presign** (`upload_url` — SigV4 signing, no network) | `mail` (SMTP), `redis`, `amq`, `auth` (OIDC) |
 

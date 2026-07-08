@@ -49,9 +49,9 @@ flag while building its own app-level graceful shutdown.)
 
 > **Resolved** per this item's own proposal: `Invocation` is now `#[non_exhaustive]` with a
 > constructor + builder — `Invocation::inline(source, ctx)` / `Invocation::registered(key, ctx)`,
-> then chainable `.profile(p)`, `.caps(c)`, `.read_hook(h)`, `.resource(r)`,
+> then chainable `.profile(p)`, `.caps(c)`, `.resource(r)`,
 > `.cache_namespace(ns)`, all defaulting the rest (profile `Full`, `CapabilitySet::NONE`, the
-> hooks/egress `None`, global cache namespace). Additive fields are now backward-compatible —
+> egress `None`, global cache namespace). Additive fields are now backward-compatible —
 > the change landed alongside the new `resource` egress field (`docs/design/resource-egress.md`)
 > precisely so that field addition wouldn't be another silent break. **One-time migration:**
 > external consumers must switch their `Invocation { … }` literals to the builder (the binary's
@@ -65,7 +65,7 @@ no builder/constructor. The only way to build one was a struct literal naming ev
 it failed to compile until each call site added the field. (This happened on a routine upstream bump.)
 
 **Proposed:** mark `Invocation` `#[non_exhaustive]` and offer a builder or constructor with sensible
-defaults, e.g. `Invocation::inline(code, ctx).profile(p).caps(c)` defaulting `read_hook: None`,
+defaults, e.g. `Invocation::inline(code, ctx).profile(p).caps(c)` defaulting `egress: None`,
 `cache_namespace: None`. Then additive fields are backward-compatible.
 
 ## 3. `LogicHost` is a concrete type, not a trait port  — *priority: medium / design*
@@ -182,8 +182,8 @@ LogicHost::new(pool, registry, settings)
 ```
 
 **Action:** drop the two arguments at your `LogicHost::new` call site. Nothing else in the blessed
-surface changed — `Invocation`, `CapabilitySet`, `Outcome`, `Egress`/`EgressError` (still
-`runlet_core::egress`), and the `read_hook` seam are unchanged. If you wired a breaker only to pass
+surface changed — `Invocation`, `CapabilitySet`, `Outcome`, and `Egress`/`EgressError` (still
+`runlet_core::egress`) are unchanged. If you wired a breaker only to pass
 it here, you can delete it; resilience for driver egress now lives in `fabricd`.
 
 **Also (Step 5, driver-feature consumers only):** the operator credential table + name→config

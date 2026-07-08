@@ -28,7 +28,7 @@ use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::{Status, TraceContextExt as _};
 
 use runlet_core::config::EngineConfig;
-use runlet_core::engine::{EngineError, ExecOutcome};
+use runlet_core::engine::{Effect, EngineError, ExecOutcome};
 use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 use runlet_core::host::{CapabilitySet, ExecMetrics, Invocation, LogicHost, Outcome};
 use runlet_core::metrics::{Capability, Metrics};
@@ -399,7 +399,14 @@ fn io_count(io: &BTreeMap<String, Value>, name: &str) -> usize {
     io.get(name).and_then(Value::as_array).map_or(0, Vec::len)
 }
 
-/// Success response: JS-produced `{data, error}` as borrowed `RawValue` + Rust meta.
+/// `skip_serializing_if` predicate: an empty effects list is omitted, so a run that never called
+/// `emit` stays byte-compatible with the prior `{data, error, meta}` response contract.
+const fn effects_empty(effects: &[Effect]) -> bool {
+    effects.is_empty()
+}
+
+/// Success response: JS-produced `{data, error}` as borrowed `RawValue` + Rust meta, plus the
+/// tagged `emit` effects (omitted when empty).
 #[derive(Debug, Serialize)]
 struct Response<'a> {
     /// The data field from the JS handler (borrowed, never copied).
@@ -408,17 +415,24 @@ struct Response<'a> {
     error: &'a RawValue,
     /// Metadata computed by Rust.
     meta: Meta,
+    /// The ordered `emit(kind, value)` effects; absent when the handler emitted nothing.
+    #[serde(skip_serializing_if = "effects_empty")]
+    effects: &'a [Effect],
 }
 
-/// System-error response: `data` is `null`, `error` is the structured envelope.
+/// System-error response: `data` is `null`, `error` is the structured envelope. Carries any
+/// effects emitted before the failure (capture-on-failure); the list is omitted when empty.
 #[derive(Debug, Serialize)]
-struct SystemErrorResponse {
+struct SystemErrorResponse<'a> {
     /// Always `null` on a system error.
     data: Option<()>,
     /// The structured error envelope.
     error: ErrorEnvelope,
     /// Metadata computed by Rust.
     meta: Meta,
+    /// Effects emitted before the failure; absent when none.
+    #[serde(skip_serializing_if = "effects_empty")]
+    effects: &'a [Effect],
 }
 
 /// Envelope parsed from the JS response — borrows from the source string.
@@ -1669,22 +1683,27 @@ fn build_response(
     match result {
         Ok((Ok(exec), backend)) => {
             record_capability_latencies(metrics, &exec.metrics, &backend);
-            // `exec.effects` (the declarative `emit` buffer) is intentionally ignored by the
-            // HTTP front — it is for non-HTTP consumers of `runlet-core`.
-            let meta = base_meta.with_metrics(exec.metrics, backend);
-            match exec.result {
+            // Surface the declarative `emit(kind, value)` effects on the response, on both the
+            // success and error paths (capture-on-failure); an empty list is omitted.
+            let Outcome {
+                result: exec_result,
+                effects,
+                metrics: exec_metrics,
+            } = exec;
+            let meta = base_meta.with_metrics(exec_metrics, backend);
+            match exec_result {
                 ExecOutcome::Success(js_json) => {
                     emit_executed(state, identity, &meta, "success");
                     metrics.record_success();
                     record_span_outcome("success");
-                    success_response(&js_json, meta, cfg)
+                    success_response(&js_json, meta, &effects, cfg)
                 }
                 ExecOutcome::Error(engine_err) => {
                     let outcome = engine_error_outcome(&engine_err);
                     emit_executed(state, identity, &meta, outcome);
                     metrics.record_engine_error(&engine_err);
                     record_span_outcome(outcome);
-                    engine_error_response(engine_err, meta, cfg)
+                    engine_error_response(engine_err, meta, &effects, cfg)
                 }
             }
         }
@@ -1693,7 +1712,7 @@ fn build_response(
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
             record_span_outcome(outcome);
-            engine_error_response(engine_err, base_meta, cfg)
+            engine_error_response(engine_err, base_meta, &[], cfg)
         }
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
@@ -1701,7 +1720,7 @@ fn build_response(
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
             record_span_outcome(outcome);
-            engine_error_response(engine_err, base_meta, cfg)
+            engine_error_response(engine_err, base_meta, &[], cfg)
         }
     }
 }
@@ -2202,12 +2221,13 @@ fn request_error(code: &str, message: String) -> ErrorEnvelope {
 /// Rust-side as opaque handles (see `sys.rs`), so a script can only ever return the
 /// `"[secret:NAME]"` placeholder, never the value. The `{data,error}` borrow stays
 /// zero-copy.
-fn success_response(js_json: &str, meta: Meta, cfg: RespCfg) -> AxumResponse {
+fn success_response(js_json: &str, meta: Meta, effects: &[Effect], cfg: RespCfg) -> AxumResponse {
     match serde_json::from_str::<Envelope<'_>>(js_json) {
-        Ok(env) => handler_envelope_response(&env, meta, cfg),
+        Ok(env) => handler_envelope_response(&env, meta, effects, cfg),
         Err(parse_err) => engine_error_response(
             EngineError::Malformed(format!("malformed handler response: {parse_err}")),
             meta,
+            effects,
             cfg,
         ),
     }
@@ -2218,7 +2238,12 @@ fn success_response(js_json: &str, meta: Meta, cfg: RespCfg) -> AxumResponse {
 /// boolean `retryable` picks the status (`true ⇒ 503` + `Retry-After`, `false`/absent ⇒ `422`). The
 /// body — both `data` and `error` — is passed through **verbatim** (invariant D1); the box only
 /// *reads* the one key to set the status line, never rewrites the payload.
-fn handler_envelope_response(env: &Envelope<'_>, meta: Meta, cfg: RespCfg) -> AxumResponse {
+fn handler_envelope_response(
+    env: &Envelope<'_>,
+    meta: Meta,
+    effects: &[Effect],
+    cfg: RespCfg,
+) -> AxumResponse {
     let projected = handler_status(env.error);
     let status = StatusCode::from_u16(projected.status).unwrap_or(StatusCode::OK);
     let mut response = (
@@ -2227,6 +2252,7 @@ fn handler_envelope_response(env: &Envelope<'_>, meta: Meta, cfg: RespCfg) -> Ax
             data: env.data,
             error: env.error,
             meta,
+            effects,
         }),
     )
         .into_response();
@@ -2274,18 +2300,34 @@ fn handler_status(error: &RawValue) -> Projected {
 /// Maps a classified [`EngineError`] to its projected HTTP response (design D6), and logs the
 /// full (raw) error server-side keyed by `trace_id` — so the raw cause is always captured for
 /// support even when `error_debug` strips it from the response.
-fn engine_error_response(err: EngineError, meta: Meta, cfg: RespCfg) -> AxumResponse {
+fn engine_error_response(
+    err: EngineError,
+    meta: Meta,
+    effects: &[Effect],
+    cfg: RespCfg,
+) -> AxumResponse {
     warn!(trace_id = %meta.trace_id, error = ?err, "execute system error");
     let envelope = err.into_envelope(cfg.error_debug, cfg.timeout_retryable);
-    projected_error_response(envelope, meta, cfg)
+    projected_error_response_with_effects(envelope, meta, effects, cfg)
 }
 
 /// Serializes a classified system error, projecting its HTTP status from the envelope's
 /// `(retryable, owner, code)` (the single source of truth, design D6) and attaching a `Retry-After`
 /// header on the retryable `5xx` class. The one place a classified fault becomes an HTTP status.
 fn projected_error_response(error: ErrorEnvelope, meta: Meta, cfg: RespCfg) -> AxumResponse {
+    projected_error_response_with_effects(error, meta, &[], cfg)
+}
+
+/// [`projected_error_response`] carrying any effects captured before an execution error
+/// (capture-on-failure). Pre-execution errors have no effects and go through the thin wrapper.
+fn projected_error_response_with_effects(
+    error: ErrorEnvelope,
+    meta: Meta,
+    effects: &[Effect],
+    cfg: RespCfg,
+) -> AxumResponse {
     let projected = project_envelope(&error);
-    let mut response = system_error_response(error, projected.status, meta);
+    let mut response = system_error_response_with_effects(error, projected.status, meta, effects);
     if projected.retry_after {
         add_retry_after(&mut response, cfg.retry_after_seconds);
     }
@@ -2301,8 +2343,19 @@ fn add_retry_after(response: &mut AxumResponse, seconds: u32) {
     }
 }
 
-/// Serializes a `{ data: null, error, meta }` response at the given status.
+/// Serializes a `{ data: null, error, meta }` response at the given status (no effects).
 fn system_error_response(error: ErrorEnvelope, status: u16, meta: Meta) -> AxumResponse {
+    system_error_response_with_effects(error, status, meta, &[])
+}
+
+/// Serializes a `{ data: null, error, meta, effects? }` response at the given status, carrying
+/// any effects captured before the failure (omitted when empty).
+fn system_error_response_with_effects(
+    error: ErrorEnvelope,
+    status: u16,
+    meta: Meta,
+    effects: &[Effect],
+) -> AxumResponse {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
         code,
@@ -2310,6 +2363,7 @@ fn system_error_response(error: ErrorEnvelope, status: u16, meta: Meta) -> AxumR
             data: None,
             error,
             meta,
+            effects,
         }),
     )
         .into_response()
@@ -3241,5 +3295,45 @@ mod execute_status_tests {
         let (status, _retry_after, body) = parts(run(&app, &big).await).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(body["error"]["code"], "SCRIPT_TOO_LARGE");
+    }
+
+    /// A successful run surfaces its `emit(kind, value)` effects as a top-level ordered list.
+    #[tokio::test]
+    async fn success_surfaces_effects() {
+        let app = state();
+        let script = "function handler(){ emit('decided', { tier: 3 }); \
+            emit('note', 'ok'); return { data: 1 }; }";
+        let (status, _retry_after, body) = parts(run(&app, script).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], 1);
+        assert_eq!(body["effects"][0]["kind"], "decided");
+        assert_eq!(body["effects"][0]["value"]["tier"], 3);
+        assert_eq!(body["effects"][1]["kind"], "note");
+        assert_eq!(body["effects"][1]["value"], "ok");
+    }
+
+    /// A handler that emits then throws still surfaces the partial effects trail on the non-2xx
+    /// response (capture-on-failure).
+    #[tokio::test]
+    async fn failing_run_surfaces_partial_effects() {
+        let app = state();
+        let script = "function handler(){ emit('finding', 7); throw new Error('boom'); }";
+        let (status, _retry_after, body) = parts(run(&app, script).await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["effects"][0]["kind"], "finding");
+        assert_eq!(body["effects"][0]["value"], 7);
+    }
+
+    /// A run that never emits carries no `effects` key — byte-compatible with the prior
+    /// `{data, error, meta}` envelope.
+    #[tokio::test]
+    async fn no_emit_omits_effects_key() {
+        let app = state();
+        let (_status, _retry_after, body) =
+            parts(run(&app, "function handler(){ return { data: 1 }; }").await).await;
+        assert!(
+            body.get("effects").is_none(),
+            "no effects key when nothing was emitted"
+        );
     }
 }

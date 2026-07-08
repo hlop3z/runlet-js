@@ -15,13 +15,11 @@
 use core::fmt;
 use std::sync::Arc;
 
-use serde_json::value::RawValue;
-
 use crate::bytecode::BytecodeCacheStats;
 use crate::capability::{CapabilityDef, CapabilityRegistry, RegistryError};
 use crate::config::EngineConfig;
 use crate::egress::Egress;
-use crate::engine::{self, EngineError, ExecOutcome, ExecParams, Profile, ReadHook};
+use crate::engine::{self, Effect, EngineError, ExecOutcome, ExecParams, Profile};
 #[cfg(feature = "http")]
 use crate::http::HttpMetric;
 use crate::pool::{JsPool, PoolStats};
@@ -123,9 +121,6 @@ pub struct Invocation<'a> {
     pub profile: Profile,
     /// Capabilities to inject (subject to the profile).
     pub caps: CapabilitySet<'a>,
-    /// Optional read-of-declared-dependencies hook (the deterministic-profile seam). `None`
-    /// = no `read` global. The core never inspects what is read — opaque to it.
-    pub read_hook: Option<Arc<ReadHook>>,
     /// Optional I/O egress seam (the `io.call` global). `None` = no `io` global.
     /// Withheld under [`Profile::Deterministic`] (it performs I/O). The HTTP front passes
     /// `None`; a sidecar-backed consumer wires its egress here.
@@ -148,7 +143,6 @@ impl fmt::Debug for Invocation<'_> {
             .field("context_json", &self.context_json)
             .field("profile", &self.profile)
             .field("caps", &self.caps)
-            .field("read_hook", &self.read_hook.as_ref().map(|_hook| "<hook>"))
             .field("egress", &self.egress.as_ref().map(|_res| "<egress>"))
             .field("cache_namespace", &self.cache_namespace)
             .finish()
@@ -157,8 +151,8 @@ impl fmt::Debug for Invocation<'_> {
 
 impl<'a> Invocation<'a> {
     /// An invocation from inline source + JSON context, defaulting to [`Profile::Full`], no
-    /// capabilities ([`CapabilitySet::NONE`]), no read-hook, no egress port, and the global
-    /// (unnamespaced) bytecode cache. Refine with the builder setters.
+    /// capabilities ([`CapabilitySet::NONE`]), no egress port, and the global (unnamespaced)
+    /// bytecode cache. Refine with the builder setters.
     #[must_use]
     pub const fn inline(source: &'a str, context_json: &'a str) -> Self {
         Self::with_defaults(CodeRef::Inline(source), context_json)
@@ -179,7 +173,6 @@ impl<'a> Invocation<'a> {
             context_json,
             profile: Profile::Full,
             caps: CapabilitySet::NONE,
-            read_hook: None,
             egress: None,
             cache_namespace: None,
         }
@@ -196,13 +189,6 @@ impl<'a> Invocation<'a> {
     #[must_use]
     pub const fn caps(mut self, caps: CapabilitySet<'a>) -> Self {
         self.caps = caps;
-        self
-    }
-
-    /// Sets the read-of-declared-dependencies hook (the deterministic-profile seam).
-    #[must_use]
-    pub fn read_hook(mut self, hook: Arc<ReadHook>) -> Self {
-        self.read_hook = Some(hook);
         self
     }
 
@@ -224,14 +210,15 @@ impl<'a> Invocation<'a> {
 /// The result of an execution.
 ///
 /// Carries the handler outcome, the declarative `emit` effects, and the drained
-/// per-capability metrics. `effects` is opaque JSON the consumer interprets ("logic
-/// proposes, the engine disposes"); the HTTP front simply ignores it.
+/// per-capability metrics. Each [`Effect`] pairs a routing `kind` tag with an opaque JSON
+/// `value` the consumer interprets ("logic proposes, the engine disposes"); the effects are
+/// captured on both the success and error paths.
 #[derive(Debug)]
 pub struct Outcome {
     /// Handler envelope (`{data,error}` JSON) or a classified engine error.
     pub result: ExecOutcome,
-    /// Effects appended via `emit(value)`, in call order.
-    pub effects: Vec<Box<RawValue>>,
+    /// Tagged effects appended via `emit(kind, value)`, in call order.
+    pub effects: Vec<Effect>,
     /// Per-capability operation metrics.
     pub metrics: ExecMetrics,
 }
@@ -399,11 +386,11 @@ impl LogicHost {
                 #[cfg(feature = "s3")]
                 s3_config: inv.caps.s3,
                 sys_config: inv.caps.sys,
-                read_hook: inv.read_hook,
                 registry: Some(&self.capabilities),
                 enabled_io: inv.caps.io,
                 egress: inv.egress,
                 max_ops: self.limits.max_ops,
+                max_emit_kind_len: self.limits.max_emit_kind_len,
                 max_output_size: self.limits.max_output_size,
                 allow_private_targets: self.allow_private_targets,
                 // `*` honored only as explicit opt-in, never in SSRF-relaxed debug mode.

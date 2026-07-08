@@ -50,7 +50,7 @@ pub use crate::capability::{
 };
 pub use crate::config::EngineConfig;
 pub use crate::egress::{Egress, EgressError};
-pub use crate::engine::{EngineError, ExecOutcome, Gate, Profile, ReadHook};
+pub use crate::engine::{Effect, EngineError, ExecOutcome, Gate, Profile};
 pub use crate::host::{
     CapabilitySet, CodeRef, ExecMetrics, HostSettings, Invocation, LogicHost, Outcome,
 };

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use rquickjs::module::{Declared, Evaluated};
 use rquickjs::{Context, Ctx, Function, Module, Object, Runtime, Value as JsValue, WriteOptions};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 
@@ -108,13 +108,22 @@ impl Gate {
     }
 }
 
-/// Consumer-supplied "read a declared dependency" hook — the deterministic-profile seam.
+/// The per-invocation `emit` buffer: native `__emit` appends `(kind, value_json)` pairs, drained
+/// into [`ExecResult::effects`] after execution.
+type EmitBuffer = Arc<Mutex<Vec<(String, String)>>>;
+
+/// A single declarative effect: a required `kind` routing tag plus an opaque `value`.
 ///
-/// The core stays domain-agnostic: it knows nothing about what is being read. Receives the
-/// JSON-encoded argument the script passed to `read(arg)` and returns the JSON-encoded
-/// value, or an `Err(message)` the JS wrapper re-throws as a script error. `Send + Sync`
-/// because the pooled runtime is shared across threads (the `parallel` feature).
-pub type ReadHook = dyn Fn(&str) -> Result<String, String> + Send + Sync;
+/// Produced by `emit(kind, value)` (verbatim `JSON.stringify` output) and surfaced in call order
+/// on [`ExecResult::effects`] / [`crate::host::Outcome::effects`]. The core surfaces `kind`
+/// structurally but never interprets it (the routing/governance seam); `value` stays fully opaque.
+#[derive(Debug, Serialize)]
+pub struct Effect {
+    /// The required non-empty routing tag (bounded by `max_emit_kind_len`).
+    pub kind: String,
+    /// The opaque emitted value, preserved verbatim from `JSON.stringify`.
+    pub value: Box<RawValue>,
+}
 
 /// Parameters for a single script execution. Built by the [`crate::host::LogicHost`] from
 /// a public `Invocation`; internal to the core.
@@ -144,9 +153,6 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) s3_config: Option<&'a S3Config>,
     /// `$sys` env/secrets context (None = no env/secrets injected).
     pub(crate) sys_config: Option<&'a SysConfig>,
-    /// Read-of-declared-dependencies hook (the deterministic-profile seam). `None` = no
-    /// `read` global is injected.
-    pub(crate) read_hook: Option<Arc<ReadHook>>,
     /// The composed capability registry (the mux's per-name routing table + the JS wrappers to
     /// inject). `None` = no registered capabilities. Under [`Profile::Deterministic`] the mux and
     /// every wrapper are withheld (they perform I/O), regardless of registration.
@@ -160,6 +166,8 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) egress: Option<Arc<dyn Egress>>,
     /// Max operations per execution (also caps the number of `emit` effects).
     pub(crate) max_ops: usize,
+    /// Max character length of an `emit` `kind` tag; a longer tag is rejected.
+    pub(crate) max_emit_kind_len: usize,
     /// Max bytes the handler may return (`0` = off, bounded only by `memory_limit`).
     pub(crate) max_output_size: usize,
     /// Debug mode: relax the SSRF private-IP block for local testing — the in-engine `http`/`s3`
@@ -178,9 +186,9 @@ pub(crate) struct ExecParams<'a> {
 pub(crate) struct ExecResult {
     /// Success envelope or a classified error.
     pub(crate) outcome: ExecOutcome,
-    /// Declarative effects appended via `emit(value)`, in call order (opaque JSON to the
-    /// core — the consumer interprets them).
-    pub(crate) effects: Vec<Box<RawValue>>,
+    /// Declarative effects appended via `emit(kind, value)`, in call order. Each carries a
+    /// routing `kind` tag and an opaque `value` (the consumer interprets the value).
+    pub(crate) effects: Vec<Effect>,
     /// HTTP requests made during execution (in-engine capability).
     #[cfg(feature = "http")]
     pub(crate) http_metrics: Vec<HttpMetric>,
@@ -302,9 +310,10 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
 
     let ctx = Context::full(params.runtime).map_err(EngineError::internal)?;
 
-    // Per-invocation `emit` buffer: native `__emit` appends JSON strings here; drained into
-    // `ExecResult.effects` after execution. Opaque to the core (the consumer interprets it).
-    let effects: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Per-invocation `emit` buffer: native `__emit` appends `(kind, value_json)` pairs here,
+    // drained into `ExecResult.effects` after execution. The value is opaque to the core (the
+    // consumer interprets it); the `kind` is a routing tag surfaced structurally.
+    let effects: EmitBuffer = Arc::new(Mutex::new(Vec::new()));
 
     // In-engine capability metric collectors (`http`/`s3` only); the driver-backed capabilities
     // record into the egress adapter, drained by the consumer.
@@ -317,10 +326,8 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         inject_bridge(&qctx).map_err(EngineError::internal)?;
         decimal::inject_decimal(&qctx).map_err(EngineError::internal)?;
         sys::inject_sys(&qctx, params.sys_config).map_err(EngineError::internal)?;
-        inject_emit(&qctx, &effects, params.max_ops).map_err(EngineError::internal)?;
-        if let Some(hook) = &params.read_hook {
-            inject_read(&qctx, Arc::clone(hook)).map_err(EngineError::internal)?;
-        }
+        inject_emit(&qctx, &effects, params.max_ops, params.max_emit_kind_len)
+            .map_err(EngineError::internal)?;
         // The capability mux + its wrappers are I/O, so gated to `Profile::Full` exactly like the
         // in-engine capabilities — the boundary is enforced here, never trusted to the caller's
         // `Invocation` (D9: the deterministic profile removes this authority, it is not gated).
@@ -525,24 +532,35 @@ fn sanitize_determinism(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     Ok(())
 }
 
-/// Injects the `emit(value)` host function: it `JSON.stringify`s the value and appends it
-/// to the per-invocation `effects` buffer (surfaced as `Outcome.effects`). The number of
-/// effects is capped at `max_ops` so a handler can't grow the buffer without bound. The
-/// value is opaque to the core — the consumer interprets it ("logic proposes, the engine
-/// disposes").
+/// Injects the `emit(kind, value)` host function: it `JSON.stringify`s the value and appends a
+/// `(kind, value_json)` pair to the per-invocation `effects` buffer (surfaced as
+/// `Outcome.effects`). `kind` is a required non-empty string tag bounded by `max_emit_kind_len`
+/// (an over-long or empty tag is rejected and records nothing); the number of effects is capped
+/// at `max_ops` so a handler can't grow the buffer without bound. The `value` is opaque to the
+/// core — the consumer interprets it ("logic proposes, the engine disposes"); the `kind` is a
+/// routing/governance tag the core surfaces but never interprets.
 fn inject_emit(
     qctx: &Ctx<'_>,
-    effects: &Arc<Mutex<Vec<String>>>,
+    effects: &EmitBuffer,
     max_ops: usize,
+    max_emit_kind_len: usize,
 ) -> Result<(), rquickjs::Error> {
     let buffer = Arc::clone(effects);
-    let emit_fn = Function::new(qctx.clone(), move |value: String| -> String {
+    let emit_fn = Function::new(qctx.clone(), move |kind: String, value: String| -> String {
+        if kind.is_empty() {
+            return "emit(kind, value): kind must be a non-empty string".to_owned();
+        }
+        if kind.chars().count() > max_emit_kind_len {
+            return format!(
+                "emit(kind, value): kind exceeds the {max_emit_kind_len}-character limit"
+            );
+        }
         match buffer.lock() {
             Ok(buf) if buf.len() >= max_ops => {
                 format!("too many emit() calls: limit is {max_ops} per execution")
             }
             Ok(mut buf) => {
-                buf.push(value);
+                buf.push((kind, value));
                 String::new()
             }
             Err(_poisoned) => "emit buffer unavailable".to_owned(),
@@ -550,41 +568,14 @@ fn inject_emit(
     })?
     .with_name("__emit")?;
     qctx.globals().set("__emit", emit_fn)?;
-    // `emit(v)` stringifies and forwards; a non-empty return is an error the wrapper throws.
+    // `emit(kind, v)` type-checks `kind`, stringifies `v`, and forwards both; a non-empty return
+    // is an error the wrapper throws (the native side re-checks non-empty + the length bound).
     let wrapper: JsValue<'_> = qctx.eval(
-        "globalThis.emit = function (value) { \
-           var err = __emit(JSON.stringify(value === undefined ? null : value)); \
+        "globalThis.emit = function (kind, value) { \
+           if (typeof kind !== 'string' || kind.length === 0) \
+             throw new Error('emit(kind, value): kind must be a non-empty string'); \
+           var err = __emit(kind, JSON.stringify(value === undefined ? null : value)); \
            if (err) throw new Error(err); \
-         };",
-    )?;
-    drop(wrapper);
-    Ok(())
-}
-
-/// Injects the consumer-supplied `read(arg)` host function (the deterministic-profile seam).
-/// `read` stringifies its argument, calls the hook, and `JSON.parse`s the returned value;
-/// an `Err` from the hook is re-thrown as a script error. The core stays domain-agnostic —
-/// it neither defines nor inspects what is read.
-fn inject_read(qctx: &Ctx<'_>, hook: Arc<ReadHook>) -> Result<(), rquickjs::Error> {
-    let read_fn = Function::new(qctx.clone(), move |arg: String| -> String {
-        match hook(&arg) {
-            // `value_json` is raw JSON from the consumer's hook, spliced verbatim.
-            Ok(value_json) => format!("{{\"value\":{value_json}}}"),
-            Err(message) => {
-                let escaped = serde_json::to_string(&message)
-                    .unwrap_or_else(|_err| "\"read hook error\"".to_owned());
-                format!("{{\"__readError\":{escaped}}}")
-            }
-        }
-    })?
-    .with_name("__read")?;
-    qctx.globals().set("__read", read_fn)?;
-    let wrapper: JsValue<'_> = qctx.eval(
-        "globalThis.read = function (arg) { \
-           var res = __read(JSON.stringify(arg === undefined ? null : arg)); \
-           var parsed = JSON.parse(res); \
-           if (parsed && parsed.__readError) throw new Error(parsed.__readError); \
-           return parsed.value; \
          };",
     )?;
     drop(wrapper);
@@ -665,15 +656,23 @@ fn inject_mux(
     Ok(())
 }
 
-/// Drains the per-invocation `emit` buffer into validated `RawValue` effects. Each entry was
-/// produced by `JSON.stringify`, so it parses; a (theoretically impossible) parse failure is
-/// dropped rather than aborting the whole outcome.
-fn drain_effects(effects: &Arc<Mutex<Vec<String>>>) -> Vec<Box<RawValue>> {
+/// Drains the per-invocation `emit` buffer into tagged [`Effect`]s. Each value was produced by
+/// `JSON.stringify`, so it parses; a (theoretically impossible) parse failure drops that entry
+/// rather than aborting the whole outcome. Runs after execution on both the success and error
+/// paths, so effects emitted before a handler throws are still captured (capture-on-failure).
+fn drain_effects(effects: &EmitBuffer) -> Vec<Effect> {
     let Ok(buf) = effects.lock() else {
         return Vec::new();
     };
     buf.iter()
-        .filter_map(|json| RawValue::from_string(json.clone()).ok())
+        .filter_map(|(kind, value_json)| {
+            RawValue::from_string(value_json.clone())
+                .ok()
+                .map(|value| Effect {
+                    kind: kind.clone(),
+                    value,
+                })
+        })
         .collect()
 }
 
@@ -1145,11 +1144,11 @@ mod bytecode_cache_tests {
             timeout: Duration::from_secs(5),
             profile: Profile::Full,
             sys_config: None,
-            read_hook: None,
             registry: None,
             enabled_io: &[],
             egress: None,
             max_ops: 64,
+            max_emit_kind_len: 64,
             max_output_size: 0,
             allow_private_targets: false,
         }
@@ -1333,11 +1332,11 @@ mod egress_tests {
             timeout: Duration::from_secs(5),
             profile,
             sys_config: None,
-            read_hook: None,
             registry: reg.registry,
             enabled_io: reg.enabled,
             egress,
             max_ops: 8,
+            max_emit_kind_len: 64,
             max_output_size: 0,
             allow_private_targets: false,
         }
@@ -1676,5 +1675,145 @@ mod egress_tests {
             json.contains("EGRESS_UNAVAILABLE"),
             "no backend + no fallback: {json}"
         );
+    }
+}
+
+/// `emit(kind, value)` tagged effects channel — behavioral coverage for the capture, ordering,
+/// validation, and bounds. Compiled in every build (`emit` is injected regardless of `_io`), so
+/// the `ExecParams` builder mirrors the in-engine cfg-gated fields.
+#[cfg(test)]
+mod emit_tests {
+    use super::{ExecOutcome, ExecParams, ExecResult, Profile, run};
+    use rquickjs::Runtime;
+    use std::time::Duration;
+
+    /// Runs `script` under the full profile with an 8-op cap and a 64-char `kind` bound, and
+    /// returns the full [`ExecResult`] (a handler throw is a `Success`/`Error` outcome, not an
+    /// engine error).
+    fn run_exec(script: &str) -> ExecResult {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let params = ExecParams {
+            runtime: &runtime,
+            bytecode_cache: None,
+            cache_namespace: None,
+            script,
+            context_json: "{}",
+            timeout: Duration::from_secs(5),
+            profile: Profile::Full,
+            #[cfg(feature = "http")]
+            allowed_hosts: &[],
+            #[cfg(feature = "s3")]
+            s3_config: None,
+            sys_config: None,
+            registry: None,
+            enabled_io: &[],
+            egress: None,
+            max_ops: 8,
+            max_emit_kind_len: 64,
+            max_output_size: 0,
+            allow_private_targets: false,
+            #[cfg(feature = "http")]
+            wildcard_hosts_allowed: false,
+        };
+        run(&params).unwrap_or_else(|_err| unreachable!("engine ran"))
+    }
+
+    /// Multiple emits are captured in call order, preserving duplicate kinds, as tagged
+    /// `{kind, value}` entries.
+    #[test]
+    fn emit_preserves_order_and_duplicate_kinds() {
+        let exec = run_exec(
+            "function handler() { emit(\"a\", 1); emit(\"b\", 2); emit(\"a\", 3); return json(1); }",
+        );
+        let tags: Vec<&str> = exec
+            .effects
+            .iter()
+            .map(|effect| effect.kind.as_str())
+            .collect();
+        assert_eq!(tags, ["a", "b", "a"], "kinds preserved in call order");
+        let vals: Vec<&str> = exec
+            .effects
+            .iter()
+            .map(|effect| effect.value.get())
+            .collect();
+        assert_eq!(vals, ["1", "2", "3"], "values preserved in call order");
+    }
+
+    /// An empty `kind` fails deterministically and records nothing.
+    #[test]
+    fn emit_with_empty_kind_fails_and_records_nothing() {
+        let exec = run_exec("function handler() { emit(\"\", 5); return json(1); }");
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "empty kind throws"
+        );
+        assert!(
+            exec.effects.is_empty(),
+            "no effect recorded on the failed emit"
+        );
+    }
+
+    /// A single-arg `emit(value)` (no kind) fails deterministically and records nothing.
+    #[test]
+    fn emit_with_missing_kind_fails_and_records_nothing() {
+        let exec = run_exec("function handler() { emit(5); return json(1); }");
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "missing kind throws"
+        );
+        assert!(exec.effects.is_empty(), "no effect recorded");
+    }
+
+    /// Effects emitted before a handler throws are still captured (capture-on-failure).
+    #[test]
+    fn emit_survives_a_handler_throw() {
+        let exec = run_exec(
+            "function handler() { emit(\"finding\", { id: 7 }); throw new Error(\"boom\"); }",
+        );
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "handler threw"
+        );
+        let kinds: Vec<&str> = exec
+            .effects
+            .iter()
+            .map(|effect| effect.kind.as_str())
+            .collect();
+        let vals: Vec<&str> = exec
+            .effects
+            .iter()
+            .map(|effect| effect.value.get())
+            .collect();
+        assert_eq!(kinds, ["finding"], "the pre-throw effect kind is retained");
+        assert_eq!(
+            vals,
+            ["{\"id\":7}"],
+            "the pre-throw effect value is retained"
+        );
+    }
+
+    /// Exceeding the per-execution emit cap (`max_ops`, 8 here) fails the over-limit call; the
+    /// buffer stops growing at the cap.
+    #[test]
+    fn emit_beyond_the_cap_fails() {
+        let exec = run_exec(
+            "function handler() { for (var i = 0; i < 9; i++) { emit(\"k\", i); } return json(1); }",
+        );
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "the 9th emit (cap is 8) throws"
+        );
+        assert_eq!(exec.effects.len(), 8, "the buffer stops at the cap");
+    }
+
+    /// A `kind` longer than `max_emit_kind_len` (64 here) is rejected and records nothing.
+    #[test]
+    fn emit_with_overlong_kind_fails() {
+        let exec = run_exec("function handler() { emit(\"x\".repeat(65), 1); return json(1); }");
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "an over-length kind throws"
+        );
+        assert!(exec.effects.is_empty(), "no effect recorded");
     }
 }

@@ -60,8 +60,13 @@ pub struct EngineConfig {
     /// (the parse ceiling) at load; exceeding it is a startup error.
     #[serde(deserialize_with = "deserialize_byte_size")]
     pub max_context_size: usize,
-    /// Maximum HTTP/DB operations per execution (default 50).
+    /// Maximum HTTP/DB operations per execution (default 50). Also caps the number of `emit`
+    /// effects per execution.
     pub max_ops: usize,
+    /// Maximum character length of an `emit(kind, value)` `kind` tag (default 64). A longer tag
+    /// is rejected deterministically and records no effect — a plain count mirroring `max_ops`,
+    /// not a byte size.
+    pub max_emit_kind_len: usize,
     /// Maximum size (bytes) of the JSON the handler may return. `0` = off (bounded only by
     /// `memory_limit`). Set it in an untrusted-script deployment so one handler can't return
     /// a `memory_limit`-sized blob as a bandwidth/amplification channel — a request over the
@@ -127,6 +132,7 @@ impl Default for EngineConfig {
             max_script_size: 1024 * 1024,    // 1mb
             max_context_size: 0,             // 0 = auto: memory_limit / CONTEXT_LIMIT_DIVISOR
             max_ops: 1500,                   // safe cap for API workloads
+            max_emit_kind_len: 64,           // `emit` kind tag length bound
             max_output_size: 0,              // 0 = off (bounded by memory_limit)
             max_concurrent_executions: 0,    // 0 = auto: pool_size * AUTO_CONCURRENCY_FACTOR
             max_concurrent_per_partition: 0, // 0 = per-partition fairness off (opt-in)

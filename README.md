@@ -101,6 +101,9 @@ bridge. On a **system-generated** failure, `error` is a structured envelope —
 branch on without parsing strings; `meta.trace_id` correlates it with server logs. See
 [`docs/99-errors.md`](docs/99-errors.md) for the full contract.
 
+A handler that calls [`emit(kind, value)`](#emitkind-value--tagged-effects) also gets a
+top-level `effects` array (`[{ kind, value }]`); it is omitted when nothing was emitted.
+
 ### Batch execution
 
 ```
@@ -283,6 +286,31 @@ function handler(ctx) {
   return json({ greeting: "hello " + ctx.name }, null);
 }
 ```
+
+### emit(kind, value) — tagged effects
+
+Always available (no config). While `return json(...)` carries *the answer*, `emit(kind, value)`
+proposes **structured side outputs** — an audit trail, a stream of findings, or an intent for a
+trusted host to perform. They come back on the response as an ordered top-level
+`effects: [{ kind, value }]` list — **even if the handler later throws**, so a partial run keeps
+everything it emitted ("logic proposes, the host disposes").
+
+```js
+function handler(ctx) {
+  emit("decided", { tier: "tier-3", reason: "spend > 10k" }); // an audit/decision trail
+  for (const m of ctx.mismatches) emit("finding", m);         // itemized findings, kept on a throw
+  return json({ ok: true }, null);
+}
+// → { "data": { "ok": true }, "error": null, "meta": {...},
+//     "effects": [ { "kind": "decided", "value": {...} }, { "kind": "finding", "value": {...} }, ... ] }
+```
+
+- `kind` is a **required** non-empty string routing tag (≤ 64 chars); `value` is any JSON value,
+  passed through verbatim and opaque to the platform.
+- A missing, empty, non-string, or over-long `kind` throws and records nothing; the per-execution
+  emit count is bounded by `max_ops`.
+- A run that never emits carries no `effects` key. See
+  [`docs/design/effects-channel.md`](docs/design/effects-channel.md) for the design rationale.
 
 ### $ / Decimal — exact decimal math
 

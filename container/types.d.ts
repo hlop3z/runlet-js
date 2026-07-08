@@ -53,6 +53,24 @@
 declare function json(data: unknown, error?: unknown): string;
 
 /**
+ * Proposes a **tagged effect** — a structured thing your handler wants the platform to record or
+ * act on, separate from its `return` value. Effects are surfaced on the response as an ordered
+ * `effects: [{ kind, value }]` list, captured **even if your handler later throws** (so a
+ * partial run keeps everything it emitted). "Logic proposes, the host disposes."
+ *
+ * @param kind  A required non-empty routing tag (e.g. `"decided"`, `"finding"`, `"email"`),
+ *              at most 64 characters. The platform routes/governs by `kind`; it never
+ *              interprets what it means.
+ * @param value Any JSON-serializable value — opaque to the platform, passed through verbatim.
+ *
+ * @example
+ * emit("decided", { tier: "tier-3", reason: "spend > 10k" }); // an audit/decision trail
+ * @example
+ * for (const m of mismatches) emit("finding", m); // itemized findings, kept even on a later throw
+ */
+declare function emit(kind: string, value: unknown): void;
+
+/**
  * The function the sandbox calls. Define `function handler(ctx) { ... }` in your
  * script; it receives the request's `context` and must return {@link json}`(...)`.
  *

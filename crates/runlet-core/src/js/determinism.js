@@ -1,7 +1,7 @@
 (function () {
   // Profile::Deterministic enforcement: neutralize nondeterministic surfaces so the same
-  // (code, context, declared-dependency reads) always produce the same result + effects.
-  // Runs AFTER eval/Proxy removal.
+  // (code, context) always produce the same result + `emit(kind, value)` effects. Runs AFTER
+  // eval/Proxy removal.
   //
   // D9 (WASI lesson): the ambient authorities are *removed*, not stubbed. A present-but-gated
   // authority is one refactor away from being un-gated, so `Math.random`/`Date.now`/`$sys` clock
