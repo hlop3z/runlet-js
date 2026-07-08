@@ -71,6 +71,47 @@ declare function json(data: unknown, error?: unknown): string;
 declare function emit(kind: string, value: unknown): void;
 
 /**
+ * A structured, leveled diagnostic logger — **diagnostics, not billing; lossy by design**. Unlike
+ * {@link emit} (platform-facing effects the host always keeps), `log.*` is developer-facing:
+ * level-filtered, capped per execution, and dropped under backpressure. Deliberately **not**
+ * `console.log` — a stateless box behind a gateway cannot promise "prints to a stream you own".
+ *
+ * Each call takes a **Serilog-style message template** with `{name}` placeholders plus a properties
+ * object; the entry keeps the template, the named properties, and the rendered message. Where the
+ * entry goes (a tenant stream, and/or inline on the response) is **platform policy** — the script
+ * never chooses a sink. Entries logged before a handler throws are still captured.
+ *
+ * @example
+ * log.info("charged {user} {amount}", { user: 42, amount: "10.00" }); // → "charged 42 10.00"
+ * @example
+ * const l = log.with({ requestId }); // bound context on every entry from `l`
+ * l.warn("retrying {attempt}", { attempt });
+ */
+interface Logger {
+  /** Finest-grained tracing (below `debug`). */
+  trace(template: string, properties?: Record<string, unknown>): void;
+  /** Debugging detail (off in production by default). */
+  debug(template: string, properties?: Record<string, unknown>): void;
+  /** Normal operational events (the default level floor). */
+  info(template: string, properties?: Record<string, unknown>): void;
+  /** A warning that did not stop the run. */
+  warn(template: string, properties?: Record<string, unknown>): void;
+  /** An error condition. */
+  error(template: string, properties?: Record<string, unknown>): void;
+  /**
+   * Derives a logger with **bound context** merged into every subsequent entry's properties
+   * (Pino-style child). A per-call property overrides a bound key of the same name.
+   */
+  with(fields: Record<string, unknown>): Logger;
+}
+
+/**
+ * The diagnostic logger (always available). Below-floor levels are discarded cheaply; captured
+ * entries are lossy and routed by platform policy. See {@link Logger}.
+ */
+declare const log: Logger;
+
+/**
  * The function the sandbox calls. Define `function handler(ctx) { ... }` in your
  * script; it receives the request's `context` and must return {@link json}`(...)`.
  *

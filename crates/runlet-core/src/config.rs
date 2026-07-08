@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::bytesize::deserialize_byte_size;
+use crate::engine::LogLevel;
 
 /// Empirically-measured heap cost of parsing a JSON context into `QuickJS` objects, as
 /// a multiple of the JSON text size (~4×, stable across 16/32/64 MB memory limits). A
@@ -67,6 +68,22 @@ pub struct EngineConfig {
     /// is rejected deterministically and records no effect — a plain count mirroring `max_ops`,
     /// not a byte size.
     pub max_emit_kind_len: usize,
+    /// Diagnostic-log level floor (D6): a `log.<level>` call below this is discarded in the JS
+    /// wrapper before any serialization. Default `info` (the industry production default). The
+    /// trusted gateway MAY lower this per-request for a capture run (OQ2), threaded via the
+    /// invocation rather than this static config.
+    pub log_level: LogLevel,
+    /// Maximum diagnostic-log entries captured per execution (default 256). A call beyond the cap
+    /// records nothing — a plain count, not a byte size.
+    pub max_log_entries: usize,
+    /// Maximum bytes of a single diagnostic-log entry (default 256 KB). An oversize entry is
+    /// truncated with a `{"truncated":true}` marker. Accepts human sizes (`"256kb"`).
+    #[serde(deserialize_with = "deserialize_byte_size")]
+    pub max_log_entry_bytes: usize,
+    /// Maximum total diagnostic-log bytes per execution (default 1 MB — binds first). Accepts human
+    /// sizes (`"1mb"`).
+    #[serde(deserialize_with = "deserialize_byte_size")]
+    pub max_log_total_bytes: usize,
     /// Maximum size (bytes) of the JSON the handler may return. `0` = off (bounded only by
     /// `memory_limit`). Set it in an untrusted-script deployment so one handler can't return
     /// a `memory_limit`-sized blob as a bandwidth/amplification channel — a request over the
@@ -125,19 +142,23 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            memory_limit: 32 * 1024 * 1024,  // 32mb
-            max_stack_size: 512 * 1024,      // 512kb
-            timeout_ms: 4000,                // 4s balanced default
-            pool_size: 0,                    // Auto
-            max_script_size: 1024 * 1024,    // 1mb
-            max_context_size: 0,             // 0 = auto: memory_limit / CONTEXT_LIMIT_DIVISOR
-            max_ops: 1500,                   // safe cap for API workloads
-            max_emit_kind_len: 64,           // `emit` kind tag length bound
-            max_output_size: 0,              // 0 = off (bounded by memory_limit)
-            max_concurrent_executions: 0,    // 0 = auto: pool_size * AUTO_CONCURRENCY_FACTOR
-            max_concurrent_per_partition: 0, // 0 = per-partition fairness off (opt-in)
-            partition_buckets: 0,            // 0 = default DEFAULT_PARTITION_BUCKETS
-            allow_wildcard_hosts: false,     // `*` in allowed_hosts ignored unless opted in
+            memory_limit: 32 * 1024 * 1024,   // 32mb
+            max_stack_size: 512 * 1024,       // 512kb
+            timeout_ms: 4000,                 // 4s balanced default
+            pool_size: 0,                     // Auto
+            max_script_size: 1024 * 1024,     // 1mb
+            max_context_size: 0,              // 0 = auto: memory_limit / CONTEXT_LIMIT_DIVISOR
+            max_ops: 1500,                    // safe cap for API workloads
+            max_emit_kind_len: 64,            // `emit` kind tag length bound
+            log_level: LogLevel::Info,        // diagnostic-log floor (D6/OQ2 default)
+            max_log_entries: 256,             // D7: entries per execution
+            max_log_entry_bytes: 256 * 1024,  // D7: 256 KB per entry
+            max_log_total_bytes: 1024 * 1024, // D7: 1 MB total per execution (binds first)
+            max_output_size: 0,               // 0 = off (bounded by memory_limit)
+            max_concurrent_executions: 0,     // 0 = auto: pool_size * AUTO_CONCURRENCY_FACTOR
+            max_concurrent_per_partition: 0,  // 0 = per-partition fairness off (opt-in)
+            partition_buckets: 0,             // 0 = default DEFAULT_PARTITION_BUCKETS
+            allow_wildcard_hosts: false,      // `*` in allowed_hosts ignored unless opted in
         }
     }
 }

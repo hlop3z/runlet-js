@@ -19,7 +19,9 @@ use crate::bytecode::BytecodeCacheStats;
 use crate::capability::{CapabilityDef, CapabilityRegistry, RegistryError};
 use crate::config::EngineConfig;
 use crate::egress::Egress;
-use crate::engine::{self, Effect, EngineError, ExecOutcome, ExecParams, Profile};
+use crate::engine::{
+    self, Effect, EngineError, ExecOutcome, ExecParams, LogEntry, LogLevel, Profile,
+};
 #[cfg(feature = "http")]
 use crate::http::HttpMetric;
 use crate::pool::{JsPool, PoolStats};
@@ -129,6 +131,10 @@ pub struct Invocation<'a> {
     /// namespaces gets separate cache entries (no cross-tenant dedup / compile-timing leak).
     /// `None` = global. Typically the caller's partition key.
     pub cache_namespace: Option<&'a str>,
+    /// Per-request diagnostic-log level floor override (D6/OQ2). `None` uses the host's configured
+    /// `EngineConfig.log_level`; the trusted gateway lowers it for a capture run so the playground
+    /// gets `debug`/`trace` while production stays `info`+.
+    pub log_level: Option<LogLevel>,
 }
 
 impl fmt::Debug for Invocation<'_> {
@@ -145,6 +151,7 @@ impl fmt::Debug for Invocation<'_> {
             .field("caps", &self.caps)
             .field("egress", &self.egress.as_ref().map(|_res| "<egress>"))
             .field("cache_namespace", &self.cache_namespace)
+            .field("log_level", &self.log_level)
             .finish()
     }
 }
@@ -175,6 +182,7 @@ impl<'a> Invocation<'a> {
             caps: CapabilitySet::NONE,
             egress: None,
             cache_namespace: None,
+            log_level: None,
         }
     }
 
@@ -205,6 +213,14 @@ impl<'a> Invocation<'a> {
         self.cache_namespace = Some(namespace);
         self
     }
+
+    /// Overrides the diagnostic-log level floor for this request (D6/OQ2). The trusted gateway
+    /// lowers it for a capture run so the playground gets `debug`/`trace`.
+    #[must_use]
+    pub const fn log_level(mut self, level: LogLevel) -> Self {
+        self.log_level = Some(level);
+        self
+    }
 }
 
 /// The result of an execution.
@@ -219,6 +235,10 @@ pub struct Outcome {
     pub result: ExecOutcome,
     /// Tagged effects appended via `emit(kind, value)`, in call order.
     pub effects: Vec<Effect>,
+    /// Diagnostic log entries appended via `log.<level>(...)`, in call order, captured on both the
+    /// success and error paths (capture-on-failure). Outside the reproducible `result`/`effects`
+    /// contract; the consumer routes them to a sink (edge-side).
+    pub logs: Vec<LogEntry>,
     /// Per-capability operation metrics.
     pub metrics: ExecMetrics,
 }
@@ -391,6 +411,11 @@ impl LogicHost {
                 egress: inv.egress,
                 max_ops: self.limits.max_ops,
                 max_emit_kind_len: self.limits.max_emit_kind_len,
+                // The per-request override (D6/OQ2) else the host's configured floor.
+                log_level: inv.log_level.unwrap_or(self.limits.log_level),
+                max_log_entries: self.limits.max_log_entries,
+                max_log_entry_bytes: self.limits.max_log_entry_bytes,
+                max_log_total_bytes: self.limits.max_log_total_bytes,
                 max_output_size: self.limits.max_output_size,
                 allow_private_targets: self.allow_private_targets,
                 // `*` honored only as explicit opt-in, never in SSRF-relaxed debug mode.
@@ -406,6 +431,7 @@ impl LogicHost {
         Ok(Outcome {
             result: result.outcome,
             effects: result.effects,
+            logs: result.logs,
             metrics: ExecMetrics {
                 #[cfg(feature = "http")]
                 http: result.http_metrics,

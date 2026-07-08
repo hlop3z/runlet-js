@@ -102,7 +102,9 @@ branch on without parsing strings; `meta.trace_id` correlates it with server log
 [`docs/99-errors.md`](docs/99-errors.md) for the full contract.
 
 A handler that calls [`emit(kind, value)`](#emitkind-value--tagged-effects) also gets a
-top-level `effects` array (`[{ kind, value }]`); it is omitted when nothing was emitted.
+top-level `effects` array (`[{ kind, value }]`); it is omitted when nothing was emitted. When the
+trusted gateway requests diagnostic capture, a top-level `logs` array
+([`log.*`](#log--diagnostic-logging)) is also attached; it is omitted otherwise.
 
 ### Batch execution
 
@@ -311,6 +313,37 @@ function handler(ctx) {
   emit count is bounded by `max_ops`.
 - A run that never emits carries no `effects` key. See
   [`docs/design/effects-channel.md`](docs/design/effects-channel.md) for the design rationale.
+
+### log.* — diagnostic logging
+
+Always available (no config). The sandbox has **no `console`**; `log.*` is the structured,
+leveled diagnostic channel — **diagnostics, not billing; lossy by design.** Each call takes a
+Serilog-style message template plus named properties; the entry keeps the template, the properties,
+and the rendered message.
+
+```js
+function handler(ctx) {
+  log.info("charged {user} {amount}", { user: ctx.id, amount: "10.00" }); // → "charged 42 10.00"
+  const l = log.with({ requestId: ctx.reqId }); // bound context on every entry from `l`
+  if (retry) l.warn("retrying attempt {n}", { n });
+  return json({ ok: true }, null);
+}
+```
+
+- Levels `trace` < `debug` < `info` < `warn` < `error`; a call below the configured floor
+  (default `info`) is discarded cheaply — no allocation, no capture.
+- `log.with(fields)` derives a logger with bound context merged into every entry (a per-call key
+  overrides a bound one).
+- **Lossy + bounded:** capped at 256 entries / 256 KB per entry / 1 MB total per execution; an
+  oversize entry is truncated. Entries logged before a handler throws are still captured.
+- **Routing is platform policy, not the script's choice.** Logs stream to a per-tenant diagnostic
+  channel and — only when the trusted gateway requests it — are mirrored inline on the response as
+  a top-level `logs` list. A caller cannot force capture.
+
+**`log` vs `emit`:** `emit` is what the run *did* (platform-facing, always-on, part of the
+reproducible outputs — billing/audit/intent); `log` is how it *went* (developer-facing,
+level-filtered, lossy, outside the reproducible contract). See
+[`docs/design/diagnostic-logging.md`](docs/design/diagnostic-logging.md) for the rationale.
 
 ### $ / Decimal — exact decimal math
 

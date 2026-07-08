@@ -28,7 +28,7 @@ use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::{Status, TraceContextExt as _};
 
 use runlet_core::config::EngineConfig;
-use runlet_core::engine::{Effect, EngineError, ExecOutcome};
+use runlet_core::engine::{Effect, EngineError, ExecOutcome, LogEntry, LogLevel};
 use runlet_core::errors::{ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, ErrorSource};
 use runlet_core::host::{CapabilitySet, ExecMetrics, Invocation, LogicHost, Outcome};
 use runlet_core::metrics::{Capability, Metrics};
@@ -45,8 +45,8 @@ use runlet_wire::{BackendMetrics, Egress, MeteredEgress, ct_eq};
 
 use crate::authz::authorize_capabilities;
 use crate::config::{BatchConfig, TrustedHeaders};
-use crate::events::{AuditBody, CapabilityOps, Event, EventBody, Sink, UsageBody};
-use crate::identity::TrustedIdentity;
+use crate::events::{AuditBody, CapabilityOps, Event, EventBody, LogBody, Sink, UsageBody};
+use crate::identity::{RunMode, TrustedIdentity};
 use crate::quota::{QuotaExceeded, QuotaGuard, TenantQuota};
 use crate::sidecar::{SessionConn, SessionError, SidecarEgress, SidecarTransport, connect_session};
 use crate::status::{Projected, project_envelope};
@@ -96,6 +96,10 @@ pub(crate) struct AppState {
     /// Live handle to the dropped-events counter, rendered as `runlet_events_dropped_total` (the
     /// backpressure signal). `None` when events are disabled.
     pub(crate) event_dropped: Option<Arc<AtomicU64>>,
+    /// Live handle to the diagnostic-log dropped-events counter, rendered as
+    /// `runlet_log_events_dropped_total` (the isolated log-channel backpressure signal, D4). `None`
+    /// when events are disabled.
+    pub(crate) log_event_dropped: Option<Arc<AtomicU64>>,
     /// `POST /batch` fan-out caps (item count + combined-input / total-response byte bounds). Copied
     /// from server config; the single-`/execute` path never reads it.
     pub(crate) batch: BatchConfig,
@@ -406,7 +410,8 @@ const fn effects_empty(effects: &[Effect]) -> bool {
 }
 
 /// Success response: JS-produced `{data, error}` as borrowed `RawValue` + Rust meta, plus the
-/// tagged `emit` effects (omitted when empty).
+/// tagged `emit` effects (omitted when empty) and — only when the trusted gateway requested
+/// diagnostic capture — the `logs` mirror (omitted otherwise, keeping the response byte-compatible).
 #[derive(Debug, Serialize)]
 struct Response<'a> {
     /// The data field from the JS handler (borrowed, never copied).
@@ -418,10 +423,14 @@ struct Response<'a> {
     /// The ordered `emit(kind, value)` effects; absent when the handler emitted nothing.
     #[serde(skip_serializing_if = "effects_empty")]
     effects: &'a [Effect],
+    /// The gateway-gated diagnostic `logs` mirror; `None` (omitted) unless capture was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logs: Option<&'a [LogEntry]>,
 }
 
 /// System-error response: `data` is `null`, `error` is the structured envelope. Carries any
-/// effects emitted before the failure (capture-on-failure); the list is omitted when empty.
+/// effects emitted before the failure (capture-on-failure); the list is omitted when empty. The
+/// `logs` mirror is present only when the trusted gateway requested capture (capture-on-failure).
 #[derive(Debug, Serialize)]
 struct SystemErrorResponse<'a> {
     /// Always `null` on a system error.
@@ -433,6 +442,9 @@ struct SystemErrorResponse<'a> {
     /// Effects emitted before the failure; absent when none.
     #[serde(skip_serializing_if = "effects_empty")]
     effects: &'a [Effect],
+    /// The gateway-gated diagnostic `logs` mirror; `None` (omitted) unless capture was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logs: Option<&'a [LogEntry]>,
 }
 
 /// Envelope parsed from the JS response — borrows from the source string.
@@ -782,6 +794,8 @@ async fn run_execute(
     // / compile-timing leak). Cloned because the shared core takes it by value and `partition` is
     // still needed for `meta` after the await.
     let cache_ns = partition.clone();
+    // The trusted per-request log-floor override (D6/OQ2), only meaningful in trusted mode.
+    let log_floor = identity.as_ref().and_then(|id| id.log_level);
     let result = execute_blocking(ExecuteBlocking {
         host: state.host.clone(),
         handle: Handle::current(),
@@ -791,6 +805,7 @@ async fn run_execute(
         context_json,
         config,
         cache_ns,
+        log_floor,
     })
     .await;
 
@@ -825,6 +840,9 @@ struct ExecuteBlocking {
     /// Bytecode-cache namespace (the fairness key) — keeps byte-identical source from different
     /// tenants from sharing a cache entry.
     cache_ns: Option<String>,
+    /// Trusted per-request diagnostic-log floor override (D6/OQ2). `None` uses the host's configured
+    /// floor; the gateway lowers it for a capture run.
+    log_floor: Option<LogLevel>,
 }
 
 /// Runs one invocation to completion on a blocking thread — the shared execute core for `/execute`
@@ -843,6 +861,7 @@ async fn execute_blocking(
         context_json,
         config,
         cache_ns,
+        log_floor,
     } = params;
     task::spawn_blocking(move || -> (Result<Outcome, EngineError>, BackendMetrics) {
         let adapter =
@@ -868,6 +887,9 @@ async fn execute_blocking(
         }
         if let Some(namespace) = cache_ns.as_deref() {
             invocation = invocation.cache_namespace(namespace);
+        }
+        if let Some(floor) = log_floor {
+            invocation = invocation.log_level(floor);
         }
         let outcome = host.run(invocation);
         let metrics =
@@ -1313,6 +1335,8 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         context_json: context.get().to_owned(),
         config,
         cache_ns: partition.map(str::to_owned),
+        // Batch items neither mirror nor stream logs (out of scope for §3); use the host's floor.
+        log_floor: None,
     })
     .await;
 
@@ -1592,6 +1616,17 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
              runlet_events_dropped_total {dropped}\n"
         );
     }
+    // Diagnostic-log channel backpressure gauge (D4): the isolated log channel's own dropped counter,
+    // separate from usage/audit so a chatty script's dropped logs are visible without conflating them
+    // with billing/audit backpressure. Absent series ⇒ 0.
+    if let Some(counter) = state.log_event_dropped.as_ref() {
+        let dropped = counter.load(Ordering::Relaxed);
+        body = format!(
+            "{body}# HELP runlet_log_events_dropped_total Diagnostic log events dropped due to a full buffer.\n\
+             # TYPE runlet_log_events_dropped_total counter\n\
+             runlet_log_events_dropped_total {dropped}\n"
+        );
+    }
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -1667,9 +1702,41 @@ fn emit_denied(
     sink.record(Event::new(tenant, user, plan, trace_id.to_owned(), audit));
 }
 
+/// The gateway-asserted diagnostic-log routing policy for a request (§3): whether to mirror the
+/// captured logs on the response, and whether the run streams to the live tenant stream (§2). Both
+/// derive **only** from trusted signals resolved in the identity layer — never a caller body field.
+#[derive(Debug, Clone, Copy)]
+struct LogPolicy {
+    /// Attach the top-level `logs` list to the response (D5, the playground mirror).
+    capture: bool,
+    /// The execution mode (OQ1): a `Test`/playground run is response-mirror-only and MUST NOT enter
+    /// the live stream / billing / audit.
+    mode: RunMode,
+}
+
+impl LogPolicy {
+    /// Resolves the policy from the request's trusted identity. Outside trusted mode there is no
+    /// gateway, so capture is off and the mode is live (a caller can neither force capture nor pick
+    /// the mode).
+    fn resolve(identity: Option<&TrustedIdentity>) -> Self {
+        identity.map_or(
+            Self {
+                capture: false,
+                mode: RunMode::Live,
+            },
+            |id| Self {
+                capture: id.capture,
+                mode: id.mode,
+            },
+        )
+    }
+}
+
 /// Turns the `spawn_blocking` result into the final HTTP response, attaching metrics to
 /// `meta` on success and classifying the error otherwise. Also emits the per-request `usage` +
-/// `allowed` audit events (the single executed-request event site, Change C).
+/// `allowed` audit events (the single executed-request event site, Change C), streams the captured
+/// diagnostic logs to the tenant (live mode, §2), and mirrors them on the response when the trusted
+/// gateway requested capture (§3, both success and error paths).
 fn build_response(
     result: Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError>,
     base_meta: Meta,
@@ -1677,33 +1744,39 @@ fn build_response(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
 ) -> AxumResponse {
+    let policy = LogPolicy::resolve(identity);
     let metrics: &Metrics = &state.metrics;
     // Record latency for every execution that ran (shed/rejected requests return earlier).
     metrics.observe_execution(base_meta.exec_time_us);
     match result {
         Ok((Ok(exec), backend)) => {
             record_capability_latencies(metrics, &exec.metrics, &backend);
-            // Surface the declarative `emit(kind, value)` effects on the response, on both the
-            // success and error paths (capture-on-failure); an empty list is omitted.
+            // Surface the declarative `emit(kind, value)` effects and — when captured — the diagnostic
+            // `logs` on the response, on both the success and error paths (capture-on-failure).
             let Outcome {
                 result: exec_result,
                 effects,
+                logs,
                 metrics: exec_metrics,
             } = exec;
             let meta = base_meta.with_metrics(exec_metrics, backend);
+            // Stream the captured logs to the tenant (live mode only, §2/OQ1) before shaping the
+            // response — a test/playground run never enters the live stream.
+            stream_logs(state, identity, &meta, &logs, policy.mode);
+            let mirror = policy.capture.then_some(logs.as_slice());
             match exec_result {
                 ExecOutcome::Success(js_json) => {
                     emit_executed(state, identity, &meta, "success");
                     metrics.record_success();
                     record_span_outcome("success");
-                    success_response(&js_json, meta, &effects, cfg)
+                    success_response(&js_json, meta, &effects, mirror, cfg)
                 }
                 ExecOutcome::Error(engine_err) => {
                     let outcome = engine_error_outcome(&engine_err);
                     emit_executed(state, identity, &meta, outcome);
                     metrics.record_engine_error(&engine_err);
                     record_span_outcome(outcome);
-                    engine_error_response(engine_err, meta, &effects, cfg)
+                    engine_error_response(engine_err, meta, &effects, mirror, cfg)
                 }
             }
         }
@@ -1712,7 +1785,9 @@ fn build_response(
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
             record_span_outcome(outcome);
-            engine_error_response(engine_err, base_meta, &[], cfg)
+            // No Outcome ⇒ no captured logs; when capture was requested, present an empty list.
+            let mirror = policy.capture.then_some::<&[LogEntry]>(&[]);
+            engine_error_response(engine_err, base_meta, &[], mirror, cfg)
         }
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
@@ -1720,8 +1795,46 @@ fn build_response(
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
             record_span_outcome(outcome);
-            engine_error_response(engine_err, base_meta, &[], cfg)
+            let mirror = policy.capture.then_some::<&[LogEntry]>(&[]);
+            engine_error_response(engine_err, base_meta, &[], mirror, cfg)
         }
+    }
+}
+
+/// Streams each captured diagnostic entry to the tenant's isolated log channel (§2, D4) as a `log`
+/// event keyed by tenant + `trace_id`. A no-op when events are disabled, when there is nothing to
+/// stream, or for a **test/playground** run (OQ1: test logs are response-mirror-only and never enter
+/// the live stream). Non-blocking + drop-on-full via the sink's separate log channel.
+fn stream_logs(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    meta: &Meta,
+    logs: &[LogEntry],
+    mode: RunMode,
+) {
+    if mode == RunMode::Test || logs.is_empty() {
+        return;
+    }
+    let Some(sink) = state.events.as_deref() else {
+        return;
+    };
+    let (tenant, user, plan) = identity_fields(identity);
+    for entry in logs {
+        let body = EventBody::Log(LogBody {
+            level: entry.level.as_str().to_owned(),
+            template: entry.template.clone(),
+            properties: serde_json::from_str(entry.properties.get()).unwrap_or(Value::Null),
+            message: entry.message.clone(),
+            seq: entry.seq,
+            offset_us: entry.offset_us,
+        });
+        sink.record_log(Event::new(
+            tenant.clone(),
+            user.clone(),
+            plan.clone(),
+            meta.trace_id.clone(),
+            body,
+        ));
     }
 }
 
@@ -2221,13 +2334,20 @@ fn request_error(code: &str, message: String) -> ErrorEnvelope {
 /// Rust-side as opaque handles (see `sys.rs`), so a script can only ever return the
 /// `"[secret:NAME]"` placeholder, never the value. The `{data,error}` borrow stays
 /// zero-copy.
-fn success_response(js_json: &str, meta: Meta, effects: &[Effect], cfg: RespCfg) -> AxumResponse {
+fn success_response(
+    js_json: &str,
+    meta: Meta,
+    effects: &[Effect],
+    logs: Option<&[LogEntry]>,
+    cfg: RespCfg,
+) -> AxumResponse {
     match serde_json::from_str::<Envelope<'_>>(js_json) {
-        Ok(env) => handler_envelope_response(&env, meta, effects, cfg),
+        Ok(env) => handler_envelope_response(&env, meta, effects, logs, cfg),
         Err(parse_err) => engine_error_response(
             EngineError::Malformed(format!("malformed handler response: {parse_err}")),
             meta,
             effects,
+            logs,
             cfg,
         ),
     }
@@ -2242,6 +2362,7 @@ fn handler_envelope_response(
     env: &Envelope<'_>,
     meta: Meta,
     effects: &[Effect],
+    logs: Option<&[LogEntry]>,
     cfg: RespCfg,
 ) -> AxumResponse {
     let projected = handler_status(env.error);
@@ -2253,6 +2374,7 @@ fn handler_envelope_response(
             error: env.error,
             meta,
             effects,
+            logs,
         }),
     )
         .into_response();
@@ -2304,30 +2426,34 @@ fn engine_error_response(
     err: EngineError,
     meta: Meta,
     effects: &[Effect],
+    logs: Option<&[LogEntry]>,
     cfg: RespCfg,
 ) -> AxumResponse {
     warn!(trace_id = %meta.trace_id, error = ?err, "execute system error");
     let envelope = err.into_envelope(cfg.error_debug, cfg.timeout_retryable);
-    projected_error_response_with_effects(envelope, meta, effects, cfg)
+    projected_error_response_with_effects(envelope, meta, effects, logs, cfg)
 }
 
 /// Serializes a classified system error, projecting its HTTP status from the envelope's
 /// `(retryable, owner, code)` (the single source of truth, design D6) and attaching a `Retry-After`
 /// header on the retryable `5xx` class. The one place a classified fault becomes an HTTP status.
 fn projected_error_response(error: ErrorEnvelope, meta: Meta, cfg: RespCfg) -> AxumResponse {
-    projected_error_response_with_effects(error, meta, &[], cfg)
+    projected_error_response_with_effects(error, meta, &[], None, cfg)
 }
 
 /// [`projected_error_response`] carrying any effects captured before an execution error
-/// (capture-on-failure). Pre-execution errors have no effects and go through the thin wrapper.
+/// (capture-on-failure) and — when the trusted gateway requested capture — the diagnostic `logs`
+/// mirror. Pre-execution errors have no effects/logs and go through the thin wrapper.
 fn projected_error_response_with_effects(
     error: ErrorEnvelope,
     meta: Meta,
     effects: &[Effect],
+    logs: Option<&[LogEntry]>,
     cfg: RespCfg,
 ) -> AxumResponse {
     let projected = project_envelope(&error);
-    let mut response = system_error_response_with_effects(error, projected.status, meta, effects);
+    let mut response =
+        system_error_response_with_effects(error, projected.status, meta, effects, logs);
     if projected.retry_after {
         add_retry_after(&mut response, cfg.retry_after_seconds);
     }
@@ -2343,18 +2469,20 @@ fn add_retry_after(response: &mut AxumResponse, seconds: u32) {
     }
 }
 
-/// Serializes a `{ data: null, error, meta }` response at the given status (no effects).
+/// Serializes a `{ data: null, error, meta }` response at the given status (no effects, no logs).
 fn system_error_response(error: ErrorEnvelope, status: u16, meta: Meta) -> AxumResponse {
-    system_error_response_with_effects(error, status, meta, &[])
+    system_error_response_with_effects(error, status, meta, &[], None)
 }
 
-/// Serializes a `{ data: null, error, meta, effects? }` response at the given status, carrying
-/// any effects captured before the failure (omitted when empty).
+/// Serializes a `{ data: null, error, meta, effects?, logs? }` response at the given status,
+/// carrying any effects captured before the failure (omitted when empty) and the gateway-gated
+/// diagnostic `logs` mirror (omitted unless capture was requested).
 fn system_error_response_with_effects(
     error: ErrorEnvelope,
     status: u16,
     meta: Meta,
     effects: &[Effect],
+    logs: Option<&[LogEntry]>,
 ) -> AxumResponse {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -2364,6 +2492,7 @@ fn system_error_response_with_effects(
             error,
             meta,
             effects,
+            logs,
         }),
     )
         .into_response()
@@ -2417,6 +2546,146 @@ mod tests {
         assert!(
             !request_authorized(&with_auth("Bearer "), "s3cret"),
             "empty token rejected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_mirror_tests {
+    //! §3 response mirror: `logs` is present iff the trusted gateway requested capture, on both the
+    //! 2xx and non-2xx paths, and absent otherwise (byte-compatible with the prior contract). Also
+    //! the caller-can't-force-capture policy (an untrusted request never captures).
+
+    use super::{Effect, ErrorEnvelope, LogEntry, LogPolicy, Meta, Response, SystemErrorResponse};
+    use crate::identity::{RunMode, TrustedIdentity};
+    use runlet_core::engine::LogLevel;
+    use runlet_core::errors::{ErrorCategory, ErrorOwner, ErrorSource};
+    use serde_json::value::RawValue;
+
+    /// One representative captured entry.
+    fn entry() -> LogEntry {
+        LogEntry {
+            level: LogLevel::Info,
+            template: "hi {n}".to_owned(),
+            properties: RawValue::from_string("{\"n\":1}".to_owned())
+                .unwrap_or_else(|_e| unreachable!()),
+            message: "hi 1".to_owned(),
+            seq: 0,
+            offset_us: None,
+        }
+    }
+
+    /// A minimal meta for serialization.
+    fn meta() -> Meta {
+        Meta::new("trace-1".to_owned(), 0, 0, 0)
+    }
+
+    /// A raw `null` value for the success envelope fields.
+    fn raw_null() -> Box<RawValue> {
+        RawValue::from_string("null".to_owned()).unwrap_or_else(|_e| unreachable!())
+    }
+
+    /// A success response with a captured mirror serializes a top-level `logs` array; without it the
+    /// field is entirely absent (byte-compatible with `{data, error, meta}`).
+    #[test]
+    fn success_mirror_present_only_when_captured() {
+        let logs = [entry()];
+        let data = raw_null();
+        let error = raw_null();
+        let no_effects: [Effect; 0] = [];
+        let with = Response {
+            data: &data,
+            error: &error,
+            meta: meta(),
+            effects: &no_effects,
+            logs: Some(&logs),
+        };
+        let json = serde_json::to_string(&with).unwrap_or_default();
+        assert!(
+            json.contains("\"logs\""),
+            "captured run carries logs: {json}"
+        );
+        assert!(json.contains("hi 1"), "the entry is serialized");
+
+        let without = Response {
+            data: &data,
+            error: &error,
+            meta: meta(),
+            effects: &no_effects,
+            logs: None,
+        };
+        let json = serde_json::to_string(&without).unwrap_or_default();
+        assert!(
+            !json.contains("\"logs\""),
+            "no capture ⇒ no logs field: {json}"
+        );
+    }
+
+    /// A non-2xx (system error) response carries the partial trail when captured (capture-on-failure)
+    /// and omits the field otherwise.
+    #[test]
+    fn error_mirror_present_only_when_captured() {
+        let logs = [entry()];
+        let no_effects: [Effect; 0] = [];
+        let script_error = || {
+            ErrorEnvelope::new(
+                ErrorCategory::Script,
+                ErrorSource::Handler,
+                "SCRIPT_ERROR".to_owned(),
+                false,
+                ErrorOwner::Developer,
+            )
+        };
+        let with = SystemErrorResponse {
+            data: None,
+            error: script_error(),
+            meta: meta(),
+            effects: &no_effects,
+            logs: Some(&logs),
+        };
+        let json = serde_json::to_string(&with).unwrap_or_default();
+        assert!(
+            json.contains("\"logs\""),
+            "captured error carries the trail: {json}"
+        );
+
+        let without = SystemErrorResponse {
+            data: None,
+            error: script_error(),
+            meta: meta(),
+            effects: &no_effects,
+            logs: None,
+        };
+        let json = serde_json::to_string(&without).unwrap_or_default();
+        assert!(
+            !json.contains("\"logs\""),
+            "no capture ⇒ no logs field: {json}"
+        );
+    }
+
+    /// A request with no trusted identity (the caller-asserted / single-tenant path) never captures
+    /// and is always live — a caller cannot force the mirror or pick the mode.
+    #[test]
+    fn untrusted_request_never_captures() {
+        let policy = LogPolicy::resolve(None);
+        assert!(!policy.capture, "no gateway ⇒ no capture");
+        assert_eq!(policy.mode, RunMode::Live, "no gateway ⇒ live");
+    }
+
+    /// The trusted capture flag drives the mirror; the mode is carried through for stream routing.
+    #[test]
+    fn trusted_capture_flag_drives_policy() {
+        let id = TrustedIdentity {
+            capture: true,
+            mode: RunMode::Test,
+            ..TrustedIdentity::default()
+        };
+        let policy = LogPolicy::resolve(Some(&id));
+        assert!(policy.capture, "trusted capture requests the mirror");
+        assert_eq!(
+            policy.mode,
+            RunMode::Test,
+            "test mode is response-mirror-only"
         );
     }
 }
@@ -2569,6 +2838,7 @@ mod trusted_pipeline_tests {
             })),
             events: None,
             event_dropped: None,
+            log_event_dropped: None,
             batch: crate::config::BatchConfig::default(),
             timeout_retryable: true,
             retry_after_seconds: 1,
@@ -2615,6 +2885,11 @@ mod trusted_pipeline_tests {
             if let Ok(mut lines) = self.lines.lock() {
                 lines.push(json);
             }
+        }
+
+        fn record_log(&self, event: Event) {
+            // Diagnostic log events land in the same capture list (uniform for assertions).
+            self.record(event);
         }
     }
 
@@ -2889,6 +3164,7 @@ mod batch_tests {
             trusted,
             events: None,
             event_dropped: None,
+            log_event_dropped: None,
             batch: BatchConfig::default(),
             timeout_retryable: true,
             retry_after_seconds: 1,
@@ -3171,6 +3447,7 @@ mod execute_status_tests {
             trusted: None,
             events: None,
             event_dropped: None,
+            log_event_dropped: None,
             batch: crate::config::BatchConfig::default(),
             timeout_retryable: true,
             retry_after_seconds: 7,

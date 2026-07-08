@@ -64,6 +64,29 @@ pub(crate) enum EventBody {
     Usage(UsageBody),
     /// One request's terminal decision (compliance trail).
     Audit(AuditBody),
+    /// One diagnostic log entry (the always-on tenant stream sink). Rides its **own** bounded
+    /// channel, isolated from `usage`/`audit` so log volume can never drop a billing/audit event
+    /// (D4). Lossy / observability-grade.
+    Log(LogBody),
+}
+
+/// One diagnostic log entry streamed to the tenant, projected from a core `LogEntry`. The properties
+/// are opaque JSON; the level is the lowercase name.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LogBody {
+    /// Severity level (`trace`/`debug`/`info`/`warn`/`error`).
+    pub(crate) level: String,
+    /// The Serilog-style message template.
+    pub(crate) template: String,
+    /// The merged named properties (opaque JSON).
+    pub(crate) properties: Value,
+    /// The rendered message.
+    pub(crate) message: String,
+    /// Call-order sequence number within the execution.
+    pub(crate) seq: u64,
+    /// Relative microseconds from execution start (full profile only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) offset_us: Option<u128>,
 }
 
 /// Per-request usage dimensions — sourced from the response `meta` the box already computes.
@@ -145,21 +168,31 @@ fn now_unix_millis() -> u128 {
         .map_or(0, |delta| delta.as_millis())
 }
 
-/// A non-blocking event sink. `record` must never block or fail the request path. `Debug` is
-/// required so `AppState` (which holds an `Arc<dyn Sink>`) can derive it.
+/// A non-blocking event sink. `record`/`record_log` must never block or fail the request path.
+/// `Debug` is required so `AppState` (which holds an `Arc<dyn Sink>`) can derive it.
 pub(crate) trait Sink: Send + Sync + fmt::Debug {
-    /// Hands an event to the sink. Implementations drop (never await) under backpressure.
+    /// Hands a **precious** `usage`/`audit` event to the sink. Implementations drop (never await)
+    /// under backpressure.
     fn record(&self, event: Event);
+    /// Hands a **diagnostic** `log` event to the sink's **separate** channel (D4), so a chatty
+    /// script's logs can never starve `usage`/`audit`. Drops (never awaits) under backpressure.
+    fn record_log(&self, event: Event);
 }
 
-/// The lossy, observability-grade sink: a bounded channel drained by a writer task that emits one
-/// JSON line per event to stdout. A full channel drops the event and increments `dropped`.
+/// The lossy, observability-grade sink: two bounded channels — one for the precious `usage`/`audit`
+/// events, a **separate** one for diagnostic `log` events (D4) — each drained by its own writer task
+/// emitting one JSON line per event to stdout. A full channel drops the event and increments its
+/// dropped counter, so log volume degrades only logs, never billing/audit.
 #[derive(Debug)]
 struct LogSink {
-    /// Bounded sender to the writer task.
+    /// Bounded sender for `usage`/`audit` events.
     tx: mpsc::Sender<Event>,
-    /// Count of events dropped because the channel was full/closed (the backpressure signal).
+    /// Count of `usage`/`audit` events dropped (full/closed channel).
     dropped: Arc<AtomicU64>,
+    /// Bounded sender for diagnostic `log` events (the isolated channel).
+    log_tx: mpsc::Sender<Event>,
+    /// Count of `log` events dropped (full/closed channel).
+    log_dropped: Arc<AtomicU64>,
 }
 
 impl Sink for LogSink {
@@ -168,42 +201,75 @@ impl Sink for LogSink {
             let _ = self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    fn record_log(&self, event: Event) {
+        if self.log_tx.try_send(event).is_err() {
+            let _ = self.log_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
-/// Owns the writer task so buffered events can be flushed on shutdown, and exposes the dropped
-/// counter for the `/metrics` backpressure gauge.
+/// Owns both writer tasks so buffered events can be flushed on shutdown, and exposes the dropped
+/// counters for the `/metrics` backpressure gauges.
 pub(crate) struct EventPipeline {
-    /// The background writer task (drains the channel until all senders drop).
+    /// The `usage`/`audit` writer task.
     writer: JoinHandle<()>,
-    /// Shared dropped-events counter.
+    /// The isolated `log` writer task.
+    log_writer: JoinHandle<()>,
+    /// Shared `usage`/`audit` dropped-events counter.
     dropped: Arc<AtomicU64>,
+    /// Shared `log` dropped-events counter.
+    log_dropped: Arc<AtomicU64>,
 }
 
 impl EventPipeline {
-    /// Spawns the writer task and returns the pipeline plus the [`Sink`] to place in `AppState`.
-    /// `bound` is the channel capacity; beyond it events are dropped (fail-open).
-    pub(crate) fn spawn(bound: usize) -> (Self, Arc<dyn Sink>) {
+    /// Spawns both writer tasks and returns the pipeline plus the [`Sink`] to place in `AppState`.
+    /// `bound` is the `usage`/`audit` channel capacity, `log_bound` the isolated log channel's;
+    /// beyond either, events on that channel are dropped (fail-open).
+    pub(crate) fn spawn(bound: usize, log_bound: usize) -> (Self, Arc<dyn Sink>) {
         let (tx, rx) = mpsc::channel(bound.max(1));
+        let (log_tx, log_rx) = mpsc::channel(log_bound.max(1));
         let dropped = Arc::new(AtomicU64::new(0));
+        let log_dropped = Arc::new(AtomicU64::new(0));
         let sink: Arc<dyn Sink> = Arc::new(LogSink {
             tx,
             dropped: Arc::clone(&dropped),
+            log_tx,
+            log_dropped: Arc::clone(&log_dropped),
         });
         let writer = tokio::spawn(writer_loop(rx));
-        (Self { writer, dropped }, sink)
+        let log_writer = tokio::spawn(writer_loop(log_rx));
+        (
+            Self {
+                writer,
+                log_writer,
+                dropped,
+                log_dropped,
+            },
+            sink,
+        )
     }
 
-    /// A shared handle to the dropped-events counter, for the `/metrics` backpressure gauge
-    /// (`runlet_events_dropped_total`), read live at scrape time.
+    /// A shared handle to the `usage`/`audit` dropped-events counter, for the `/metrics`
+    /// backpressure gauge (`runlet_events_dropped_total`), read live at scrape time.
     pub(crate) fn dropped_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.dropped)
     }
 
-    /// Best-effort flush: the caller drops the last [`Sink`] (closing the channel) before calling
-    /// this, so the writer drains the remainder and exits, which this awaits.
+    /// A shared handle to the diagnostic-log dropped-events counter, for the
+    /// `runlet_log_events_dropped_total` gauge.
+    pub(crate) fn log_dropped_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.log_dropped)
+    }
+
+    /// Best-effort flush: the caller drops the last [`Sink`] (closing both channels) before calling
+    /// this, so each writer drains its remainder and exits, which this awaits.
     pub(crate) async fn shutdown(self) {
         if let Err(err) = self.writer.await {
             tracing::warn!("event writer task join error: {err}");
+        }
+        if let Err(err) = self.log_writer.await {
+            tracing::warn!("log event writer task join error: {err}");
         }
     }
 }
@@ -229,8 +295,8 @@ mod tests {
     //! Envelope serialization + the non-blocking drop-on-full contract.
 
     use super::{
-        AtomicU64, AuditBody, CapabilityOps, Event, EventBody, LogSink, Ordering, Sink, UsageBody,
-        Value, mpsc,
+        AtomicU64, AuditBody, CapabilityOps, Event, EventBody, LogBody, LogSink, Ordering, Sink,
+        UsageBody, Value, mpsc,
     };
     use std::sync::Arc;
 
@@ -246,6 +312,24 @@ mod tests {
                 exec_time_us: 5,
                 input_bytes: 10,
                 ops: CapabilityOps::default(),
+            }),
+        )
+    }
+
+    /// A representative `log` event.
+    fn log_event() -> Event {
+        Event::new(
+            Some("ws_acme".to_owned()),
+            Some("u_1".to_owned()),
+            Some("pro".to_owned()),
+            "trace-abc".to_owned(),
+            EventBody::Log(LogBody {
+                level: "info".to_owned(),
+                template: "hi {n}".to_owned(),
+                properties: Value::from("{}"),
+                message: "hi 1".to_owned(),
+                seq: 0,
+                offset_us: Some(3),
             }),
         )
     }
@@ -298,10 +382,14 @@ mod tests {
     fn full_channel_drops_and_counts() {
         // Capacity 1, receiver held but never drained.
         let (tx, _rx) = mpsc::channel(1);
+        let (log_tx, _log_rx) = mpsc::channel(1);
         let dropped = Arc::new(AtomicU64::new(0));
+        let log_dropped = Arc::new(AtomicU64::new(0));
         let sink = LogSink {
             tx,
             dropped: Arc::clone(&dropped),
+            log_tx,
+            log_dropped: Arc::clone(&log_dropped),
         };
         sink.record(usage_event()); // fills the single slot
         sink.record(usage_event()); // full → dropped
@@ -311,5 +399,41 @@ mod tests {
             2,
             "events beyond the bound are dropped, not blocked"
         );
+    }
+
+    /// 4.7 — a saturated log channel drops **log** events (advancing the log counter) while
+    /// `usage`/`audit` events on their separate channel are still delivered (D4 isolation). The log
+    /// channel has capacity 1 and is never drained; the usage channel has room.
+    #[test]
+    fn saturated_log_channel_never_drops_usage() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (log_tx, _log_rx) = mpsc::channel(1); // never drained → saturates immediately
+        let dropped = Arc::new(AtomicU64::new(0));
+        let log_dropped = Arc::new(AtomicU64::new(0));
+        let sink = LogSink {
+            tx,
+            dropped: Arc::clone(&dropped),
+            log_tx,
+            log_dropped: Arc::clone(&log_dropped),
+        };
+        // Saturate the log channel.
+        sink.record_log(log_event()); // fills the single slot
+        sink.record_log(log_event()); // dropped
+        sink.record_log(log_event()); // dropped
+        // Usage on the separate channel is unaffected.
+        sink.record(usage_event());
+        sink.record(usage_event());
+        assert_eq!(
+            log_dropped.load(Ordering::Relaxed),
+            2,
+            "log events beyond the log bound are dropped"
+        );
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "usage/audit events are never dropped by log backpressure"
+        );
+        assert!(rx.try_recv().is_ok(), "the usage events were delivered");
+        assert!(rx.try_recv().is_ok(), "both usage events were delivered");
     }
 }

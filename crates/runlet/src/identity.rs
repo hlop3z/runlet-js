@@ -6,8 +6,21 @@
 //! reaches this. See `docs/design/multitenant-trust.md`.
 
 use axum::http::HeaderMap;
+use runlet_core::LogLevel;
 
 use crate::config::TrustedHeaders;
+
+/// The gateway-asserted execution mode (OQ1, Stripe's isolation model). A **live** run streams its
+/// logs to the tenant stream; a **test/playground** run is response-mirror-only and never enters the
+/// live stream / billing / audit. Both are orthogonal to the diagnostic-capture flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RunMode {
+    /// Production traffic — logs stream to the tenant.
+    #[default]
+    Live,
+    /// Test / playground traffic — response-mirror-only, never streams.
+    Test,
+}
 
 /// The trusted identity extracted from the edge-injected headers for one request.
 ///
@@ -34,6 +47,15 @@ pub(crate) struct TrustedIdentity {
     /// The acting-org assurance the edge asserts per request (nexus N5). Populated from the
     /// configured scope header; the gate requires `Some("acting")` for tenant-scoped work.
     pub(crate) scope: Option<String>,
+    /// Gateway-asserted execution mode (OQ1). Governs diagnostic-log routing only in this change: a
+    /// `Test` run is response-mirror-only and never streams. Defaults to `Live`.
+    pub(crate) mode: RunMode,
+    /// Gateway-asserted request for the response-mirror `logs` list (D5). `false` unless the trusted
+    /// capture header is truthy.
+    pub(crate) capture: bool,
+    /// Gateway-supplied per-request log-level-floor override (OQ2). `None` unless a valid level name
+    /// is present in the trusted log-level header.
+    pub(crate) log_level: Option<LogLevel>,
 }
 
 impl TrustedIdentity {
@@ -50,6 +72,10 @@ impl TrustedIdentity {
             anonymous: header_flag(headers, &names.anonymous),
             plan: header_value(headers, &names.plan),
             scope: header_value(headers, &names.scope),
+            mode: header_mode(headers, &names.mode),
+            capture: header_flag(headers, &names.capture),
+            log_level: header_value(headers, &names.log_level)
+                .and_then(|raw| LogLevel::parse(&raw.to_ascii_lowercase())),
         }
     }
 
@@ -81,6 +107,16 @@ fn header_list(headers: &HeaderMap, name: &str) -> Vec<String> {
             .map(str::to_owned)
             .collect()
     })
+}
+
+/// Reads the execution-mode trusted header. `test`/`playground` (case-insensitive) ⇒ [`RunMode::Test`];
+/// anything else, including absent or `live`, ⇒ [`RunMode::Live`] (the safe default — a run only
+/// escapes the live stream when the edge *explicitly* marks it test).
+fn header_mode(headers: &HeaderMap, name: &str) -> RunMode {
+    match header_value(headers, name).map(|value| value.to_ascii_lowercase()) {
+        Some(value) if value == "test" || value == "playground" => RunMode::Test,
+        _other => RunMode::Live,
+    }
 }
 
 /// Reads a boolean trusted header — `true` only for a case-insensitive `"true"` or `"1"` (anything
@@ -135,6 +171,36 @@ mod tests {
         assert!(id.has_grant("db"), "entitlement grant matches");
         assert!(id.has_grant("admin"), "role grant matches");
         assert!(!id.has_grant("mongo"), "absent grant does not match");
+    }
+
+    /// The trusted `mode` + `capture` + per-request log-level override parse from their default
+    /// header names; absent mode is `live`, absent capture is `false` (§3.1 / OQ5).
+    #[test]
+    fn resolves_mode_capture_and_log_level() {
+        use super::RunMode;
+        use runlet_core::LogLevel;
+
+        let map = headers(&[
+            ("x-tenant-scope", "acting"),
+            ("x-runlet-mode", "test"),
+            ("x-runlet-capture", "true"),
+            ("x-runlet-log-level", "DEBUG"),
+        ]);
+        let id = TrustedIdentity::from_headers(&map, &TrustedHeaders::default());
+        assert_eq!(id.mode, RunMode::Test, "test mode parses");
+        assert!(id.capture, "capture flag parses");
+        assert_eq!(
+            id.log_level,
+            Some(LogLevel::Debug),
+            "the per-request floor override parses case-insensitively"
+        );
+
+        // Absent signals default to (live, no-capture, no override).
+        let bare = headers(&[("x-tenant-scope", "acting")]);
+        let id = TrustedIdentity::from_headers(&bare, &TrustedHeaders::default());
+        assert_eq!(id.mode, RunMode::Live, "absent mode defaults to live");
+        assert!(!id.capture, "absent capture defaults to false");
+        assert_eq!(id.log_level, None, "absent override is None");
     }
 
     /// The suspended / anonymous flags read `true`/`1` case-insensitively.

@@ -202,11 +202,16 @@ impl Default for BatchConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub(crate) struct EventsConfig {
-    /// Turn on usage + audit event emission. `false` (default) ⇒ no events, no writer task.
+    /// Turn on usage + audit event emission. `false` (default) ⇒ no events, no writer task. Also
+    /// gates the diagnostic-log stream sink (logs ride the same pipeline on their own channel).
     pub(crate) enabled: bool,
-    /// Bounded event-channel capacity; beyond it events are dropped (fail-open) and the
-    /// `runlet_events_dropped_total` counter increments. Default `4096`.
+    /// Bounded `usage`/`audit` channel capacity; beyond it those events are dropped (fail-open) and
+    /// `runlet_events_dropped_total` increments. Default `4096`.
     pub(crate) buffer: usize,
+    /// Bounded **diagnostic-log** channel capacity — a separate, higher-volume channel isolated from
+    /// `usage`/`audit` (D4), so log volume can never drop a billing/audit event. Beyond it, log
+    /// events are dropped and `runlet_log_events_dropped_total` increments. Default `8192`.
+    pub(crate) log_buffer: usize,
 }
 
 impl Default for EventsConfig {
@@ -214,6 +219,7 @@ impl Default for EventsConfig {
         Self {
             enabled: false,
             buffer: 4096,
+            log_buffer: 8192,
         }
     }
 }
@@ -294,6 +300,18 @@ pub(crate) struct TrustedHeaders {
     /// tenant-scoped request whose value is not `acting` is rejected fail-closed (nexus upstream
     /// requirement N5). See `docs/design/multitenant-trust.md`.
     pub(crate) scope: String,
+    /// Execution mode header (default `x-runlet-mode`): `live` (default) or `test`/`playground`. A
+    /// **test** run is response-mirror-only and never enters the live log stream / billing / audit
+    /// (OQ1, Stripe's isolation model). Gateway-asserted, never caller-asserted.
+    pub(crate) mode: String,
+    /// Diagnostic-capture header (default `x-runlet-capture`): when truthy, the trusted gateway
+    /// requests the response-mirror `logs` list for this request (D5, the playground path). Never
+    /// caller-asserted.
+    pub(crate) capture: String,
+    /// Per-request log-level-floor override header (default `x-runlet-log-level`): the gateway MAY
+    /// lower the floor for a capture run so the playground gets `debug`/`trace` while production
+    /// stays `info`+ (OQ2). Ignored when absent/unparseable.
+    pub(crate) log_level: String,
 }
 
 impl Default for TrustedHeaders {
@@ -307,6 +325,9 @@ impl Default for TrustedHeaders {
             anonymous: "x-auth-anonymous".to_owned(),
             plan: "x-tenant-plan".to_owned(),
             scope: "x-tenant-scope".to_owned(),
+            mode: "x-runlet-mode".to_owned(),
+            capture: "x-runlet-capture".to_owned(),
+            log_level: "x-runlet-log-level".to_owned(),
         }
     }
 }

@@ -196,13 +196,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Per-tenant usage + audit event pipeline (Change C): a bounded, non-blocking writer task
     // streaming JSON events to stdout. `None` when disabled — every emit site is then a no-op.
-    let (event_pipeline, event_sink, event_dropped) = if config.events.enabled {
-        let (pipeline, sink) = events::EventPipeline::spawn(config.events.buffer);
+    let (event_pipeline, event_sink, event_dropped, log_event_dropped) = if config.events.enabled {
+        let (pipeline, sink) =
+            events::EventPipeline::spawn(config.events.buffer, config.events.log_buffer);
         let dropped = pipeline.dropped_handle();
-        info!(buffer = config.events.buffer, "per-tenant events enabled");
-        (Some(pipeline), Some(sink), Some(dropped))
+        let log_dropped = pipeline.log_dropped_handle();
+        info!(
+            buffer = config.events.buffer,
+            log_buffer = config.events.log_buffer,
+            "per-tenant events enabled"
+        );
+        (Some(pipeline), Some(sink), Some(dropped), Some(log_dropped))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     let state = AppState {
@@ -219,6 +225,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         trusted,
         events: event_sink,
         event_dropped,
+        log_event_dropped,
         batch: config.batch,
         timeout_retryable: config.timeout_retryable,
         retry_after_seconds: config.retry_after_seconds,

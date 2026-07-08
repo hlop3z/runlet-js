@@ -62,6 +62,11 @@ const DETERMINISM_SANITIZER: &str = include_str!("js/determinism.js");
 /// profile is `Full` (the seam is I/O).
 const IO_WRAPPER: &str = include_str!("js/io.js");
 
+/// The `log.*` diagnostic wrapper — loaded from `src/js/log.js` at compile time. `eval`'d after
+/// `__log` + `__logFloor` are registered; injected under both profiles (D8: a deterministic script
+/// is often exactly the one you want to debug), so it sits beside `inject_emit` in `run`.
+const LOG_WRAPPER: &str = include_str!("js/log.js");
+
 /// Capability-injection + determinism profile for an execution.
 ///
 /// A **runtime** injection decision (not a compile-time feature) so a single process can
@@ -125,6 +130,151 @@ pub struct Effect {
     pub value: Box<RawValue>,
 }
 
+/// Diagnostic log severity for the `log.*` channel.
+///
+/// Ordered `Trace < Debug < Info < Warn < Error` (the D6 level floor; the derived [`Ord`] follows
+/// declaration order). A call below the configured floor is discarded in the JS wrapper before any
+/// serialization (near-free on the hot path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// The most verbose level — fine-grained tracing.
+    Trace,
+    /// Debugging detail, off in production by default.
+    Debug,
+    /// The default floor: normal operational events.
+    Info,
+    /// A warning that did not stop the run.
+    Warn,
+    /// An error condition.
+    Error,
+}
+
+impl LogLevel {
+    /// The lowercase wire name (`"trace"`/`"debug"`/…), matching the `serde` representation and the
+    /// names the JS wrapper passes across the FFI.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    /// The numeric rank (`0`..=`4`) used as the JS-side level floor, so the wrapper can compare
+    /// cheaply before building an entry.
+    #[must_use]
+    pub const fn ordinal(self) -> u8 {
+        match self {
+            Self::Trace => 0,
+            Self::Debug => 1,
+            Self::Info => 2,
+            Self::Warn => 3,
+            Self::Error => 4,
+        }
+    }
+
+    /// Parses a lowercase level name; `None` for an unknown token.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "trace" => Some(Self::Trace),
+            "debug" => Some(Self::Debug),
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _unknown => None,
+        }
+    }
+}
+
+/// A single structured diagnostic entry produced by a `log.<level>(...)` call.
+///
+/// Carries the Serilog-style `template`, the merged `properties` (bound context + per-call fields,
+/// opaque JSON to the core), the rendered `message`, a deterministic `seq` (call order), and — only
+/// under [`Profile::Full`] — a relative `offset_us` from execution start (D8: no wall-clock timing
+/// under the deterministic profile). An oversize entry is truncated with a `{"truncated":true}`
+/// property marker (D7). The core defines this structure but never interprets a log's meaning.
+#[derive(Debug, Serialize)]
+pub struct LogEntry {
+    /// Severity level.
+    pub level: LogLevel,
+    /// The message template (`"charged {user} {amount}"`).
+    pub template: String,
+    /// The merged named properties (opaque JSON object), verbatim from `JSON.stringify`.
+    pub properties: Box<RawValue>,
+    /// The rendered message (template with `{name}` placeholders substituted, rendered in JS).
+    pub message: String,
+    /// Monotonic per-execution sequence number preserving call order (starts at `0`).
+    pub seq: u64,
+    /// Relative microseconds from execution start; attached only under [`Profile::Full`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_us: Option<u128>,
+}
+
+/// One captured `(level, template, properties_json, message, seq, offset_us)` tuple, before it is
+/// drained into a public [`LogEntry`]. Held in the [`LogBuffer`]'s accumulator.
+struct RawLog {
+    /// Severity level.
+    level: LogLevel,
+    /// The message template.
+    template: String,
+    /// The merged properties as a JSON string (verbatim from the wrapper's `JSON.stringify`).
+    properties_json: String,
+    /// The JS-rendered message.
+    message: String,
+    /// Call-order sequence number.
+    seq: u64,
+    /// Relative microseconds from execution start (`None` under the deterministic profile).
+    offset_us: Option<u128>,
+}
+
+/// The per-invocation `log` accumulator: the captured entries plus a running byte total, so the D7
+/// per-execution total bound (`max_log_total_bytes`) can be enforced across entries.
+#[derive(Default)]
+struct LogAccumulator {
+    /// Captured entries, in call order.
+    entries: Vec<RawLog>,
+    /// Running sum of the captured entries' sizes (template + properties + message bytes).
+    total_bytes: usize,
+}
+
+/// The shared per-invocation `log` buffer: native `__log` appends [`RawLog`]s here (bounded by the
+/// D7 triad), drained into [`ExecResult::logs`] after execution on both paths (capture-on-failure).
+type LogBuffer = Arc<Mutex<LogAccumulator>>;
+
+/// One candidate log entry crossing from the native `__log` into [`capture_log`], before the D7
+/// bounds decide to keep, truncate, or drop it. Bundled so the capture helper stays within the
+/// argument-count lint.
+struct PendingLog {
+    /// Severity level.
+    level: LogLevel,
+    /// The message template.
+    template: String,
+    /// The merged properties as a JSON string.
+    properties_json: String,
+    /// The JS-rendered message.
+    message: String,
+    /// Relative microseconds from execution start (`None` under the deterministic profile).
+    offset_us: Option<u128>,
+}
+
+/// The D7 per-execution log bounds + the resolved level floor, threaded into the native `__log`.
+#[derive(Clone, Copy)]
+struct LogLimits {
+    /// The resolved minimum level (below it, the wrapper records nothing).
+    floor: LogLevel,
+    /// Max entries per execution; beyond it further calls are dropped.
+    max_entries: usize,
+    /// Max bytes per entry; an oversize entry is truncated with a marker.
+    max_entry_bytes: usize,
+    /// Max total bytes per execution (binds first); a call that would exceed it is dropped.
+    max_total_bytes: usize,
+}
+
 /// Parameters for a single script execution. Built by the [`crate::host::LogicHost`] from
 /// a public `Invocation`; internal to the core.
 pub(crate) struct ExecParams<'a> {
@@ -168,6 +318,17 @@ pub(crate) struct ExecParams<'a> {
     pub(crate) max_ops: usize,
     /// Max character length of an `emit` `kind` tag; a longer tag is rejected.
     pub(crate) max_emit_kind_len: usize,
+    /// The resolved diagnostic-log level floor (D6): a `log.<level>` call below this records
+    /// nothing. Resolved by the host from `EngineConfig.log_level` and any trusted per-request
+    /// override.
+    pub(crate) log_level: LogLevel,
+    /// Max diagnostic-log entries captured per execution (D7 count cap).
+    pub(crate) max_log_entries: usize,
+    /// Max bytes of a single diagnostic-log entry (D7 per-entry cap); an oversize entry is
+    /// truncated with a marker.
+    pub(crate) max_log_entry_bytes: usize,
+    /// Max total diagnostic-log bytes per execution (D7 total cap — binds first).
+    pub(crate) max_log_total_bytes: usize,
     /// Max bytes the handler may return (`0` = off, bounded only by `memory_limit`).
     pub(crate) max_output_size: usize,
     /// Debug mode: relax the SSRF private-IP block for local testing — the in-engine `http`/`s3`
@@ -189,6 +350,10 @@ pub(crate) struct ExecResult {
     /// Declarative effects appended via `emit(kind, value)`, in call order. Each carries a
     /// routing `kind` tag and an opaque `value` (the consumer interprets the value).
     pub(crate) effects: Vec<Effect>,
+    /// Diagnostic log entries appended via `log.<level>(...)`, in call order, drained on both the
+    /// success and error paths (capture-on-failure, D8). Outside the reproducible `data`/`effects`
+    /// contract.
+    pub(crate) logs: Vec<LogEntry>,
     /// HTTP requests made during execution (in-engine capability).
     #[cfg(feature = "http")]
     pub(crate) http_metrics: Vec<HttpMetric>,
@@ -315,6 +480,14 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     // consumer interprets it); the `kind` is a routing tag surfaced structurally.
     let effects: EmitBuffer = Arc::new(Mutex::new(Vec::new()));
 
+    // Per-invocation `log` buffer: native `__log` appends captured diagnostic entries here, drained
+    // into `ExecResult.logs` after execution (both paths). Outside the reproducible outputs (D8).
+    let logs: LogBuffer = Arc::new(Mutex::new(LogAccumulator::default()));
+    // Execution start, for the relative `offset_us` — attached only under the full profile (the
+    // deterministic profile strips the clock, D8), so timing never enters a reproducible run.
+    let log_start = Instant::now();
+    let log_timing = params.profile == Profile::Full;
+
     // In-engine capability metric collectors (`http`/`s3` only); the driver-backed capabilities
     // record into the egress adapter, drained by the consumer.
     #[cfg(feature = "http")]
@@ -328,6 +501,21 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         sys::inject_sys(&qctx, params.sys_config).map_err(EngineError::internal)?;
         inject_emit(&qctx, &effects, params.max_ops, params.max_emit_kind_len)
             .map_err(EngineError::internal)?;
+        // `log.*` is injected under both profiles (D8) — logging a deterministic run is allowed;
+        // only the timing is withheld there. The floor + D7 bounds ride in via `LogLimits`.
+        inject_log(
+            &qctx,
+            &logs,
+            LogLimits {
+                floor: params.log_level,
+                max_entries: params.max_log_entries,
+                max_entry_bytes: params.max_log_entry_bytes,
+                max_total_bytes: params.max_log_total_bytes,
+            },
+            log_start,
+            log_timing,
+        )
+        .map_err(EngineError::internal)?;
         // The capability mux + its wrappers are I/O, so gated to `Profile::Full` exactly like the
         // in-engine capabilities — the boundary is enforced here, never trusted to the caller's
         // `Invocation` (D9: the deterministic profile removes this authority, it is not gated).
@@ -367,6 +555,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     Ok(ExecResult {
         outcome,
         effects: drain_effects(&effects),
+        logs: drain_logs(&logs),
         #[cfg(feature = "http")]
         http_metrics: sandbox::drain(http_collector.as_ref()),
         #[cfg(feature = "s3")]
@@ -580,6 +769,159 @@ fn inject_emit(
     )?;
     drop(wrapper);
     Ok(())
+}
+
+/// The `{"truncated":true}` property marker substituted for an oversize entry's real properties
+/// (D7), analogous to Cloudflare Workers' `$cloudflare.truncated`.
+const LOG_TRUNCATED_MARKER: &str = "{\"truncated\":true}";
+
+/// Injects the `log.*` diagnostic channel.
+///
+/// Registers the native `__log(level, template, properties_json, message)` sink plus the
+/// `__logFloor` numeric floor the JS wrapper (`js/log.js`) checks *before* serializing (D6 — a
+/// below-floor call is near-free). Each accepted call captures a structured entry into the
+/// per-invocation `logs` buffer under the D7 triad (count / per-entry / total bounds), assigning a
+/// monotonic `seq` and, under the full profile, a relative `offset_us`. The core surfaces the
+/// structure but never interprets a log's meaning; routing to a sink is the consumer's job
+/// (edge-side).
+fn inject_log(
+    qctx: &Ctx<'_>,
+    logs: &LogBuffer,
+    limits: LogLimits,
+    start: Instant,
+    record_timing: bool,
+) -> Result<(), rquickjs::Error> {
+    // The numeric level floor the JS wrapper compares against before building an entry (D6).
+    qctx.globals()
+        .set("__logFloor", i32::from(limits.floor.ordinal()))?;
+    let buffer = Arc::clone(logs);
+    let log_fn = Function::new(
+        qctx.clone(),
+        move |level: String,
+              template: String,
+              properties_json: String,
+              message: String|
+              -> String {
+            // The wrapper always passes a valid lowercase level; fall back to `info` defensively.
+            let parsed_level = LogLevel::parse(&level).unwrap_or(LogLevel::Info);
+            let offset_us = record_timing.then(|| start.elapsed().as_micros());
+            match buffer.lock() {
+                Ok(mut acc) => {
+                    capture_log(
+                        &mut acc,
+                        &limits,
+                        PendingLog {
+                            level: parsed_level,
+                            template,
+                            properties_json,
+                            message,
+                            offset_us,
+                        },
+                    );
+                    String::new()
+                }
+                Err(_poisoned) => "log buffer unavailable".to_owned(),
+            }
+        },
+    )?
+    .with_name("__log")?;
+    qctx.globals().set("__log", log_fn)?;
+    let wrapper: JsValue<'_> = qctx.eval(LOG_WRAPPER)?;
+    drop(wrapper);
+    Ok(())
+}
+
+/// Captures one accepted `log` call into the accumulator under the D7 triad.
+///
+/// A call beyond the count cap, or one whose size would push the running total past
+/// `max_total_bytes` (the total binds first), is silently dropped (records nothing, never errors —
+/// the execution is otherwise unaffected). An entry over `max_entry_bytes` is truncated: its
+/// properties become the `{"truncated":true}` marker and its message is trimmed to a char boundary
+/// within the per-entry budget.
+fn capture_log(acc: &mut LogAccumulator, limits: &LogLimits, pending: PendingLog) {
+    if acc.entries.len() >= limits.max_entries {
+        return; // count cap: drop, record nothing
+    }
+    let PendingLog {
+        level,
+        template,
+        properties_json,
+        message,
+        offset_us,
+    } = pending;
+    let raw_size = template
+        .len()
+        .saturating_add(properties_json.len())
+        .saturating_add(message.len());
+    let (props, msg) = if raw_size > limits.max_entry_bytes {
+        // Truncate: replace the properties with the marker and trim the message to fit the
+        // per-entry budget left after the template + marker.
+        let budget = limits
+            .max_entry_bytes
+            .saturating_sub(template.len())
+            .saturating_sub(LOG_TRUNCATED_MARKER.len());
+        (
+            LOG_TRUNCATED_MARKER.to_owned(),
+            truncate_on_char_boundary(&message, budget),
+        )
+    } else {
+        (properties_json, message)
+    };
+    let entry_size = template
+        .len()
+        .saturating_add(props.len())
+        .saturating_add(msg.len());
+    if acc.total_bytes.saturating_add(entry_size) > limits.max_total_bytes {
+        return; // total cap (binds first): drop, record nothing
+    }
+    acc.total_bytes = acc.total_bytes.saturating_add(entry_size);
+    let seq = u64::try_from(acc.entries.len()).unwrap_or(u64::MAX);
+    acc.entries.push(RawLog {
+        level,
+        template,
+        properties_json: props,
+        message: msg,
+        seq,
+        offset_us,
+    });
+}
+
+/// Truncates `text` to at most `max_bytes` bytes, ending on a UTF-8 char boundary so the result is
+/// always valid. Returns the whole string when it already fits.
+fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text.get(..end).unwrap_or("").to_owned()
+}
+
+/// Drains the per-invocation `log` buffer into public [`LogEntry`]s. Each `properties_json` was
+/// produced by `JSON.stringify` (or is the truncation marker), so it parses; a (theoretically
+/// impossible) parse failure drops that entry rather than aborting the outcome. Runs after
+/// execution on both paths (capture-on-failure, D8).
+fn drain_logs(logs: &LogBuffer) -> Vec<LogEntry> {
+    let Ok(acc) = logs.lock() else {
+        return Vec::new();
+    };
+    acc.entries
+        .iter()
+        .filter_map(|raw| {
+            RawValue::from_string(raw.properties_json.clone())
+                .ok()
+                .map(|properties| LogEntry {
+                    level: raw.level,
+                    template: raw.template.clone(),
+                    properties,
+                    message: raw.message.clone(),
+                    seq: raw.seq,
+                    offset_us: raw.offset_us,
+                })
+        })
+        .collect()
 }
 
 /// Injects the capability mux (`io.call` via `__io`) plus each enabled registered capability's
@@ -1149,6 +1491,10 @@ mod bytecode_cache_tests {
             egress: None,
             max_ops: 64,
             max_emit_kind_len: 64,
+            log_level: super::LogLevel::Info,
+            max_log_entries: 256,
+            max_log_entry_bytes: 256 * 1024,
+            max_log_total_bytes: 1024 * 1024,
             max_output_size: 0,
             allow_private_targets: false,
         }
@@ -1337,6 +1683,10 @@ mod egress_tests {
             egress,
             max_ops: 8,
             max_emit_kind_len: 64,
+            log_level: super::LogLevel::Info,
+            max_log_entries: 256,
+            max_log_entry_bytes: 256 * 1024,
+            max_log_total_bytes: 1024 * 1024,
             max_output_size: 0,
             allow_private_targets: false,
         }
@@ -1710,6 +2060,10 @@ mod emit_tests {
             egress: None,
             max_ops: 8,
             max_emit_kind_len: 64,
+            log_level: super::LogLevel::Info,
+            max_log_entries: 256,
+            max_log_entry_bytes: 256 * 1024,
+            max_log_total_bytes: 1024 * 1024,
             max_output_size: 0,
             allow_private_targets: false,
             #[cfg(feature = "http")]
@@ -1815,5 +2169,237 @@ mod emit_tests {
             "an over-length kind throws"
         );
         assert!(exec.effects.is_empty(), "no effect recorded");
+    }
+}
+
+/// `log.*` diagnostic channel — structured capture, the level floor, bound context, the D7 bounds,
+/// capture-on-failure, and the determinism/timing split. Compiled in every build (`log` is injected
+/// regardless of `_io`), so the `ExecParams` builder mirrors the cfg-gated in-engine fields.
+#[cfg(test)]
+mod log_tests {
+    use super::{ExecOutcome, ExecParams, ExecResult, LogLevel, Profile, run};
+    use rquickjs::Runtime;
+    use std::time::Duration;
+
+    /// Small per-execution log bounds for the bound tests (5 entries, 200 B/entry, 500 B total).
+    struct LogCaps {
+        /// Level floor.
+        floor: LogLevel,
+        /// Count cap.
+        entries: usize,
+        /// Per-entry byte cap.
+        entry_bytes: usize,
+        /// Total byte cap.
+        total_bytes: usize,
+    }
+
+    impl LogCaps {
+        /// Production-like caps at the `info` floor.
+        const fn info() -> Self {
+            Self {
+                floor: LogLevel::Info,
+                entries: 256,
+                entry_bytes: 256 * 1024,
+                total_bytes: 1024 * 1024,
+            }
+        }
+    }
+
+    /// Runs `script` under `profile` with the given caps, returning the full [`ExecResult`].
+    fn run_logs(script: &str, profile: Profile, caps: &LogCaps) -> ExecResult {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let params = ExecParams {
+            runtime: &runtime,
+            bytecode_cache: None,
+            cache_namespace: None,
+            script,
+            context_json: "{}",
+            timeout: Duration::from_secs(5),
+            profile,
+            #[cfg(feature = "http")]
+            allowed_hosts: &[],
+            #[cfg(feature = "s3")]
+            s3_config: None,
+            sys_config: None,
+            registry: None,
+            enabled_io: &[],
+            egress: None,
+            max_ops: 64,
+            max_emit_kind_len: 64,
+            log_level: caps.floor,
+            max_log_entries: caps.entries,
+            max_log_entry_bytes: caps.entry_bytes,
+            max_log_total_bytes: caps.total_bytes,
+            max_output_size: 0,
+            allow_private_targets: false,
+            #[cfg(feature = "http")]
+            wildcard_hosts_allowed: false,
+        };
+        run(&params).unwrap_or_else(|_err| unreachable!("engine ran"))
+    }
+
+    /// 4.1 — `log.info` records a structured entry (level, template, properties, rendered message,
+    /// seq); order is preserved with strictly increasing `seq`.
+    #[test]
+    fn records_structured_entries_in_order() {
+        let exec = run_logs(
+            "function handler() { \
+               log.info(\"charged {user} {amount}\", { user: 42, amount: \"10.00\" }); \
+               log.warn(\"second\"); \
+               log.error(\"third\"); \
+               return json(1); }",
+            Profile::Full,
+            &LogCaps::info(),
+        );
+        assert_eq!(exec.logs.len(), 3, "three entries recorded");
+        let first = &exec.logs[0];
+        assert_eq!(first.level, LogLevel::Info);
+        assert_eq!(first.template, "charged {user} {amount}");
+        assert_eq!(first.message, "charged 42 10.00", "template rendered");
+        assert!(
+            first.properties.get().contains("\"user\":42")
+                && first.properties.get().contains("\"amount\":\"10.00\""),
+            "properties carried: {}",
+            first.properties.get()
+        );
+        assert_eq!(
+            [exec.logs[0].seq, exec.logs[1].seq, exec.logs[2].seq],
+            [0, 1, 2],
+            "seq is strictly increasing in call order"
+        );
+    }
+
+    /// 4.2 — a below-floor `log.debug` records nothing (floor is `info`).
+    #[test]
+    fn below_floor_records_nothing() {
+        let exec = run_logs(
+            "function handler() { log.debug(\"x\", { a: 1 }); log.trace(\"y\"); return json(1); }",
+            Profile::Full,
+            &LogCaps::info(),
+        );
+        assert!(exec.logs.is_empty(), "below-floor calls record no entries");
+    }
+
+    /// An at-or-above-floor call is recorded.
+    #[test]
+    fn at_floor_records() {
+        let exec = run_logs(
+            "function handler() { log.warn(\"careful\"); return json(1); }",
+            Profile::Full,
+            &LogCaps::info(),
+        );
+        assert_eq!(exec.logs.len(), 1);
+        assert_eq!(exec.logs[0].level, LogLevel::Warn);
+    }
+
+    /// 4.3 — `log.with(ctx)` merges bound context into subsequent entries, with per-call keys
+    /// overriding the bound value (OQ3).
+    #[test]
+    fn bound_context_merges_and_call_overrides() {
+        let exec = run_logs(
+            "function handler() { \
+               var l = log.with({ order: 7, tier: \"a\" }); \
+               l.info(\"done\", { ok: true, tier: \"b\" }); \
+               return json(1); }",
+            Profile::Full,
+            &LogCaps::info(),
+        );
+        assert_eq!(exec.logs.len(), 1);
+        let props = exec.logs[0].properties.get();
+        assert!(
+            props.contains("\"order\":7"),
+            "bound field present: {props}"
+        );
+        assert!(
+            props.contains("\"ok\":true"),
+            "per-call field present: {props}"
+        );
+        assert!(
+            props.contains("\"tier\":\"b\""),
+            "per-call key overrides bound: {props}"
+        );
+    }
+
+    /// 4.4a — exceeding the per-execution count cap drops further entries (execution unaffected).
+    #[test]
+    fn count_cap_drops_further_entries() {
+        let caps = LogCaps {
+            entries: 3,
+            ..LogCaps::info()
+        };
+        let exec = run_logs(
+            "function handler() { for (var i = 0; i < 10; i++) log.info(\"n\", { i: i }); \
+               return json(\"ok\"); }",
+            Profile::Full,
+            &caps,
+        );
+        assert_eq!(exec.logs.len(), 3, "capped at the count limit");
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Success(_)),
+            "over-cap logging does not fail the run"
+        );
+    }
+
+    /// 4.4b — an oversize entry is truncated with a `{"truncated":true}` marker rather than dropped.
+    #[test]
+    fn oversize_entry_is_truncated() {
+        let caps = LogCaps {
+            entry_bytes: 128,
+            ..LogCaps::info()
+        };
+        let exec = run_logs(
+            "function handler() { log.info(\"big {blob}\", { blob: \"y\".repeat(500) }); \
+               return json(1); }",
+            Profile::Full,
+            &caps,
+        );
+        assert_eq!(exec.logs.len(), 1, "the oversize entry is kept (truncated)");
+        assert!(
+            exec.logs[0].properties.get().contains("truncated"),
+            "carries the truncation marker: {}",
+            exec.logs[0].properties.get()
+        );
+    }
+
+    /// 4.5 — a handler that logs then throws still carries the entries (capture-on-failure).
+    #[test]
+    fn logs_survive_a_handler_throw() {
+        let exec = run_logs(
+            "function handler() { log.info(\"step 1\"); throw new Error(\"boom\"); }",
+            Profile::Full,
+            &LogCaps::info(),
+        );
+        assert!(
+            matches!(exec.outcome, ExecOutcome::Error(_)),
+            "the handler threw"
+        );
+        assert_eq!(exec.logs.len(), 1, "the pre-throw entry is retained");
+        assert_eq!(exec.logs[0].message, "step 1");
+    }
+
+    /// 4.6 — a deterministic run carries `seq` but no timing; a full-profile run may carry
+    /// `offset_us`; `data` is byte-identical across two deterministic runs regardless of logging.
+    #[test]
+    fn determinism_seq_without_timing() {
+        let script = "function handler() { log.info(\"tick\"); return json({ n: 1 }); }";
+        let det_a = run_logs(script, Profile::Deterministic, &LogCaps::info());
+        let det_b = run_logs(script, Profile::Deterministic, &LogCaps::info());
+        assert_eq!(det_a.logs.len(), 1);
+        assert_eq!(det_a.logs[0].seq, 0, "seq present under determinism");
+        assert!(
+            det_a.logs[0].offset_us.is_none(),
+            "no wall-clock timing under the deterministic profile"
+        );
+        let (ExecOutcome::Success(a), ExecOutcome::Success(b)) = (&det_a.outcome, &det_b.outcome)
+        else {
+            unreachable!("both deterministic runs succeed");
+        };
+        assert_eq!(a, b, "data is byte-identical across deterministic runs");
+
+        let full = run_logs(script, Profile::Full, &LogCaps::info());
+        assert!(
+            full.logs[0].offset_us.is_some(),
+            "the full profile attaches a relative timing offset"
+        );
     }
 }
