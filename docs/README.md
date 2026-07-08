@@ -12,7 +12,8 @@ Imagine a little **robot in a box** 🤖. You hand the robot:
 The robot does the work _inside the box_ (so it can never make a mess on your
 computer), and hands you back an **answer**. That's it!
 
-You talk to the robot by sending a message to `POST /execute`.
+You talk to the robot by sending a message to `POST /execute`. To send **many jobs at
+once** — each answered on its own, one bad job never spoils the others — use `POST /batch`.
 
 ## Start here 👇
 

@@ -129,6 +129,24 @@ def _post_status(url: str, body: dict, headers: dict | None = None):
         return None, None
 
 
+def _post_batch(items: list, headers: dict | None = None) -> dict | None:
+    """POST a list of items to `/batch`; returns the parsed body — `{results, meta}` on an
+    admitted batch, or a batch-level `{data, error, meta}` envelope on a 400 (empty/caps/malformed).
+    Hides the HTTP status like `_post` (partial failure is a 200 with per-item errors)."""
+    data = json.dumps({"items": items}).encode()
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(f"{BASE_URL}/batch", data=data, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return _parse_response(resp.getcode(), resp.read())
+    except urllib.error.HTTPError as err:
+        return _parse_response(err.code, err.read())
+    except Exception:
+        return None
+
+
 def _parse_response(status: int, raw: bytes) -> dict:
     """Parse a server response. A well-formed jsbox response is the JSON envelope; a
     non-JSON body (e.g. axum's plain-text deserialize rejection) is surfaced as a
@@ -910,6 +928,106 @@ def test_partition_fairness(t: Runner):
            lambda _r: r3 is not None and r3.get("meta", {}).get("partition") == "header-wins")
 
 
+def test_batch(t: Runner):
+    """POST /batch: order preservation + per-item id echo, partial-failure isolation, item
+    isolation, batch-level caps (empty / over-max / malformed item), and the D6 response-size
+    truncation. Per-item quota/authz (trusted mode) are covered by the Rust unit tests; this
+    section exercises the non-trusted, deterministic surface end-to-end."""
+    t.section("Batch endpoint (/batch)")
+
+    def results_of(resp):
+        return resp.get("results", []) if isinstance(resp, dict) else []
+
+    # Order preservation + per-item id echo.
+    resp = _post_batch([
+        {"script": "function handler(){ return json(1, null); }", "id": "a"},
+        {"script": "function handler(){ return json(2, null); }", "id": "b"},
+        {"script": "function handler(){ return json(3, null); }", "id": "c"},
+    ])
+    rs = results_of(resp)
+    t.check("results preserve order and echo per-item id",
+            [r.get("data") for r in rs] == [1, 2, 3]
+            and [r.get("id") for r in rs] == ["a", "b", "c"]
+            and resp.get("meta", {}).get("items") == 3
+            and resp.get("meta", {}).get("ok") == 3)
+
+    # Partial failure is isolated — a throwing item errors, the others still succeed; still 200.
+    resp = _post_batch([
+        {"script": "function handler(){ return json(1, null); }"},
+        {"script": "function handler(){ throw new Error('boom'); }"},
+        {"script": "function handler(){ return json(3, null); }"},
+    ])
+    rs = results_of(resp)
+    t.check("partial failure is isolated (one item errors, the rest succeed)",
+            len(rs) == 3
+            and rs[0].get("data") == 1
+            and rs[1].get("error") is not None
+            and rs[2].get("data") == 3
+            and resp.get("meta", {}).get("ok") == 2
+            and resp.get("meta", {}).get("failed") == 1)
+
+    # Each item runs in a fresh global scope.
+    resp = _post_batch([
+        {"script": "globalThis.leak = 42; function handler(){ return json('set', null); }"},
+        {"script": "function handler(){ return json(typeof globalThis.leak, null); }"},
+    ])
+    rs = results_of(resp)
+    t.check("items are isolated (a global set by one is invisible to another)",
+            len(rs) == 2 and rs[1].get("data") == "undefined")
+
+    # Per-item envelope is the single-execute envelope (data/error/meta keys).
+    resp = _post_batch([{"script": "function handler(){ return json(7, null); }"}])
+    rs = results_of(resp)
+    t.check("per-item envelope carries data/error/meta",
+            len(rs) == 1 and set(rs[0].keys()) >= {"data", "error", "meta"} and rs[0]["data"] == 7)
+
+    # Empty batch → batch-level 400.
+    t.check("empty batch is rejected (EMPTY_BATCH)",
+            _err_code(_post_batch([])) == "EMPTY_BATCH")
+
+    # Over the item cap (default 25) → batch-level 400 before any item runs.
+    over = [{"script": "function handler(){ return json(1, null); }"} for _ in range(26)]
+    t.check("over-max batch is rejected (BATCH_TOO_LARGE)",
+            _err_code(_post_batch(over)) == "BATCH_TOO_LARGE")
+
+    # Malformed item (both script and key) fails only itself.
+    resp = _post_batch([
+        {"script": "function handler(){ return json(1, null); }", "key": "also-a-key"},
+        {"script": "function handler(){ return json(2, null); }"},
+    ])
+    rs = results_of(resp)
+    t.check("malformed item fails only itself (SCRIPT_XOR_KEY)",
+            len(rs) == 2 and _err_code(rs[0]) == "SCRIPT_XOR_KEY" and rs[1].get("data") == 2)
+
+    # D6: an item that would push the response past the cap is truncated to a size-limit envelope
+    # (the harness box sets a small batch.max_response_bytes) — the earlier item still returns.
+    resp = _post_batch([
+        {"script": "function handler(){ return json(1, null); }"},
+        {"script": "function handler(){ return json('x'.repeat(5000), null); }"},
+    ])
+    rs = results_of(resp)
+    t.check("response-size cap truncates the offending item (BATCH_RESPONSE_TRUNCATED)",
+            len(rs) == 2 and rs[0].get("data") == 1
+            and _err_code(rs[1]) == "BATCH_RESPONSE_TRUNCATED")
+
+    # Fairness (D2): a large slow batch on one partition is bounded to its fair share of the pool and
+    # cannot starve a single request on another partition — the rest of the batch queues.
+    import concurrent.futures
+    slow_item = {"script": "function handler(){ var x=0; for(var i=0;i<20000000;i++){x+=i;} return json(x>0, null); }"}
+
+    def big_batch():
+        _post_batch([dict(slow_item) for _ in range(10)], headers={"X-Partition-Key": "batch-noisy"})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        bg = ex.submit(big_batch)
+        time.sleep(0.1)  # let the batch ramp and occupy its fair-share slots
+        good = _post({"script": "function handler(){ return json('ok', null); }"},
+                     headers={"X-Partition-Key": "batch-good"})
+        bg.result()
+    t.check("a large batch does not starve another partition's single request",
+            good is not None and good.get("data") == "ok")
+
+
 def test_metrics(t: Runner):
     """The /metrics endpoint exposes Prometheus counters/gauges that move with traffic."""
     t.section("Observability (/metrics)")
@@ -1517,6 +1635,9 @@ def _start_servers(resources: dict) -> list:
         "scripts_dir": os.path.join(repo, "tests", "scripts"),
         "modules_dir": merged_modules,
         "engine": {"max_concurrent_executions": 6, "max_concurrent_per_partition": 2},
+        # Small batch response cap so the /batch section can exercise the D6 truncation guard with
+        # cheap items; the item/input caps keep their generous defaults.
+        "batch": {"max_response_bytes": 4096},
     }
     if fabricd_bin is not None:
         box_cfg["fabricd_socket"] = socket
@@ -1822,6 +1943,7 @@ def main():
     test_isolation_under_concurrency(t)
     test_bulkhead(t)
     test_partition_fairness(t)
+    test_batch(t)
     test_metrics(t)
     test_esm(t)
     test_hasura(t)

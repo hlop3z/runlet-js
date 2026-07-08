@@ -101,6 +101,53 @@ bridge. On a **system-generated** failure, `error` is a structured envelope —
 branch on without parsing strings; `meta.trace_id` correlates it with server logs. See
 [`docs/99-errors.md`](docs/99-errors.md) for the full contract.
 
+### Batch execution
+
+```
+POST /batch
+```
+
+Runs many **independent** executions in one round-trip — the fit for per-row ETL, webhook
+fan-out, or bulk validation, where a user-space loop inside one handler would share one
+sandbox, one wall-clock budget, and one `meta`, so a single bad row kills the whole run.
+
+```json
+{
+  "items": [
+    { "script": "function handler(ctx){ return json(ctx.n * 2, null); }", "context": { "n": 21 }, "id": "row-1" },
+    { "key": "billing/price", "context": { "sku": "abc" }, "id": "row-2" }
+  ]
+}
+```
+
+```json
+{
+  "results": [
+    { "data": 42, "error": null, "meta": { "...": "..." }, "id": "row-1" },
+    { "data": null, "error": { "code": "..." }, "meta": { "...": "..." }, "id": "row-2" }
+  ],
+  "meta": { "items": 2, "ok": 1, "failed": 1, "duration_ms": 3, "trace_id": "..." }
+}
+```
+
+Each item is the same body shape as `/execute` (`script` **xor** `key`, optional `context`
+/ `config`) plus an optional client `id` echoed on its result for subset-retry. The
+contract:
+
+- **Independent, no atomicity.** Items don't share state, aren't ordered during execution,
+  and egress side effects are never rolled back. `results` preserves *request* order; there
+  is no `sequential` mode — an ordered multi-step flow belongs in one script.
+- **Partial failure is normal.** An admitted batch returns **HTTP 200**; a per-item failure
+  lands in `results[i].error` and is counted in `meta.failed`. Only batch-level rejections
+  (auth, malformed body, or the caps below) use a non-200 `{data, error, meta}` response.
+- **Per item, not per batch.** Each item passes the same validation, admission, per-tenant
+  quota, and — in trusted mode — capability authorization as a single request. A batch is N
+  requests in cost and accounting, never a way to slip an operation past a per-request gate.
+- **Bounded.** `batch.max_items` and `batch.max_input_bytes` bound the request (oversize ⇒
+  `400`); `batch.max_response_bytes` bounds the response — an item that would exceed it is
+  truncated to a `BATCH_RESPONSE_TRUNCATED` error envelope rather than buffered. A single
+  batch can occupy at most its partition's fair share of the runtime pool; the rest queue.
+
 ### Logical resources (`config.io`)
 
 Driver-backed capabilities are addressed by **logical name**, not inline connection
@@ -199,8 +246,8 @@ the output in. Authoring how-to: [`docs/modules.md`](docs/modules.md); design no
 
 ### Operational endpoints
 
-Besides `POST /execute`, the server exposes two unauthenticated read-only endpoints for
-liveness and scraping:
+Besides `POST /execute` (and its fan-out sibling `POST /batch`), the server exposes two
+unauthenticated read-only endpoints for liveness and scraping:
 
 ```
 GET /health    -> 200 "ok"

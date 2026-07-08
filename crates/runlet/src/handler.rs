@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task;
+use tokio::task::JoinSet;
 use tracing::field::Empty;
 use tracing::{Instrument as _, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -43,11 +44,11 @@ use runlet_wire::wire::WireInit;
 use runlet_wire::{BackendMetrics, Egress, MeteredEgress, ct_eq};
 
 use crate::authz::authorize_capabilities;
-use crate::config::TrustedHeaders;
+use crate::config::{BatchConfig, TrustedHeaders};
 use crate::events::{AuditBody, CapabilityOps, Event, EventBody, Sink, UsageBody};
 use crate::identity::TrustedIdentity;
 use crate::quota::{QuotaExceeded, QuotaGuard, TenantQuota};
-use crate::sidecar::{SessionError, SidecarEgress, SidecarTransport, connect_session};
+use crate::sidecar::{SessionConn, SessionError, SidecarEgress, SidecarTransport, connect_session};
 
 /// Shared application state for the router: the logic host, the script registry, and
 /// the concurrency bulkhead.
@@ -94,6 +95,9 @@ pub(crate) struct AppState {
     /// Live handle to the dropped-events counter, rendered as `runlet_events_dropped_total` (the
     /// backpressure signal). `None` when events are disabled.
     pub(crate) event_dropped: Option<Arc<AtomicU64>>,
+    /// `POST /batch` fan-out caps (item count + combined-input / total-response byte bounds). Copied
+    /// from server config; the single-`/execute` path never reads it.
+    pub(crate) batch: BatchConfig,
 }
 
 /// Resolved trusted-header-mode runtime state, shared into the handler. Present only when
@@ -402,37 +406,42 @@ fn raw_null_ref() -> &'static RawValue {
     &RAW_NULL
 }
 
-/// Maps a [`SessionError`] (opening the `fabricd` session) to a response: a resolution failure is
-/// the caller's `400`, an unreachable/absent sidecar is a retryable `503`, a protocol slip is a
-/// `500`.
-fn session_error_response(err: SessionError, meta: Meta) -> AxumResponse {
+/// Maps a [`SessionError`] (opening the `fabricd` session) to a `(status, envelope)` pair: a
+/// resolution failure is the caller's `400`, an unreachable/absent sidecar is a retryable `503`, a
+/// protocol slip is a `500`. Shared by the single-`/execute` response path and the per-item `/batch`
+/// path (which renders the envelope inside a `200` batch instead of setting the HTTP status).
+fn session_error_envelope(err: SessionError) -> (u16, ErrorEnvelope) {
     match err {
-        SessionError::Resolve { code, message } => {
-            system_error_response(request_error(&code, message), 400, meta)
-        }
-        SessionError::Unavailable(message) => {
-            let envelope = ErrorEnvelope::new(
+        SessionError::Resolve { code, message } => (400, request_error(&code, message)),
+        SessionError::Unavailable(message) => (
+            503,
+            ErrorEnvelope::new(
                 ErrorCategory::Runtime,
                 ErrorSource::Engine,
                 "EGRESS_UNAVAILABLE".to_owned(),
                 true,
                 ErrorOwner::Operator,
             )
-            .with_message(message);
-            system_error_response(envelope, 503, meta)
-        }
-        SessionError::Protocol(_raw) => {
-            let envelope = ErrorEnvelope::new(
+            .with_message(message),
+        ),
+        SessionError::Protocol(_raw) => (
+            500,
+            ErrorEnvelope::new(
                 ErrorCategory::Runtime,
                 ErrorSource::Engine,
                 "EGRESS_PROTOCOL".to_owned(),
                 false,
                 ErrorOwner::Operator,
             )
-            .with_message("egress protocol error".to_owned());
-            system_error_response(envelope, 500, meta)
-        }
+            .with_message("egress protocol error".to_owned()),
+        ),
     }
+}
+
+/// Maps a [`SessionError`] to the single-`/execute` HTTP response (status + envelope + meta).
+fn session_error_response(err: SessionError, meta: Meta) -> AxumResponse {
+    let (status, envelope) = session_error_envelope(err);
+    system_error_response(envelope, status, meta)
 }
 
 /// Adapts an axum [`HeaderMap`] to the `OTel` [`Extractor`] interface so the W3C
@@ -723,33 +732,84 @@ async fn run_execute(
         }
     };
 
-    // The blocking task wraps the pre-connected `fabricd` session as the egress, runs the
-    // invocation, then drains the session's metrics — the UDS round-trips and the drain `block_on`,
-    // which must run on the `spawn_blocking` thread, not a runtime worker. The driver metrics come
-    // back with the outcome and are folded into the response `meta.io` map by capability name.
-    let host = state.host.clone();
-    let handle = Handle::current();
-    let timeout = engine_cfg.timeout();
     // Namespace the bytecode cache by the fairness key — in trusted mode the trusted tenant id —
     // so byte-identical source from different tenants never shares an entry (no cross-tenant dedup
-    // / compile-timing leak). Cloned because the closure is `move` and `partition` is still needed
-    // for `meta` after the await.
+    // / compile-timing leak). Cloned because the shared core takes it by value and `partition` is
+    // still needed for `meta` after the await.
     let cache_ns = partition.clone();
-    let result = task::spawn_blocking(move || -> (Result<Outcome, EngineError>, BackendMetrics) {
+    let result = execute_blocking(ExecuteBlocking {
+        host: state.host.clone(),
+        handle: Handle::current(),
+        timeout: engine_cfg.timeout(),
+        session,
+        source,
+        context_json,
+        config,
+        cache_ns,
+    })
+    .await;
+
+    // Execution finished — free the bulkhead + per-partition permits for the next request.
+    drop(permit);
+    drop(partition_permit);
+
+    let exec_time_us = start.elapsed().as_micros();
+    let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
+        .with_key(key)
+        .with_partition(partition);
+    build_response(result, base_meta, error_debug, &state, identity.as_ref())
+}
+
+/// Inputs for the shared blocking-execution core (grouped so the call sites and the
+/// `spawn_blocking` closure stay within the argument-count lint).
+struct ExecuteBlocking {
+    /// The callable logic host (cloned per invocation; `Arc`-backed).
+    host: LogicHost,
+    /// Runtime handle to drive the sidecar socket I/O via `block_on` on the blocking thread.
+    handle: Handle,
+    /// Per-execution wall-clock budget bounding every egress round-trip.
+    timeout: Duration,
+    /// The pre-connected `fabricd` session, when the request named driver resources.
+    session: Option<SessionConn>,
+    /// The resolved script source (inline or registered).
+    source: ScriptSource,
+    /// Raw context JSON handed straight to `QuickJS`.
+    context_json: String,
+    /// Per-request capability configuration.
+    config: RequestConfig,
+    /// Bytecode-cache namespace (the fairness key) — keeps byte-identical source from different
+    /// tenants from sharing a cache entry.
+    cache_ns: Option<String>,
+}
+
+/// Runs one invocation to completion on a blocking thread — the shared execute core for `/execute`
+/// and each `/batch` item. Wraps the pre-connected `fabricd` session as the egress, runs the
+/// invocation under the full-capability profile, then drains the session's driver metrics (the
+/// round-trips + drain `block_on` must run on the `spawn_blocking` thread, never a runtime worker).
+async fn execute_blocking(
+    params: ExecuteBlocking,
+) -> Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError> {
+    let ExecuteBlocking {
+        host,
+        handle,
+        timeout,
+        session,
+        source,
+        context_json,
+        config,
+        cache_ns,
+    } = params;
+    task::spawn_blocking(move || -> (Result<Outcome, EngineError>, BackendMetrics) {
         let adapter =
             session.map(|conn| Arc::new(SidecarEgress::new(conn, handle.clone(), timeout)));
         let egress: Option<Arc<dyn Egress>> = adapter.as_ref().map(|metered| {
-            // Upcast `Arc<SidecarEgress>` → `Arc<dyn Egress>`; the turbofish pins the source
-            // type so the clone resolves before the coercion (the original `adapter` stays for
-            // draining).
+            // Upcast `Arc<SidecarEgress>` → `Arc<dyn Egress>`; the turbofish pins the source type so
+            // the clone resolves before the coercion (the original `adapter` stays for draining).
             let dynamic: Arc<dyn Egress> = Arc::<SidecarEgress>::clone(metered);
             dynamic
         });
-        // `Invocation` is `#[non_exhaustive]`; build via the constructor + builder setters. The
-        // HTTP front always runs the full-capability profile (the default) with no read-hook,
-        // so only `caps`, the egress port, and the cache namespace differ from the defaults. The
-        // enabled driver-capability names drive registry wrapper injection; their calls route to
-        // the per-request sidecar egress (the mux fallback).
+        // The HTTP front always runs the full-capability profile (the default) with no read-hook, so
+        // only `caps`, the egress port, and the cache namespace differ from the defaults.
         let enabled_io = config.io.enabled_names();
         let caps = CapabilitySet {
             allowed_hosts: &config.allowed_hosts,
@@ -769,17 +829,705 @@ async fn run_execute(
             adapter.map_or_else(BackendMetrics::default, |metered| metered.drain_metrics());
         (outcome, metrics)
     })
+    .await
+}
+
+// ===== POST /batch — independent per-item fan-out over the single-execute machinery =====
+
+/// A `/batch` request body: an ordered list of independent items. No atomicity, no cross-item
+/// ordering guarantee during execution — only the results array preserves request order.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BatchRequest {
+    /// The items to execute (validated for count/size before any admission).
+    #[serde(default)]
+    items: Vec<BatchItem>,
+}
+
+/// One `/batch` item — the single-execute body shape plus an optional client `id` echoed back on its
+/// result (D7). No per-item `partition`: fairness is keyed off the request's tenant/partition, shared
+/// across all items so a caller cannot split its fairness bucket.
+#[derive(Debug, Deserialize)]
+struct BatchItem {
+    /// Inline JavaScript source (exactly one of `script` / `key`).
+    #[serde(default)]
+    script: Option<String>,
+    /// Registered-script key (exactly one of `script` / `key`).
+    #[serde(default)]
+    key: Option<String>,
+    /// Raw context passed straight to `QuickJS`.
+    #[serde(default = "default_context")]
+    context: Box<RawValue>,
+    /// Per-item configuration (capabilities, `io`).
+    #[serde(default)]
+    config: RequestConfig,
+    /// Optional client correlation id, echoed on the result for subset-retry (D7).
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// The `/batch` response: order-preserving per-item envelopes + a batch-level summary.
+#[derive(Debug, Serialize)]
+struct BatchResponse {
+    /// One rendered `{data, error, meta, id?}` envelope per item, in request order.
+    results: Vec<Box<RawValue>>,
+    /// Batch-level summary.
+    meta: BatchMeta,
+}
+
+/// Batch-level summary metadata (per-item timing/metrics live in each `results[i].meta`).
+#[derive(Debug, Serialize)]
+struct BatchMeta {
+    /// Number of items in the batch.
+    items: usize,
+    /// Items that executed successfully (engine success).
+    ok: usize,
+    /// Items that failed (rejected, engine error, or truncated).
+    failed: usize,
+    /// Wall-clock duration of the whole batch fan-out, milliseconds.
+    duration_ms: u128,
+    /// The batch correlation id — shared by every item's `meta.trace_id`.
+    trace_id: String,
+}
+
+/// A fully-rendered batch item: its serialized `{data, error, meta, id?}` JSON plus whether it
+/// counted as a success (for the batch `meta.ok/failed` summary).
+struct RenderedItem {
+    /// Serialized item envelope (owned, valid JSON text).
+    body: String,
+    /// `true` iff the item executed successfully (engine success, not a rejection/error/truncation).
+    ok: bool,
+}
+
+impl RenderedItem {
+    /// Serialized byte length — the unit the D6 total-response cap sums.
+    const fn bytes(&self) -> usize {
+        self.body.len()
+    }
+}
+
+/// A serialized system-error item: `{ data: null, error, meta, id? }`.
+#[derive(Serialize)]
+struct ItemErrorEnvelope<'a> {
+    /// Always `null` on a per-item system error.
+    data: Option<()>,
+    /// The structured error envelope.
+    error: &'a ErrorEnvelope,
+    /// Per-item metadata.
+    meta: &'a Meta,
+    /// The echoed client id, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+}
+
+/// A serialized success item: `{ data, error, meta, id? }` (data/error borrowed from the JS output).
+#[derive(Serialize)]
+struct ItemSuccessEnvelope<'a> {
+    /// The JS handler's `data` (zero-copy borrow).
+    data: &'a RawValue,
+    /// The JS handler's `error` (zero-copy borrow; the application-level error passthrough).
+    error: &'a RawValue,
+    /// Per-item metadata.
+    meta: &'a Meta,
+    /// The echoed client id, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+}
+
+/// `POST /batch` — execute a list of independent items, one rendered `{data, error, meta}` envelope
+/// each, order-preserving. Batch-level failures (auth, identity, malformed body, caps) use non-200;
+/// an admitted batch always returns `200` with per-item envelopes (design D4).
+pub(crate) async fn batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<BatchRequest>, JsonRejection>,
+) -> AxumResponse {
+    let span = build_request_span(&headers);
+    run_batch(state, headers, payload).instrument(span).await
+}
+
+/// The `/batch` request pipeline: batch-level gates (auth → identity → parse → caps), then a bounded
+/// concurrent fan-out over the items, then order-preserving assembly with the D6 response-size cap.
+async fn run_batch(
+    state: AppState,
+    headers: HeaderMap,
+    payload: Result<Json<BatchRequest>, JsonRejection>,
+) -> AxumResponse {
+    // Edge service credential (defense in depth) — reject the whole batch before any body work.
+    if let Some(rejected) = enforce_auth(&state, &headers) {
+        return rejected;
+    }
+    let trace_id = current_trace_id();
+    // Trusted-identity ingress applies to the whole batch: every item shares this request's tenant.
+    let identity = match resolve_identity(&state, &headers, &trace_id) {
+        Ok(identity) => identity,
+        Err(rejected) => {
+            state.metrics.record_rejection();
+            return *rejected;
+        }
+    };
+    record_identity_attrs(identity.as_ref());
+
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            state.metrics.record_rejection();
+            emit_denied(
+                &state,
+                identity.as_ref(),
+                &trace_id,
+                "MALFORMED_REQUEST",
+                None,
+            );
+            return malformed_batch_response(&state, &rejection);
+        }
+    };
+    let items = req.items;
+
+    // Batch-level caps (D3), before any item is admitted or executed.
+    if let Err(rejected) = validate_batch(&state, &items, identity.as_ref(), &trace_id) {
+        state.metrics.record_rejection();
+        return *rejected;
+    }
+
+    // Shared fairness/partition key (request-level): the trusted tenant in trusted mode, else the
+    // caller-asserted header. Every item keys off this — a batch cannot split its fairness bucket.
+    let partition = resolve_partition(identity.as_ref(), header_partition(&headers));
+
+    let start = Instant::now();
+    let count = items.len();
+    // Bound this batch's concurrency to its fair share so it cannot monopolize the pool (D2): the
+    // per-partition ceiling when fairness is on, else the global bulkhead capacity. Items beyond the
+    // ceiling queue on this gate rather than fast-failing (unlike single `/execute`).
+    let gate = Arc::new(Semaphore::new(batch_ceiling(&state)));
+    let mut set: JoinSet<(usize, RenderedItem)> = JoinSet::new();
+    for (index, item) in items.into_iter().enumerate() {
+        let task_state = state.clone();
+        let task_gate = Arc::clone(&gate);
+        let task_identity = identity.clone();
+        let task_partition = partition.clone();
+        let task_trace = trace_id.clone();
+        let _abort = set.spawn(async move {
+            let rendered = run_batch_item(BatchItemCtx {
+                state: &task_state,
+                gate: task_gate,
+                identity: task_identity.as_ref(),
+                partition: task_partition.as_deref(),
+                trace_id: &task_trace,
+                item,
+            })
+            .await;
+            (index, rendered)
+        });
+    }
+
+    // Collect into positional slots so the results array preserves request order regardless of
+    // completion order. A slot left empty (a task that somehow panicked) is filled defensively.
+    let mut slots: Vec<Option<RenderedItem>> = (0..count).map(|_idx| None).collect();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((index, rendered)) = joined
+            && let Some(slot) = slots.get_mut(index)
+        {
+            *slot = Some(rendered);
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis();
+    assemble_batch(slots, trace_id, duration_ms, state.batch.max_response_bytes)
+}
+
+/// This batch's concurrency ceiling: the per-partition fair share when fairness is enabled, else the
+/// global bulkhead capacity. Never exceeds the bulkhead capacity, always ≥1.
+fn batch_ceiling(state: &AppState) -> usize {
+    let per_partition = state.engine_cfg.max_concurrent_per_partition;
+    let ceiling = if per_partition > 0 {
+        per_partition
+    } else {
+        state.bulkhead_capacity
+    };
+    ceiling.min(state.bulkhead_capacity).max(1)
+}
+
+/// Batch-level caps enforced before any admission (D3): non-empty, within `max_items`, and combined
+/// input bytes within `max_input_bytes`. Returns the ready `400` response on violation, emitting the
+/// denied audit at each gate.
+fn validate_batch(
+    state: &AppState,
+    items: &[BatchItem],
+    identity: Option<&TrustedIdentity>,
+    trace_id: &str,
+) -> Result<(), Box<AxumResponse>> {
+    if items.is_empty() {
+        emit_denied(state, identity, trace_id, "EMPTY_BATCH", None);
+        return Err(Box::new(batch_level_error(
+            "EMPTY_BATCH",
+            "batch must contain at least one item".to_owned(),
+            trace_id,
+        )));
+    }
+    if items.len() > state.batch.max_items {
+        emit_denied(state, identity, trace_id, "BATCH_TOO_LARGE", None);
+        return Err(Box::new(batch_level_error(
+            "BATCH_TOO_LARGE",
+            format!(
+                "batch has {} items, exceeding the limit of {}",
+                items.len(),
+                state.batch.max_items
+            ),
+            trace_id,
+        )));
+    }
+    let combined = items
+        .iter()
+        .map(batch_item_input_bytes)
+        .fold(0_usize, usize::saturating_add);
+    if combined > state.batch.max_input_bytes {
+        emit_denied(state, identity, trace_id, "BATCH_INPUT_TOO_LARGE", None);
+        return Err(Box::new(batch_level_error(
+            "BATCH_INPUT_TOO_LARGE",
+            format!(
+                "combined input {combined} bytes exceeds the limit of {}",
+                state.batch.max_input_bytes
+            ),
+            trace_id,
+        )));
+    }
+    Ok(())
+}
+
+/// One item's request-body input size: inline script length (0 for a `key` — the registered source
+/// is resolved and sized per item) plus context length. Sums to the combined-input cap.
+fn batch_item_input_bytes(item: &BatchItem) -> usize {
+    let script = item.script.as_ref().map_or(0, String::len);
+    script.saturating_add(item.context.get().len())
+}
+
+/// A batch-level `400` response (malformed body / caps): the single `{data:null, error, meta}`
+/// envelope with the batch trace id — batch-level rejections are non-200 (design D4).
+fn batch_level_error(code: &str, message: String, trace_id: &str) -> AxumResponse {
+    system_error_response(
+        request_error(code, message),
+        400,
+        Meta::new(trace_id.to_owned(), 0, 0, 0),
+    )
+}
+
+/// The structured `400` for a `/batch` body that failed to parse (bad JSON / wrong types / oversize).
+fn malformed_batch_response(state: &AppState, rejection: &JsonRejection) -> AxumResponse {
+    let trace_id = Uuid::new_v4().to_string();
+    let base = request_error(
+        "MALFORMED_REQUEST",
+        "request body is not valid for /batch".to_owned(),
+    );
+    let envelope = if state.error_debug {
+        base.with_debug(ErrorDebug {
+            stack: None,
+            raw: Some(rejection.body_text()),
+        })
+    } else {
+        base
+    };
+    system_error_response(envelope, 400, Meta::new(trace_id, 0, 0, 0))
+}
+
+/// Inputs for running one batch item (grouped to stay within the argument-count lint).
+struct BatchItemCtx<'a> {
+    /// Shared application state.
+    state: &'a AppState,
+    /// This batch's fair-share concurrency gate.
+    gate: Arc<Semaphore>,
+    /// The request's trusted identity (shared across items), if any.
+    identity: Option<&'a TrustedIdentity>,
+    /// The request's fairness/cache key (shared across items).
+    partition: Option<&'a str>,
+    /// The batch correlation id (every item's `meta.trace_id`).
+    trace_id: &'a str,
+    /// The item to run.
+    item: BatchItem,
+}
+
+/// Runs one batch item through the same per-request machinery as `/execute`, rendering a per-item
+/// envelope instead of an HTTP status: resolve script → validate size → per-item authz (D5) →
+/// per-item quota debit (D5) → open session → admit (queue) → execute → render. Every security gate
+/// is the exact function `/execute` uses, evaluated per item — never once for the batch.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear per-item pipeline mirroring run_execute: resolve → validate → authz → quota → session → admit → execute → render"
+)]
+async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
+    let BatchItemCtx {
+        state,
+        gate,
+        identity,
+        partition,
+        trace_id,
+        item,
+    } = ctx;
+    let BatchItem {
+        script,
+        key,
+        context,
+        config,
+        id,
+    } = item;
+    let id_ref = id.as_deref();
+    let context_bytes = context.get().len();
+
+    // Resolve exactly one of script/key.
+    let source = match resolve_script(script, key.as_deref(), &state.registry) {
+        Ok(source) => source,
+        Err(boxed) => {
+            let (_status, envelope) = *boxed;
+            emit_denied(state, identity, trace_id, "SCRIPT_NOT_FOUND", None);
+            let meta = base_error_meta(trace_id, 0, context_bytes, key.as_deref(), partition);
+            return render_error_item(&envelope, &meta, id_ref);
+        }
+    };
+    let script_bytes = source.as_str().len();
+
+    // Per-item input-size validation.
+    if let Err((code, message)) = sandbox::validate_input_sizes(
+        script_bytes,
+        context_bytes,
+        state.engine_cfg.max_script_size,
+        state.engine_cfg.max_context_size,
+    ) {
+        emit_denied(state, identity, trace_id, "INPUT_TOO_LARGE", None);
+        let meta = base_error_meta(
+            trace_id,
+            script_bytes,
+            context_bytes,
+            key.as_deref(),
+            partition,
+        );
+        return render_error_item(&request_error(code, message), &meta, id_ref);
+    }
+
+    // Per-item member-capability authz (trusted mode, D5) — evaluated for EVERY item, never once for
+    // the batch (the GraphQL-batch-attack guard).
+    if let Some(envelope) = batch_item_authz(state, identity, &config, trace_id) {
+        let meta = base_error_meta(
+            trace_id,
+            script_bytes,
+            context_bytes,
+            key.as_deref(),
+            partition,
+        );
+        return render_error_item(&envelope, &meta, id_ref);
+    }
+
+    // Per-item quota debit (trusted mode) — held across this item's execution (D5: counts N, not 1).
+    let _item_quota = match batch_item_quota(state, identity, trace_id) {
+        Ok(guard) => guard,
+        Err(envelope) => {
+            let meta = base_error_meta(
+                trace_id,
+                script_bytes,
+                context_bytes,
+                key.as_deref(),
+                partition,
+            );
+            return render_error_item(&envelope, &meta, id_ref);
+        }
+    };
+
+    // Open the fabricd session when the item names driver resources.
+    let session = if config.io.any() {
+        let tenant = identity.and_then(|trusted| trusted.tenant.as_deref());
+        let init = config.io.wire_init(state.engine_cfg.timeout(), tenant);
+        match connect_session(&state.transport, &init).await {
+            Ok(conn) => Some(conn),
+            Err(err) => {
+                emit_denied(state, identity, trace_id, "EGRESS_UNAVAILABLE", None);
+                let (_status, envelope) = session_error_envelope(err);
+                let meta = base_error_meta(
+                    trace_id,
+                    script_bytes,
+                    context_bytes,
+                    key.as_deref(),
+                    partition,
+                );
+                return render_error_item(&envelope, &meta, id_ref);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Admit: acquire this batch's fair-share slot (queues past the ceiling) then a global bulkhead
+    // permit (queues; protects blocking threads). Both held across execution.
+    let _slot = gate.acquire_owned().await.ok();
+    let _global = Arc::clone(&state.limiter).acquire_owned().await.ok();
+
+    let start = Instant::now();
+    let result = execute_blocking(ExecuteBlocking {
+        host: state.host.clone(),
+        handle: Handle::current(),
+        timeout: state.engine_cfg.timeout(),
+        session,
+        source,
+        context_json: context.get().to_owned(),
+        config,
+        cache_ns: partition.map(str::to_owned),
+    })
     .await;
 
-    // Execution finished — free the bulkhead + per-partition permits for the next request.
-    drop(permit);
-    drop(partition_permit);
-
     let exec_time_us = start.elapsed().as_micros();
-    let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
-        .with_key(key)
-        .with_partition(partition);
-    build_response(result, base_meta, error_debug, &state, identity.as_ref())
+    let base_meta = Meta::new(
+        trace_id.to_owned(),
+        script_bytes,
+        context_bytes,
+        exec_time_us,
+    )
+    .with_key(key)
+    .with_partition(partition.map(str::to_owned));
+    render_executed_item(state, identity, result, base_meta, id_ref)
+}
+
+/// Per-item member-capability authz (trusted mode, D5). `None` = permitted (or not gated); `Some`
+/// carries the `ENTITLEMENT_REQUIRED` envelope. Emits the denied audit on rejection.
+fn batch_item_authz(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    config: &RequestConfig,
+    trace_id: &str,
+) -> Option<ErrorEnvelope> {
+    let (Some(trusted), Some(id)) = (state.trusted.as_ref(), identity) else {
+        return None;
+    };
+    let requested = requested_capabilities(config);
+    match authorize_capabilities(&trusted.capability_entitlements, &requested, id) {
+        Ok(()) => None,
+        Err(denied) => {
+            emit_denied(
+                state,
+                identity,
+                trace_id,
+                "ENTITLEMENT_REQUIRED",
+                Some(json!({ "capability": denied.capability, "required": denied.required })),
+            );
+            let message = format!(
+                "capability `{}` requires entitlement `{}`",
+                denied.capability, denied.required
+            );
+            Some(request_error("ENTITLEMENT_REQUIRED", message))
+        }
+    }
+}
+
+/// Per-item quota debit (trusted mode). Returns the in-flight guard (held across the item's
+/// execution) or the `QUOTA_EXCEEDED` envelope. Emits the denied audit on rejection. This is what
+/// makes a batch cost N quota units, not 1 (D5).
+fn batch_item_quota(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    trace_id: &str,
+) -> Result<Option<QuotaGuard>, Box<ErrorEnvelope>> {
+    let (Some(trusted), Some(id)) = (state.trusted.as_ref(), identity) else {
+        return Ok(None);
+    };
+    let Some(quota) = trusted.quota.as_ref() else {
+        return Ok(None);
+    };
+    let Some(tenant) = id.tenant.as_deref() else {
+        return Ok(None);
+    };
+    match quota.admit(tenant, id.plan.as_deref()) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(exceeded) => {
+            emit_denied(
+                state,
+                identity,
+                trace_id,
+                "QUOTA_EXCEEDED",
+                Some(json!({
+                    "plan": exceeded.plan,
+                    "limit": exceeded.limit,
+                    "usage": exceeded.usage,
+                })),
+            );
+            Err(Box::new(quota_exceeded_envelope(&exceeded)))
+        }
+    }
+}
+
+/// Renders one item's execution outcome (mirrors [`build_response`]): emits the per-item usage/audit
+/// events + records per-item metrics, then serializes the `{data, error, meta, id?}` envelope.
+fn render_executed_item(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    result: Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError>,
+    base_meta: Meta,
+    id: Option<&str>,
+) -> RenderedItem {
+    let metrics: &Metrics = &state.metrics;
+    metrics.observe_execution(base_meta.exec_time_us);
+    match result {
+        Ok((Ok(exec), backend)) => {
+            record_capability_latencies(metrics, &exec.metrics, &backend);
+            let meta = base_meta.with_metrics(exec.metrics, backend);
+            match exec.result {
+                ExecOutcome::Success(js_json) => {
+                    emit_executed(state, identity, &meta, "success");
+                    metrics.record_success();
+                    render_success_item(&js_json, &meta, id, state.error_debug)
+                }
+                ExecOutcome::Error(engine_err) => {
+                    let outcome = engine_error_outcome(&engine_err);
+                    emit_executed(state, identity, &meta, outcome);
+                    metrics.record_engine_error(&engine_err);
+                    render_engine_error_item(engine_err, &meta, id, state.error_debug)
+                }
+            }
+        }
+        Ok((Err(engine_err), _backend)) => {
+            let outcome = engine_error_outcome(&engine_err);
+            emit_executed(state, identity, &base_meta, outcome);
+            metrics.record_engine_error(&engine_err);
+            render_engine_error_item(engine_err, &base_meta, id, state.error_debug)
+        }
+        Err(join_err) => {
+            let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
+            let outcome = engine_error_outcome(&engine_err);
+            emit_executed(state, identity, &base_meta, outcome);
+            metrics.record_engine_error(&engine_err);
+            render_engine_error_item(engine_err, &base_meta, id, state.error_debug)
+        }
+    }
+}
+
+/// Serializes a success item from the JS `{data, error}` output + meta + id. A JS output that does
+/// not parse is rendered as a `MALFORMED_RESPONSE` error item instead (mirrors [`success_response`]).
+fn render_success_item(
+    js_json: &str,
+    meta: &Meta,
+    id: Option<&str>,
+    error_debug: bool,
+) -> RenderedItem {
+    match serde_json::from_str::<Envelope<'_>>(js_json) {
+        Ok(env) => {
+            let envelope = ItemSuccessEnvelope {
+                data: env.data,
+                error: env.error,
+                meta,
+                id,
+            };
+            let body = serde_json::to_string(&envelope)
+                .unwrap_or_else(|_err| fallback_item_body(&meta.trace_id));
+            RenderedItem { body, ok: true }
+        }
+        Err(parse_err) => {
+            let envelope =
+                EngineError::Malformed(format!("malformed handler response: {parse_err}"))
+                    .into_envelope(error_debug);
+            render_error_item(&envelope, meta, id)
+        }
+    }
+}
+
+/// Serializes an engine-error item, logging the raw cause server-side keyed by `trace_id` (mirrors
+/// [`engine_error_response`]).
+fn render_engine_error_item(
+    err: EngineError,
+    meta: &Meta,
+    id: Option<&str>,
+    error_debug: bool,
+) -> RenderedItem {
+    warn!(trace_id = %meta.trace_id, error = ?err, "batch item system error");
+    let envelope = err.into_envelope(error_debug);
+    render_error_item(&envelope, meta, id)
+}
+
+/// Serializes a system-error item: `{ data: null, error, meta, id? }`.
+fn render_error_item(error: &ErrorEnvelope, meta: &Meta, id: Option<&str>) -> RenderedItem {
+    let envelope = ItemErrorEnvelope {
+        data: None,
+        error,
+        meta,
+        id,
+    };
+    let body =
+        serde_json::to_string(&envelope).unwrap_or_else(|_err| fallback_item_body(&meta.trace_id));
+    RenderedItem { body, ok: false }
+}
+
+/// A minimal valid item body used only if serializing an item envelope somehow fails (unreachable in
+/// practice — the fields are plain JSON).
+fn fallback_item_body(trace_id: &str) -> String {
+    format!(
+        "{{\"data\":null,\"error\":{{\"code\":\"INTERNAL_ERROR\"}},\"meta\":{{\"trace_id\":{trace_id:?}}}}}"
+    )
+}
+
+/// Assembles the final `/batch` response in request order, enforcing the total-response-bytes cap
+/// (D6): an item whose bytes would push the running total past the cap is truncated to a classified
+/// size-limit error envelope rather than buffered. Counts ok/failed for the batch summary.
+fn assemble_batch(
+    slots: Vec<Option<RenderedItem>>,
+    trace_id: String,
+    duration_ms: u128,
+    max_response_bytes: usize,
+) -> AxumResponse {
+    let count = slots.len();
+    let mut results: Vec<Box<RawValue>> = Vec::with_capacity(count);
+    let mut ok = 0_usize;
+    let mut failed = 0_usize;
+    let mut used = 0_usize;
+    for slot in slots {
+        let rendered = slot.unwrap_or_else(|| internal_error_item(&trace_id));
+        let projected = used.saturating_add(rendered.bytes());
+        let item = if projected > max_response_bytes {
+            let truncated = truncated_item(&trace_id);
+            used = used.saturating_add(truncated.bytes());
+            failed = failed.saturating_add(1);
+            truncated
+        } else {
+            used = projected;
+            if rendered.ok {
+                ok = ok.saturating_add(1);
+            } else {
+                failed = failed.saturating_add(1);
+            }
+            rendered
+        };
+        let raw = RawValue::from_string(item.body).unwrap_or_else(|_err| RAW_NULL.clone());
+        results.push(raw);
+    }
+    let meta = BatchMeta {
+        items: count,
+        ok,
+        failed,
+        duration_ms,
+        trace_id,
+    };
+    (StatusCode::OK, Json(BatchResponse { results, meta })).into_response()
+}
+
+/// A defensive per-item envelope for a slot that never completed (a panicked fan-out task) — a
+/// retryable internal error, so a batch never returns a hole in its results array.
+fn internal_error_item(trace_id: &str) -> RenderedItem {
+    let envelope = ErrorEnvelope::new(
+        ErrorCategory::Runtime,
+        ErrorSource::Engine,
+        "INTERNAL_ERROR".to_owned(),
+        true,
+        ErrorOwner::Operator,
+    )
+    .with_message("batch item did not complete".to_owned());
+    render_error_item(&envelope, &Meta::new(trace_id.to_owned(), 0, 0, 0), None)
+}
+
+/// The classified size-limit envelope an item is truncated to when it would exceed the total-
+/// response-bytes cap (D6). Small and fixed so it never itself blows the cap.
+fn truncated_item(trace_id: &str) -> RenderedItem {
+    let envelope = ErrorEnvelope::new(
+        ErrorCategory::Runtime,
+        ErrorSource::Engine,
+        "BATCH_RESPONSE_TRUNCATED".to_owned(),
+        false,
+        ErrorOwner::Operator,
+    )
+    .with_message("item output omitted: batch response size limit reached".to_owned());
+    render_error_item(&envelope, &Meta::new(trace_id.to_owned(), 0, 0, 0), None)
 }
 
 /// `GET /metrics` — Prometheus text exposition of the process-wide counters and live
@@ -1336,11 +2084,12 @@ fn enforce_quota<F: FnOnce() -> Meta>(
     }
 }
 
-/// Builds the `429 QUOTA_EXCEEDED` response carrying the plan, limit, and current usage — the
-/// structured over-limit result. Retryable (a concurrency cap frees as executions finish), owned by
-/// the caller (the tenant is over its plan).
-fn quota_exceeded_response(exceeded: &QuotaExceeded, meta: Meta) -> AxumResponse {
-    let envelope = ErrorEnvelope::new(
+/// Builds the `QUOTA_EXCEEDED` envelope carrying the plan, limit, and current usage — the structured
+/// over-limit result. Retryable (a concurrency cap frees as executions finish), owned by the caller
+/// (the tenant is over its plan). Shared by the single-`/execute` response and the per-item `/batch`
+/// path.
+fn quota_exceeded_envelope(exceeded: &QuotaExceeded) -> ErrorEnvelope {
+    ErrorEnvelope::new(
         ErrorCategory::Runtime,
         ErrorSource::Engine,
         "QUOTA_EXCEEDED".to_owned(),
@@ -1352,8 +2101,12 @@ fn quota_exceeded_response(exceeded: &QuotaExceeded, meta: Meta) -> AxumResponse
         plan = exceeded.plan,
         usage = exceeded.usage,
         limit = exceeded.limit,
-    ));
-    system_error_response(envelope, 429, meta)
+    ))
+}
+
+/// Builds the `429 QUOTA_EXCEEDED` single-`/execute` response from the shared envelope + meta.
+fn quota_exceeded_response(exceeded: &QuotaExceeded, meta: Meta) -> AxumResponse {
+    system_error_response(quota_exceeded_envelope(exceeded), 429, meta)
 }
 
 /// Enforces the optional `/execute` bearer gate. Returns `Some(401)` when a token is
@@ -1653,6 +2406,7 @@ mod trusted_pipeline_tests {
             })),
             events: None,
             event_dropped: None,
+            batch: crate::config::BatchConfig::default(),
         }
     }
 
@@ -1904,6 +2658,288 @@ mod trusted_pipeline_tests {
             run(&app, HeaderMap::new(), RequestConfig::default()).await,
             StatusCode::OK,
             "non-trusted mode does not consult the scope header"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    //! `POST /batch` driven directly through the handler: order preservation + `id` echo, per-item
+    //! isolation, partial failure, batch-level caps (empty / too-many / xor-key item), the D6
+    //! response-size truncation, and — the D5 GraphQL-batch-attack guard — per-item authorization.
+    //! Egress is not wired (no sidecar), so items run deterministic scripts.
+
+    use super::{
+        AppState, BatchItem, BatchRequest, RequestConfig, RequestIo, TrustedRuntime, batch,
+    };
+    use crate::config::{BatchConfig, TrustedHeaders};
+    use crate::sidecar::SidecarTransport;
+    use axum::Json;
+    use axum::body::to_bytes;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse as _;
+    use runlet_core::config::EngineConfig;
+    use runlet_core::host::{HostSettings, LogicHost};
+    use runlet_core::metrics::Metrics;
+    use runlet_core::modules::ModuleRegistry;
+    use runlet_core::pool::JsPool;
+    use runlet_core::registry::ScriptRegistry;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// Builds an app state with a small warm pool, no sidecar, and the given trusted runtime.
+    fn state(trusted: Option<Arc<TrustedRuntime>>) -> AppState {
+        let mut engine = EngineConfig::default();
+        engine
+            .resolve_limits()
+            .unwrap_or_else(|_err| unreachable!("engine limits resolve"));
+        let pool = JsPool::new(engine, Arc::new(ModuleRegistry::default()))
+            .unwrap_or_else(|_err| unreachable!("pool init"));
+        let registry = Arc::new(ScriptRegistry::default());
+        let host = LogicHost::new(
+            pool,
+            Arc::clone(&registry),
+            HostSettings {
+                limits: engine,
+                allow_private_targets: false,
+            },
+        );
+        AppState {
+            host,
+            registry,
+            engine_cfg: engine,
+            error_debug: false,
+            limiter: Arc::new(Semaphore::new(8)),
+            partition_limiter: None,
+            transport: SidecarTransport::None,
+            metrics: Arc::new(Metrics::default()),
+            bulkhead_capacity: 8,
+            access_token: None,
+            trusted,
+            events: None,
+            event_dropped: None,
+            batch: BatchConfig::default(),
+        }
+    }
+
+    /// A trusted runtime with the given capability→entitlement gate and no quota.
+    fn trusted_runtime(gate: HashMap<String, String>) -> Arc<TrustedRuntime> {
+        Arc::new(TrustedRuntime {
+            headers: TrustedHeaders::default(),
+            capability_entitlements: gate,
+            quota: None,
+        })
+    }
+
+    /// A batch item running the given inline script (no id, default config).
+    fn item(script: &str) -> BatchItem {
+        BatchItem {
+            script: Some(script.to_owned()),
+            key: None,
+            context: super::default_context(),
+            config: RequestConfig::default(),
+            id: None,
+        }
+    }
+
+    /// A `HeaderMap` from `(name, value)` pairs.
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            drop(map.insert(*name, HeaderValue::from_static(value)));
+        }
+        map
+    }
+
+    /// Drives `POST /batch` and returns `(status, parsed-body)`.
+    async fn run(state: &AppState, hdrs: HeaderMap, items: Vec<BatchItem>) -> (StatusCode, Value) {
+        let response = batch(State(state.clone()), hdrs, Ok(Json(BatchRequest { items })))
+            .await
+            .into_response();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// Results preserve request order regardless of completion order, and a client `id` is echoed.
+    #[tokio::test]
+    async fn preserves_order_and_echoes_id() {
+        let app = state(None);
+        let items = vec![
+            BatchItem {
+                id: Some("a".to_owned()),
+                ..item("function handler(){ return { data: 1 }; }")
+            },
+            BatchItem {
+                id: Some("b".to_owned()),
+                ..item("function handler(){ return { data: 2 }; }")
+            },
+            BatchItem {
+                id: Some("c".to_owned()),
+                ..item("function handler(){ return { data: 3 }; }")
+            },
+        ];
+        let (status, body) = run(&app, HeaderMap::new(), items).await;
+        assert_eq!(status, StatusCode::OK, "an admitted batch returns 200");
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 3);
+        for (index, data, id) in [(0, 1, "a"), (1, 2, "b"), (2, 3, "c")] {
+            assert_eq!(results[index]["data"], data, "positional data");
+            assert_eq!(results[index]["id"], id, "echoed id");
+        }
+        assert_eq!(body["meta"]["items"], 3);
+        assert_eq!(body["meta"]["ok"], 3);
+        assert_eq!(body["meta"]["failed"], 0);
+    }
+
+    /// One item's failure is isolated: it carries an error envelope, the others still succeed, and the
+    /// batch reports `ok`/`failed` accordingly — still HTTP 200 (design D4).
+    #[tokio::test]
+    async fn partial_failure_is_isolated() {
+        let app = state(None);
+        let items = vec![
+            item("function handler(){ return { data: 1 }; }"),
+            item("function handler(){ throw new Error('boom'); }"),
+            item("function handler(){ return { data: 3 }; }"),
+        ];
+        let (status, body) = run(&app, HeaderMap::new(), items).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "partial failure is still a 200 batch"
+        );
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results[0]["data"], 1);
+        assert!(
+            !results[1]["error"].is_null(),
+            "the failing item carries an error"
+        );
+        assert_eq!(results[2]["data"], 3);
+        assert_eq!(body["meta"]["ok"], 2);
+        assert_eq!(body["meta"]["failed"], 1);
+    }
+
+    /// Each item runs in a fresh global scope — a mutation by one item is invisible to another.
+    #[tokio::test]
+    async fn items_are_isolated_from_each_other() {
+        let app = state(None);
+        let items = vec![
+            item("globalThis.leak = 42; function handler(){ return { data: 'set' }; }"),
+            item("function handler(){ return { data: typeof globalThis.leak }; }"),
+        ];
+        let (_status, body) = run(&app, HeaderMap::new(), items).await;
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(
+            results[1]["data"], "undefined",
+            "a global set by one item does not leak into another"
+        );
+    }
+
+    /// An empty batch is rejected whole with a request-category 400 before any item runs.
+    #[tokio::test]
+    async fn empty_batch_is_rejected() {
+        let app = state(None);
+        let (status, body) = run(&app, HeaderMap::new(), Vec::new()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "EMPTY_BATCH");
+    }
+
+    /// A batch over `max_items` is rejected whole with a 400 and no item executes.
+    #[tokio::test]
+    async fn too_many_items_is_rejected() {
+        let mut app = state(None);
+        app.batch.max_items = 2;
+        let items = vec![
+            item("function handler(){ return { data: 1 }; }"),
+            item("function handler(){ return { data: 2 }; }"),
+            item("function handler(){ return { data: 3 }; }"),
+        ];
+        let (status, body) = run(&app, HeaderMap::new(), items).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "BATCH_TOO_LARGE");
+    }
+
+    /// A malformed item (both `script` and `key`) fails only itself; the rest of the batch runs.
+    #[tokio::test]
+    async fn malformed_item_fails_only_itself() {
+        let app = state(None);
+        let items = vec![
+            BatchItem {
+                key: Some("also-a-key".to_owned()),
+                ..item("function handler(){ return { data: 1 }; }")
+            },
+            item("function handler(){ return { data: 2 }; }"),
+        ];
+        let (status, body) = run(&app, HeaderMap::new(), items).await;
+        assert_eq!(status, StatusCode::OK);
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results[0]["error"]["code"], "SCRIPT_XOR_KEY");
+        assert_eq!(results[1]["data"], 2, "the well-formed item still runs");
+    }
+
+    /// The D6 response-size cap truncates the offending item to a size-limit envelope rather than
+    /// buffering an unbounded response — the earlier item still returns its data.
+    #[tokio::test]
+    async fn response_size_cap_truncates_offending_item() {
+        let mut app = state(None);
+        // A small first item fits; the second returns a large blob that clearly blows the cap.
+        app.batch.max_response_bytes = 2000;
+        let items = vec![
+            item("function handler(){ return { data: 1 }; }"),
+            item("function handler(){ return { data: 'x'.repeat(5000) }; }"),
+        ];
+        let (status, body) = run(&app, HeaderMap::new(), items).await;
+        assert_eq!(status, StatusCode::OK);
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results[0]["data"], 1, "the first item fits and returns");
+        assert_eq!(
+            results[1]["error"]["code"], "BATCH_RESPONSE_TRUNCATED",
+            "the item that would blow the cap is truncated"
+        );
+    }
+
+    /// D5 (GraphQL-batch-attack guard): per-item authorization is evaluated for EVERY item — an item
+    /// requesting a gated capability the member lacks fails, while a plain item in the same batch
+    /// still runs. A batch cannot smuggle an operation past the per-request authz gate.
+    #[tokio::test]
+    async fn authorization_is_per_item() {
+        let mut gate = HashMap::new();
+        drop(gate.insert("db".to_owned(), "db.write".to_owned()));
+        let app = state(Some(trusted_runtime(gate)));
+        let hdrs = headers(&[
+            ("x-workspace-id", "ws_a"),
+            ("x-tenant-scope", "acting"),
+            ("x-user-entitlements", "mail.send"),
+        ]);
+        let items = vec![
+            BatchItem {
+                config: RequestConfig {
+                    io: RequestIo {
+                        db: vec!["orders-db".to_owned()],
+                        ..RequestIo::default()
+                    },
+                    ..RequestConfig::default()
+                },
+                ..item("function handler(){ return { data: 'db' }; }")
+            },
+            item("function handler(){ return { data: 'plain' }; }"),
+        ];
+        let (status, body) = run(&app, hdrs, items).await;
+        assert_eq!(status, StatusCode::OK, "the batch itself is admitted");
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(
+            results[0]["error"]["code"], "ENTITLEMENT_REQUIRED",
+            "the item requesting a gated capability is denied per item"
+        );
+        assert_eq!(
+            results[1]["data"], "plain",
+            "an ungated item in the same batch still runs"
         );
     }
 }

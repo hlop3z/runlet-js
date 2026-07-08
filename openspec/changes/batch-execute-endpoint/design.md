@@ -85,17 +85,37 @@ for a future per-item idempotency key. The retry contract we document: on partia
 only the items whose envelope carried an error. *Alternative*: index-only — rejected as a
 known-regret once subset-retry appears.
 
-### Decision: Batch fan-out / response-size / per-item idempotency — Build (reuse existing machinery)
+### Decision: Batch fan-out / response-size / per-item idempotency — Extend (reuse existing machinery)
 
 - **Status**: approved
 - **Why**: the fan-out runs over the in-house `LogicHost::run` port and reuses the existing bulkhead,
   per-partition fairness, quota, events, and byte-size validation; no mature library batches over a
   private execution port, and v1 idempotency is echoing a client-supplied item `id` (no cached-outcome
-  store yet). Adopting anything would wrap machinery we already own.
+  store yet). Adopting anything would wrap machinery we already own. The build-vs-adopt gate confirmed
+  no new third-party dependency is warranted — every critical concern (fan-out, per-item authz/quota,
+  bounded concurrency, response bound) reuses in-house machinery over already-adopted infra
+  (axum/tokio/serde).
 - **Considered**: adopt a batch/idempotency framework — none fit fan-out over an internal port; a
   Stripe-style cached-outcome idempotency store is a future add, not v1.
 - **Isolation**: confined to `runlet/src/handler.rs` (+ the router in `main.rs`); `LogicHost` and
-  `runlet-core` are untouched.
+  `runlet-core` are untouched. Concrete in-tree primitives (settled at the gate):
+  - **Fan-out**: `tokio::task::JoinSet` — each item spawned tagged with its index, results collected
+    into a pre-sized vec by index (preserves result order; integrates with `spawn_blocking` + the
+    bulkhead permits; cancels cleanly on drop). *Considered*: `futures::stream::buffer_unordered`
+    — rejected, needs manual re-sort and maps less cleanly onto per-item permit acquisition.
+  - **Request body cap (D3)**: axum `DefaultBodyLimit` layer on the `/batch` route as the outer
+    raw-byte guard (rejects an oversize body before allocation — the request-side of the D6
+    amplification concern), then item-count + per-item size checks after `serde` parse. *Considered*:
+    hand-count after parse only — rejected, allocates the full oversize body before rejecting.
+
+### Decision: Endpoint path — `/batch` (top-level sibling of `/execute`)
+
+- **Status**: approved
+- **Why**: the batch endpoint is an independent execution surface, not a sub-resource of a single
+  execution; a flat top-level `/batch` reads correctly and avoids implying `/execute/*` sub-routing.
+- **Considered**: `/execute/batch` (nested) — dropped; the nesting implied a parent/child relationship
+  that does not exist (a batch is N independent executions, not a mode of one).
+- **Isolation**: router registration in `runlet/src/main.rs`; no behavioral coupling to `/execute`.
 
 ## Risks / Trade-offs
 

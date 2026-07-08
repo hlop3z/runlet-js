@@ -181,6 +181,66 @@ interface ResponseMeta {
   io: Record<string, IoMetric[]>;
 }
 // ─────────────────────────────────────────────────────────────────────────────
+// Batch wire envelope — the `POST /batch` request/response shapes (client-side types)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** One item of a {@link BatchRequest}: the single-execute body plus an optional client `id`. */
+interface BatchItem {
+  /** Inline JS source defining `handler(ctx)` (exactly one of `script` / `key`). */
+  script?: string;
+  /** Registered-script key (exactly one of `script` / `key`). */
+  key?: string;
+  /** JSON context passed as `ctx` to the handler. */
+  context?: unknown;
+  /** Per-item config (capabilities, `io`) — same shape as `/execute`. */
+  config?: unknown;
+  /** Optional client correlation id, echoed on the matching result for subset-retry. */
+  id?: string;
+}
+
+/** The `POST /batch` request body: an ordered list of independent items. */
+interface BatchRequest {
+  /** The items to execute (bounded by `batch.max_items` / `batch.max_input_bytes`). */
+  items: BatchItem[];
+}
+
+/** One entry of {@link BatchResponse.results}: the single-execute envelope plus the echoed `id`. */
+interface BatchResultItem {
+  /** The item's success payload, or `null` on a system error. */
+  data: unknown;
+  /** The item's error (application error from `json(...)`, or a structured system envelope). */
+  error: unknown;
+  /** The item's metadata (same shape as a single response's `meta`). */
+  meta: ResponseMeta;
+  /** The client id from the corresponding request item, when supplied. */
+  id?: string;
+}
+
+/** Batch-level summary attached to a {@link BatchResponse}. */
+interface BatchMeta {
+  /** Number of items in the batch. */
+  items: number;
+  /** Items that executed successfully. */
+  ok: number;
+  /** Items that failed (rejected, engine error, or truncated). */
+  failed: number;
+  /** Wall-clock duration of the whole batch, milliseconds. */
+  duration_ms: number;
+  /** Batch correlation id (shared by every item's `meta.trace_id`). */
+  trace_id: string;
+}
+
+/**
+ * The `POST /batch` response: order-preserving per-item envelopes plus a batch summary. An admitted
+ * batch is always HTTP 200; per-item failures live in `results[i].error`.
+ */
+interface BatchResponse {
+  /** One envelope per request item, in request order. */
+  results: BatchResultItem[];
+  /** Batch-level summary. */
+  meta: BatchMeta;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 // `$sys` — runtime stdlib: crypto + date (always on); env/secrets when config.sys set
 // ─────────────────────────────────────────────────────────────────────────────
 

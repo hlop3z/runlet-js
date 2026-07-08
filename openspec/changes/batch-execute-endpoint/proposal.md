@@ -11,7 +11,8 @@ fairness-aware parallelism — with amortized HTTP overhead.
 
 ## What Changes
 
-- New `POST /execute/batch` endpoint: `{ items: [ {script|key, context, config, id?}, … ] }` →
+- New `POST /batch` endpoint (top-level sibling of `/execute`, not nested under it):
+  `{ items: [ {script|key, context, config, id?}, … ] }` →
   `{ results: [ {data,error,meta,id?}, … ], meta: {items, ok, failed, duration_ms, trace_id} }`,
   order-preserving. Each item MAY carry an optional client-supplied `id`, echoed on its result for
   correlation and subset-retry (positional order is still guaranteed).
@@ -39,7 +40,7 @@ fairness-aware parallelism — with amortized HTTP overhead.
 
 ### Modified Capabilities
 - `execution`: the "Single execution endpoint" requirement changes — `/execute` is no longer
-  the sole execution endpoint; `/execute/batch` is added with per-item envelope semantics
+  the sole execution endpoint; `/batch` is added with per-item envelope semantics
   defined by `batch-execution`.
 
 ## Impact

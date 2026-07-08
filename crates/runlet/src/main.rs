@@ -218,12 +218,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         trusted,
         events: event_sink,
         event_dropped,
+        batch: config.batch,
     };
 
+    // `/batch` gets its own (larger) body limit sized to the combined-input cap so a batch is not
+    // capped by the single-execute body limit; item-count + combined-input bytes are re-checked
+    // after parse (decide gate: axum DefaultBodyLimit layer + post-parse checks). The route layer is
+    // innermost, so it overrides the router-wide default for this route only.
+    let batch_body_limit = config.batch.max_input_bytes.max(body_limit);
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/metrics", get(handler::metrics))
         .route("/execute", post(handler::execute))
+        .route(
+            "/batch",
+            post(handler::batch).layer(DefaultBodyLimit::max(batch_body_limit)),
+        )
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state);
 

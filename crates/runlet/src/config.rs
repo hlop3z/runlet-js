@@ -96,6 +96,45 @@ pub(crate) struct Config {
     /// `events.rs`.
     #[serde(default)]
     pub(crate) events: EventsConfig,
+    /// `POST /batch` fan-out caps (the `batch` block): the maximum item count and the combined-input
+    /// / total-response byte bounds. Always present with modest defaults; the endpoint is additive
+    /// (a request that never calls `/batch` is unaffected). See `docs/design` (batch-execute-endpoint).
+    #[serde(default)]
+    pub(crate) batch: BatchConfig,
+}
+
+/// `POST /batch` fan-out caps (the `batch` block). Bounds both the request (item count +
+/// combined input bytes) and the response (total bytes), so a batch can neither be admitted
+/// oversize nor buffer an unbounded response (design D3/D6). Plain byte counts (not the
+/// human-readable size strings the engine block uses) — these are HTTP-layer request/response
+/// bounds, not engine sandbox limits.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the `max_` prefix is the stable JSON config key contract (max_items / max_input_bytes / max_response_bytes)"
+)]
+pub(crate) struct BatchConfig {
+    /// Maximum items in one batch; a larger batch is rejected whole (`400`). Kept modest so a batch's
+    /// worst-case pool hold time stays bounded (design D3). Default `25`.
+    pub(crate) max_items: usize,
+    /// Maximum combined input bytes (Σ script + context over all items); an oversize batch body is
+    /// rejected whole (`400`) before any item is admitted. Default `4 MiB`.
+    pub(crate) max_input_bytes: usize,
+    /// Maximum total response bytes while assembling `results`; an item that would push the running
+    /// total past this is truncated to a classified size-limit error envelope rather than buffered
+    /// (design D6). Default `8 MiB`.
+    pub(crate) max_response_bytes: usize,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_items: 25,
+            max_input_bytes: 4 * 1024 * 1024,
+            max_response_bytes: 8 * 1024 * 1024,
+        }
+    }
 }
 
 /// Per-tenant usage + audit event emission (the `events` block). Emits one `usage` event per
@@ -489,6 +528,24 @@ mod tests {
         let parsed_cfg = parsed.unwrap_or_default();
         assert!(parsed_cfg.events.enabled);
         assert_eq!(parsed_cfg.events.buffer, 256);
+    }
+
+    /// Batch caps are present with modest defaults; a block parses overrides.
+    #[test]
+    fn batch_defaults_and_parse() {
+        let cfg = Config::default();
+        assert_eq!(cfg.batch.max_items, 25, "default item cap");
+        assert_eq!(cfg.batch.max_input_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.batch.max_response_bytes, 8 * 1024 * 1024);
+
+        let json =
+            r#"{"batch":{"max_items":100,"max_input_bytes":1024,"max_response_bytes":2048}}"#;
+        let parsed = serde_json::from_str::<Config>(json);
+        assert!(parsed.is_ok(), "batch block should parse");
+        let parsed_cfg = parsed.unwrap_or_default();
+        assert_eq!(parsed_cfg.batch.max_items, 100);
+        assert_eq!(parsed_cfg.batch.max_input_bytes, 1024);
+        assert_eq!(parsed_cfg.batch.max_response_bytes, 2048);
     }
 
     /// Builds a config in trusted-header mode with a chosen bind + isolation assertion. A token is

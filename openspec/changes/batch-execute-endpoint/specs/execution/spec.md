@@ -6,7 +6,7 @@
 
 The system SHALL expose `POST /execute` as the primary execution endpoint, accepting a JSON
 body and returning a JSON `{data, error, meta}` envelope. The system additionally exposes
-`POST /execute/batch` (see the `batch-execution` capability), whose per-item results carry
+`POST /batch` (see the `batch-execution` capability), whose per-item results carry
 the same `{data, error, meta}` envelope; no other execution endpoint exists.
 
 #### Scenario: Successful execution
@@ -21,5 +21,5 @@ the same `{data, error, meta}` envelope; no other execution endpoint exists.
 
 #### Scenario: Batch endpoint reuses the envelope per item
 
-- **WHEN** a request to `/execute/batch` completes
+- **WHEN** a request to `/batch` completes
 - **THEN** every `results[i]` entry carries the same `{data, error, meta}` envelope defined here

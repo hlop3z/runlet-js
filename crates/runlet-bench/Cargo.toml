@@ -28,6 +28,10 @@ harness = false
 name = "mux"
 harness = false
 
+[[bench]]
+name = "batch"
+harness = false
+
 # Intentionally NOT `[lints] workspace = true`: this is dev-only benchmark scaffolding, exempt
 # from the production gauntlet (criterion's macros generate undocumented items, the harness
 # uses `unsafe Module::load` by design, etc.). Default lint levels apply.

@@ -4,7 +4,7 @@
 
 ### Requirement: Batch endpoint and envelope
 
-The system SHALL expose `POST /execute/batch` accepting `{ items: [...] }` where each item
+The system SHALL expose `POST /batch` accepting `{ items: [...] }` where each item
 has the single-execute shape (`script` XOR `key`, optional `context`, optional `config`),
 and SHALL respond with `{ results: [...], meta }` where `results[i]` is the full
 `{data, error, meta}` envelope for `items[i]` (order-preserving) and the batch `meta`
