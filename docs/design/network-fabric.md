@@ -131,8 +131,11 @@ the drivers that leave `runlet-core` land here.
 > by `scripts/smoke_quic.sh` (happy path + wrong/absent-token negatives). The **`sa-token`** provider (k8s
 > projected `ServiceAccount` token, verified offline against the cluster JWKS) is implemented in
 > `fabric_backends::sa_token` (`JwksVerifier`: background-refreshed JWKS cache + offline RS256 +
-> `aud`/`iss`/`exp` check) and unit-tested hermetically; the remaining open item is the **KIND
-> end-to-end** test (`scripts/smoke_satoken.sh`) that exercises it against a real projected token in-cluster.
+> `aud`/`iss`/`exp` check) and unit-tested hermetically, and exercised **end-to-end on a real KIND
+> cluster** by `scripts/smoke_satoken.sh` (two box pods with real projected `ServiceAccount` tokens:
+> valid audience → `db.query` routed box→QUIC→fabricd→Postgres, wrong audience → rejected at session
+> open with `UNAUTHENTICATED`/`InvalidAudience`, no query). The test self-skips without
+> docker/kind/kubectl and is not yet wired into CI (KIND-in-CI is a `fabricd`-repo decision).
 > Everything below the `## Deferred` line at the end stays parked.
 
 ## Why only this slice
