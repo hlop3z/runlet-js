@@ -11,8 +11,10 @@ guarantees, and the system-error taxonomy. Rationale: `docs/design/` and `CLAUDE
 
 ### Requirement: Single execution endpoint
 
-The system SHALL expose `POST /execute` as the sole execution endpoint, accepting a JSON body
-and returning a JSON `{data, error, meta}` envelope.
+The system SHALL expose `POST /execute` as the primary execution endpoint, accepting a JSON
+body and returning a JSON `{data, error, meta}` envelope. The system additionally exposes
+`POST /batch` (see the `batch-execution` capability), whose per-item results carry
+the same `{data, error, meta}` envelope; no other execution endpoint exists.
 
 #### Scenario: Successful execution
 
@@ -23,6 +25,11 @@ and returning a JSON `{data, error, meta}` envelope.
 
 - **WHEN** any request to `/execute` completes (success or failure)
 - **THEN** the response body has exactly the keys `data`, `error`, and `meta`
+
+#### Scenario: Batch endpoint reuses the envelope per item
+
+- **WHEN** a request to `/batch` completes
+- **THEN** every `results[i]` entry carries the same `{data, error, meta}` envelope defined here
 
 ### Requirement: Source resolution (script XOR key)
 
