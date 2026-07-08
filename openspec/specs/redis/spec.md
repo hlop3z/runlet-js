@@ -3,7 +3,7 @@
 ## Purpose
 
 The `redis` capability gives a sandboxed handler a synchronous key/value client
-(`redis.get/set/del/incr/expire`) for caches, counters, sessions, and short-lived state
+(`redis.get/set/delete/increment/expire`) for caches, counters, sessions, and short-lived state
 against Redis (or a Redis-compatible store). The connection is **operator-bound**: the
 request enables the capability by naming a logical resource in `config.io.redis`, and the
 operator's resource definition — never the request — supplies the URL and credentials, so
@@ -30,7 +30,7 @@ resource names.
 #### Scenario: Capability present with a named resource
 
 - **WHEN** a request's `config.io.redis` names an operator-bound resource (whose definition supplies the `url`)
-- **THEN** the handler can call `redis.get/set/del/incr/expire`
+- **THEN** the handler can call `redis.get/set/delete/increment/expire`
 
 #### Scenario: Unknown resource name is rejected
 
@@ -65,8 +65,8 @@ The system SHALL establish a TLS connection when the resource definition's `url`
 
 ### Requirement: Key/value operation surface
 
-The `redis` global SHALL expose `get(key)`, `set(key, value, opts?)`, `del(key)`,
-`incr(key)`, and `expire(key, seconds)`, all synchronous (no `await`), with values coerced to
+The `redis` global SHALL expose `get(key)`, `set(key, value, opts?)`, `delete(key)`,
+`increment(key)`, and `expire(key, seconds)`, all synchronous (no `await`), with values coerced to
 strings on write and returned as strings on read.
 
 #### Scenario: get returns the stored string
@@ -79,14 +79,14 @@ strings on write and returned as strings on read.
 - **WHEN** a handler calls `redis.get(key)` for a key that does not exist
 - **THEN** it returns `null`
 
-#### Scenario: del returns the erased count
+#### Scenario: delete returns the erased count
 
-- **WHEN** a handler calls `redis.del(key)`
+- **WHEN** a handler calls `redis.delete(key)`
 - **THEN** it returns the number of keys removed (0 or 1)
 
-#### Scenario: incr bumps and returns the counter
+#### Scenario: increment bumps and returns the counter
 
-- **WHEN** a handler calls `redis.incr(key)`
+- **WHEN** a handler calls `redis.increment(key)`
 - **THEN** the key's integer value is increased by 1 (starting at 1 if absent) and the new value is returned
 
 ### Requirement: TTL and expiry

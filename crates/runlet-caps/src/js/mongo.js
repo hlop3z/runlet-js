@@ -1,9 +1,9 @@
 (function() {
-  // Routes through the generic io egress; the collection is packed into the payload
-  // ({collection, data}) since io.call carries a single payload. io.call throws a
-  // tagged capability error on failure (see js/io.js).
+  // Bound to the `mongo` capability via io.channel (see js/io.js); the collection is packed into
+  // the one payload ({collection, data}). Throws a tagged capability error on failure.
+  var send = io.channel('mongo');
   function call(action, collection, payload) {
-    return io.call('mongo', action, { collection: collection, data: payload || {} });
+    return send(action, { collection: collection, data: payload || {} });
   }
   globalThis.mongo = {
     // Reads. Values that don't fit a JS number exactly come back as strings
