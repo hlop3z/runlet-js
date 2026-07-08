@@ -129,6 +129,25 @@ def _post_status(url: str, body: dict, headers: dict | None = None):
         return None, None
 
 
+def _post_full(body: dict, headers: dict | None = None):
+    """POST /execute returning `(http_status, parsed_envelope, response_headers)`. Unlike `_post`
+    (which hides the status), this keeps the status line and headers so the status-projection tests
+    can assert `4xx`/`5xx` routing and the `Retry-After` header. `response_headers` is the
+    case-insensitive message object (use `.get("Retry-After")`)."""
+    data = json.dumps(body).encode()
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(f"{BASE_URL}/execute", data=data, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.getcode(), _parse_response(resp.getcode(), resp.read()), resp.headers
+    except urllib.error.HTTPError as err:
+        return err.code, _parse_response(err.code, err.read()), err.headers
+    except Exception:
+        return None, None, None
+
+
 def _post_batch(items: list, headers: dict | None = None) -> dict | None:
     """POST a list of items to `/batch`; returns the parsed body — `{results, meta}` on an
     admitted batch, or a batch-level `{data, error, meta}` envelope on a 400 (empty/caps/malformed).
@@ -279,6 +298,72 @@ def test_meta(t: Runner):
     t.test("has context_bytes",        h("return json(1, null);", {"a": 1}), lambda r: r["meta"]["context_bytes"] > 0)
     t.test("total = script + context", simple, lambda r: r["meta"]["total_input_bytes"] == r["meta"]["script_bytes"] + r["meta"]["context_bytes"])
     t.test("has exec_time_us",         simple, lambda r: r["meta"]["exec_time_us"] >= 0)
+
+
+def test_status_projection(t: Runner):
+    """The HTTP status line is a truthful projection of the outcome (docs/99-errors.md): `2xx`
+    **iff** `error` is null, `retryable => 5xx` (+ `Retry-After`), non-retryable `=> 4xx`, and
+    **never `429`**. Covers every path reachable without a `fabricd` sidecar; capability-error
+    projection (a driver throw ⇒ `503`/`4xx`) is asserted in the driver sections, which self-skip
+    when no sidecar is present."""
+    t.section("HTTP status projection")
+
+    def rget(hdrs, name):
+        return hdrs.get(name) if hdrs is not None else None
+
+    # 2xx is success and only success.
+    st, r, hd = _post_full(h("return json(42, null);"))
+    t.check("null-error success is 200", st == 200 and bool(r) and r.get("data") == 42)
+    t.check("success carries no Retry-After", rget(hd, "Retry-After") is None)
+
+    # Handler opt-in: retryable:true => 503 + Retry-After, body verbatim.
+    st, r, hd = _post_full(h('return json(null, { message: "later", retryable: true });'))
+    t.check("handler retryable:true => 503", st == 503)
+    t.check("handler retryable:true carries Retry-After", rget(hd, "Retry-After") is not None)
+    t.check("handler error body is verbatim",
+            _err_code(r) is None and r["error"]["message"] == "later" and r["error"]["retryable"] is True)
+
+    # Handler opt-in: retryable:false => 422 (park), body verbatim.
+    st, r, hd = _post_full(h('return json(null, { message: "nope", retryable: false });'))
+    t.check("handler retryable:false => 422", st == 422 and r["error"]["message"] == "nope")
+    t.check("park carries no Retry-After", rget(hd, "Retry-After") is None)
+
+    # Un-annotated handler error defaults to 422 (park), never 200; body unchanged.
+    st, r, _ = _post_full(h('return json(null, { message: "name required" });'))
+    t.check("un-annotated handler error => 422 (park, not 200)",
+            st == 422 and st != 200 and r["error"]["message"] == "name required")
+
+    # Non-retryable engine errors park at 4xx (previously an uncaught throw was 200).
+    st, r, _ = _post_full(h_raw("function handler(ctx { }"))
+    t.check("syntax error => 422", st == 422 and _err_code(r) == "SYNTAX_ERROR")
+    st, r, _ = _post_full(h('throw new Error("boom");'))
+    t.check("uncaught throw => 422 (not 200)", st == 422 and _err_code(r) == "SCRIPT_ERROR")
+    st, r, _ = _post_full(h_raw("var x = 1;"))
+    t.check("missing handler => 422", st == 422)
+
+    # Oversize input is a caller fault that parks at 413 (not a generic 400).
+    big_script = "function handler(ctx){ return json('" + ("x" * (2 * 1024 * 1024)) + "', null); }"
+    st, r, _ = _post_full({"script": big_script})
+    t.check("oversize script => 413", st == 413 and _err_code(r) == "SCRIPT_TOO_LARGE")
+    st, r, _ = _post_full(h("return json(1, null);", ctx={"blob": "x" * (5 * 1024 * 1024)}))
+    t.check("oversize context => 413", st == 413 and _err_code(r) == "CONTEXT_TOO_LARGE")
+
+    # A wall-clock TIMEOUT follows timeout_retryable (default true => 503 + Retry-After).
+    st, r, hd = _post_full(h("while(true){}"))
+    t.check("timeout (default retryable) => 503", st == 503 and _err_code(r) == "TIMEOUT")
+    t.check("timeout carries Retry-After", rget(hd, "Retry-After") is not None)
+
+    # Status/envelope agreement across a representative sample: 5xx <=> retryable:true,
+    # 4xx <=> retryable:false (system-error envelopes carry `retryable`).
+    for label, body in [
+        ("timeout", h("while(true){}")),
+        ("syntax", h_raw("function handler(ctx { }")),
+        ("no-handler", h_raw("var y = 1;")),
+    ]:
+        st, r, _ = _post_full(body)
+        retry = bool((r.get("error") or {}).get("retryable")) if r else False
+        t.check(f"status class agrees with envelope.retryable ({label})",
+                st is not None and (st // 100 == 5) == retry)
 
 
 def test_http_api(t: Runner):
@@ -588,6 +673,11 @@ def test_db_engine(t: Runner, label: str, db: str):
     t.test(f"{label}: sql error throws",
            h("db.query('SELECT * FROM nonexistent_table_xyz'); return json('should not reach', null);", config=_db_io(db)),
            has_error())
+    # An uncaught capability error now projects onto the status line (no longer a blanket 200): a
+    # permanent SQL error (non-retryable) parks at a 4xx.
+    _st, _r, _hd = _post_full(h("db.query('SELECT * FROM nonexistent_table_xyz'); return json('x', null);", config=_db_io(db)))
+    t.check(f"{label}: uncaught sql error is a 4xx park (not 200)",
+            _st is not None and 400 <= _st < 500 and _err_code(_r) is not None)
 
     # db disabled without config
     t.test(f"{label}: db disabled without config",
@@ -598,6 +688,13 @@ def test_db_engine(t: Runner, label: str, db: str):
     t.test(f"{label}: bad connection",
            h("db.query('SELECT 1');", config=_db_io(db + "-badhost")),
            has_error())
+    # A retryable capability outage (can't reach the DB) projects to a retryable 5xx with a
+    # Retry-After header, instead of the old blanket 200 that a queue worker would wrongly ack.
+    _st, _r, _hd = _post_full(h("db.query('SELECT 1');", config=_db_io(db + "-badhost")))
+    t.check(f"{label}: bad connection is a retryable 5xx (not 200)",
+            _st is not None and 500 <= _st < 600 and _err_code(_r) is not None)
+    t.check(f"{label}: bad connection carries Retry-After",
+            _hd is not None and _hd.get("Retry-After") is not None)
 
     # Metrics tracked
     t.test(f"{label}: metrics tracked",
@@ -829,8 +926,8 @@ def test_isolation_under_concurrency(t: Runner):
 # -- Resilience: bulkhead (Tier 1) + statement_timeout clamp (Tier 0) ---------
 
 def test_bulkhead(t: Runner):
-    """Saturate the bulkhead and prove excess load fast-fails 429 OVERLOADED while the
-    server stays responsive (the SLO-protecting behavior)."""
+    """Saturate the bulkhead and prove excess load fast-fails OVERLOADED (a retryable `503` +
+    `Retry-After`, never `429`) while the server stays responsive (the SLO-protecting behavior)."""
     t.section("Bulkhead / overload (resilience)")
     import concurrent.futures
 
@@ -842,31 +939,37 @@ def test_bulkhead(t: Runner):
     slow = h("var x=0; for (var i=0;i<4000000;i++){ x+=i; } return json(x>0, null);")
 
     def fire(_):
-        r = _post(slow)
+        st, r, _hd = _post_full(slow)
         if r is None:
-            return "none"
+            return ("none", st)
         if _err_code(r) == "OVERLOADED":
-            return "429"
+            return ("shed", st)
         if r.get("data") is True:
-            return "ok"
+            return ("ok", st)
         # Keep the real error code visible so a failure shows WHAT the non-ok
         # outcomes were (PARTITION_OVERLOADED? TIMEOUT?), not an opaque "other".
-        return _err_code(r) or "other"
+        return (_err_code(r) or "other", st)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=24) as ex:
         outcomes = list(ex.map(fire, range(24)))
+    codes = [c for c, _st in outcomes]
     from collections import Counter
-    print(f"  \033[36mINFO\033[0m burst outcomes: {dict(Counter(outcomes))}")
+    print(f"  \033[36mINFO\033[0m burst outcomes: {dict(Counter(codes))}")
 
     # The bulkhead only sheds load when the configured bound is below the burst size.
     # If the server runs the default (auto, high) bound, nothing is shed â€” probe, don't fail.
-    if "429" not in outcomes:
-        print(f"  \033[33mPROBE\033[0m bulkhead not exercised (no 429s; bound >= burst). outcomes={set(outcomes)}\n")
+    if "shed" not in codes:
+        print(f"  \033[33mPROBE\033[0m bulkhead not exercised (no shedding; bound >= burst). outcomes={set(codes)}\n")
     else:
-        t.test("bulkhead sheds excess as 429 OVERLOADED",
-               h("return json(1,null);"), lambda _r: "429" in outcomes)
+        shed_statuses = {st for c, st in outcomes if c == "shed"}
+        t.test("bulkhead sheds excess as OVERLOADED",
+               h("return json(1,null);"), lambda _r: "shed" in codes)
+        # The retry-classification fix: a shed request is a retryable 503, never 429 (whose
+        # 4xx digit would make a status-line worker wrongly park it).
+        t.test("shed responses are 503, never 429",
+               h("return json(1,null);"), lambda _r: shed_statuses == {503})
         t.test("some requests still succeed under overload",
-               h("return json(1,null);"), lambda _r: "ok" in outcomes)
+               h("return json(1,null);"), lambda _r: "ok" in codes)
     # Either way, the server must be responsive immediately after the burst.
     t.test("server responsive right after overload burst",
            h("return json('alive', null);"), data_eq("alive"))
@@ -1936,6 +2039,7 @@ def main():
     test_sandbox(t)
     test_json_bridge(t)
     test_meta(t)
+    test_status_projection(t)
     test_http_api(t)
 
     test_registry(t)

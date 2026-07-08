@@ -280,4 +280,26 @@ impl ErrorEnvelope {
         self.debug = if debug.is_empty() { None } else { Some(debug) };
         self
     }
+
+    /// The retry hint — the signal a status-line projection routes on (`true ⇒ 5xx`,
+    /// `false ⇒ 4xx`). Status-code *policy* stays with the consumer; this only exposes the
+    /// classification the envelope already carries.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+
+    /// Who should act on the error — selects the specific code *within* the status class,
+    /// never the class itself.
+    #[must_use]
+    pub const fn owner(&self) -> ErrorOwner {
+        self.owner
+    }
+
+    /// The stable machine code — lets a projection pick a within-class code (e.g. `413`
+    /// oversize, `500` `INTERNAL`, `404` unknown script).
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
 }

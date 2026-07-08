@@ -994,27 +994,14 @@ impl EngineError {
         Self::Internal(err.to_string())
     }
 
-    /// HTTP status for this error per `docs/99-errors.md`.
-    #[must_use]
-    pub const fn http_status(&self) -> u16 {
-        match self {
-            Self::Internal(_) => 500,
-            Self::ShuttingDown => 503,
-            Self::Script { .. } | Self::Capability(_) => 200,
-            Self::ScriptNotFound(_) => 404,
-            Self::Syntax(_)
-            | Self::ModuleNotFound(_)
-            | Self::HandlerNotDefined
-            | Self::Timeout { .. }
-            | Self::MemoryLimit
-            | Self::Malformed(_)
-            | Self::OutputTooLarge { .. } => 422,
-        }
-    }
-
     /// Assembles the structured [`ErrorEnvelope`], gating debug on `error_debug`.
+    ///
+    /// `timeout_retryable` sets the `retryable` of a wall-clock `TIMEOUT` (the operator knob —
+    /// the engine cannot tell a slow dependency from a slow algorithm). `MEMORY_LIMIT` and the
+    /// op-count cap are deterministic for a given `(script, input)` and stay non-retryable
+    /// regardless. The status *projection* over the resulting envelope lives with the consumer.
     #[must_use]
-    pub fn into_envelope(self, error_debug: bool) -> ErrorEnvelope {
+    pub fn into_envelope(self, error_debug: bool, timeout_retryable: bool) -> ErrorEnvelope {
         let dev = ErrorOwner::Developer;
         match self {
             Self::Syntax(message) => runtime_envelope("SYNTAX_ERROR", false, dev, message),
@@ -1039,7 +1026,7 @@ impl EngineError {
             ),
             Self::Timeout { limit_ms } => runtime_envelope(
                 "TIMEOUT",
-                false,
+                timeout_retryable,
                 dev,
                 format!("execution timed out ({limit_ms}ms limit)"),
             ),

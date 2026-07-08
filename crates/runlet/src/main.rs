@@ -7,6 +7,7 @@ mod handler;
 mod identity;
 mod quota;
 mod sidecar;
+mod status;
 mod telemetry;
 
 use std::error::Error;
@@ -219,6 +220,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         events: event_sink,
         event_dropped,
         batch: config.batch,
+        timeout_retryable: config.timeout_retryable,
+        retry_after_seconds: config.retry_after_seconds,
     };
 
     // `/batch` gets its own (larger) body limit sized to the combined-input cap so a batch is not

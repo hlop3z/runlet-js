@@ -18,11 +18,25 @@ use serde::Deserialize;
 
 use crate::quota::PlanLimit;
 
-/// Top-level configuration. `Default` is derived — every field's default is its type
-/// default (`false` / `None` / the nested config's own `Default`), including the
-/// security-relevant `error_debug: false` (secure by default) and `access_token: None`.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Default `Retry-After` delay (seconds) attached to a retryable `503`/`500` when no
+/// circuit-breaker cool-down applies (the box's breakers live in `fabricd`, so this is the
+/// usual value). A short floor: the status already says "retry", the header only bounds the
+/// backoff — a generic worker adds its own jitter on top.
+const DEFAULT_RETRY_AFTER_SECONDS: u32 = 1;
+
+/// Top-level configuration. `Default` is hand-written (not derived) so the two policy fields that
+/// must not default to their type-zero — `timeout_retryable` (default `true`) and
+/// `retry_after_seconds` (default [`DEFAULT_RETRY_AFTER_SECONDS`]) — carry the intended value both
+/// in Rust (`Config::default()`) and via serde (a missing key falls back to this same `Default`).
+/// Every other field keeps its secure/empty zero (`error_debug: false`, `access_token: None`, …).
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent operator on/off switches (debug, error_debug, allow_unauthenticated, \
+              timeout_retryable), not a state machine — a two-variant enum per flag would obscure \
+              the flat JSON config contract"
+)]
 pub(crate) struct Config {
     /// Local-dev switch. When `true`, the SSRF private-IP block is relaxed so
     /// localhost / LAN targets (e.g. `MinIO`) work for `s3` and `api`. Never enable in
@@ -101,6 +115,51 @@ pub(crate) struct Config {
     /// (a request that never calls `/batch` is unaffected). See `docs/design` (batch-execute-endpoint).
     #[serde(default)]
     pub(crate) batch: BatchConfig,
+    /// Whether a wall-clock `TIMEOUT` is classified retryable (default `true`). The box cannot tell
+    /// a slow dependency (retrying helps) from a slow algorithm (retrying wastes budget), so this is
+    /// an operator knob: `true` projects `TIMEOUT` to a `503` (retry, the retry ladder bounds a
+    /// runaway), `false` to a `422` (park). Governs **only** `TIMEOUT`; `MEMORY_LIMIT` and the
+    /// op-count cap are deterministic for a given `(script, input)` and stay non-retryable (`422`)
+    /// regardless. Flip it `false` for compute-heavy deterministic workloads.
+    #[serde(default = "default_timeout_retryable")]
+    pub(crate) timeout_retryable: bool,
+    /// Seconds advertised in the `Retry-After` header on a retryable `503`/`500` when no
+    /// circuit-breaker cool-down applies. Default [`DEFAULT_RETRY_AFTER_SECONDS`].
+    #[serde(default = "default_retry_after_seconds")]
+    pub(crate) retry_after_seconds: u32,
+}
+
+/// serde default for [`Config::timeout_retryable`] — retry a timeout unless the operator opts out.
+const fn default_timeout_retryable() -> bool {
+    true
+}
+
+/// serde default for [`Config::retry_after_seconds`].
+const fn default_retry_after_seconds() -> u32 {
+    DEFAULT_RETRY_AFTER_SECONDS
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            debug: false,
+            error_debug: false,
+            server: ServerConfig::default(),
+            engine: EngineConfig::default(),
+            scripts_dir: None,
+            modules_dir: None,
+            access_token: None,
+            allow_unauthenticated: false,
+            fabricd_socket: None,
+            fabricd_quic: None,
+            trusted: TrustedConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            events: EventsConfig::default(),
+            batch: BatchConfig::default(),
+            timeout_retryable: default_timeout_retryable(),
+            retry_after_seconds: default_retry_after_seconds(),
+        }
+    }
 }
 
 /// `POST /batch` fan-out caps (the `batch` block). Bounds both the request (item count +
@@ -546,6 +605,31 @@ mod tests {
         assert_eq!(parsed_cfg.batch.max_items, 100);
         assert_eq!(parsed_cfg.batch.max_input_bytes, 1024);
         assert_eq!(parsed_cfg.batch.max_response_bytes, 2048);
+    }
+
+    /// `timeout_retryable` defaults to `true` and `retry_after_seconds` to the constant default,
+    /// both in Rust and through serde (a missing key falls back to the same `Default`); a block
+    /// parses explicit overrides.
+    #[test]
+    fn retry_policy_defaults_and_parse() {
+        let cfg = Config::default();
+        assert!(cfg.timeout_retryable, "timeout retries by default");
+        assert_eq!(cfg.retry_after_seconds, super::DEFAULT_RETRY_AFTER_SECONDS);
+
+        let empty = serde_json::from_str::<Config>("{}").unwrap_or_default();
+        assert!(
+            empty.timeout_retryable,
+            "a missing key defaults to retry, not the type-zero false"
+        );
+        assert_eq!(
+            empty.retry_after_seconds,
+            super::DEFAULT_RETRY_AFTER_SECONDS
+        );
+
+        let json = r#"{"timeout_retryable":false,"retry_after_seconds":30}"#;
+        let parsed = serde_json::from_str::<Config>(json).unwrap_or_default();
+        assert!(!parsed.timeout_retryable, "explicit opt-out parses");
+        assert_eq!(parsed.retry_after_seconds, 30);
     }
 
     /// Builds a config in trusted-header mode with a chosen bind + isolation assertion. A token is

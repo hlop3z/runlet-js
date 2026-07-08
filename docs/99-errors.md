@@ -20,6 +20,15 @@ the answer in one of two ways:
 So `error` is `null` when all is well, **your shape** when you set it, or the robot's
 **labeled shape** when the robot caught the problem.
 
+**One rule ties it all together: an answer with an `error` is never a `200`.** A `200`
+means "success, no error" — full stop. If `error` is set (yours or the robot's), the HTTP
+status is a `4xx` or `5xx` that matches `retryable` (below), so a dumb retry worker can
+route on the status line alone. Want your own error to say "retry me"? Add a top-level
+`retryable: true` to it: `return json(null, { message: "later", retryable: true })` →
+the status becomes `503` (with a `Retry-After`). Leave it off and your error parks at
+`422`. Either way your `error` body is passed back **exactly as you wrote it** — the robot
+only *reads* that one key, it never rewrites your shape.
+
 ## What the robot's error looks like 🔖
 
 ```json
@@ -73,30 +82,47 @@ So a dead database pages the ops team, but your `TypeError` doesn't. 🙂
 
 ## The traffic light (HTTP status) 🚥
 
-The HTTP status is a quick signal for gateways and load balancers:
+The HTTP status is a truthful projection of the answer, so a gateway or a dumb queue
+worker can route on the **status line alone**: the *first digit* is the whole story —
+**`2xx` = ack, `4xx` = park (don't retry), `5xx` = retry.** The class is a pure function
+of `retryable`; `owner` only picks *which* code inside the class.
 
-| You get | Means                                                                                                 |
-| ------- | ----------------------------------------------------------------------------------------------------- |
-| **200** | the robot ran fine; if there's an `error` it's an app/tool issue (read the body)                      |
-| **400** | your request was bad (`request` type)                                                                 |
-| **404** | the `key` you asked for isn't registered (`SCRIPT_NOT_FOUND`)                                         |
-| **422** | your script can't be processed (typo, timeout, no `handler`)                                          |
-| **429** | at capacity (`OVERLOADED`) or your partition hit its share (`PARTITION_OVERLOADED`) — back off, retry |
-| **500** | the robot itself broke (rare!) — safe to retry, someone should look                                   |
+| You get | Means                                                                                                          |
+| ------- | -------------------------------------------------------------------------------------------------------------- |
+| **200** | success — and **only** success (`error` is `null`). An answer with an `error` is never `200`.                  |
+| **400** | your request was bad (`request` type: `MALFORMED_REQUEST`, `SCRIPT_XOR_KEY`)                                   |
+| **404** | the `key` you asked for isn't registered (`SCRIPT_NOT_FOUND`)                                                  |
+| **409** | operator misconfig a retry can't fix (`AUTH_REQUEST`, `S3_FORBIDDEN`, `RESOURCE_KIND_MISMATCH`)                |
+| **413** | your script or context is over the size limit (`SCRIPT_TOO_LARGE` / `CONTEXT_TOO_LARGE`)                       |
+| **422** | can't process it and a retry won't help (typo, no `handler`, memory/op cap, a thrown script error, your park)  |
+| **500** | the robot itself broke (`INTERNAL`, rare!) — retry after the `Retry-After`                                     |
+| **503** | transient — a tool is down, at capacity, over quota, or a retryable timeout — retry after the `Retry-After`    |
 
-The rule: **5xx means "infrastructure, react!"** Everything else is explained in the
-body, so a gateway never retries things it shouldn't.
+**No `429`.** Rate-limit/quota/capacity conditions are all `503`: `429` has a `4xx`
+*digit* but retry *meaning*, so a one-digit worker would wrongly park it. The `Retry-After`
+header (seconds) rides every `503`/`500` and carries the *when* — a short backoff for
+capacity, a longer one seeded from a circuit-breaker cool-down.
 
 ## Try-again-later (`retryable`) 🔁
 
 A database deadlock or a network blip is **`retryable: true`** — waiting and retrying
-might work. A bad query or a constraint violation is **`retryable: false`** — retrying
-fails the same way, so don't.
+might work, so it's a **`5xx`** (`503`, or `500` for the robot's own `INTERNAL`) with a
+`Retry-After`. A bad query or a constraint violation is **`retryable: false`** — retrying
+fails the same way, so it's a **`4xx`** (park). The status line and this field never
+disagree.
+
+A wall-clock **`TIMEOUT`** is the one ambiguous case (a slow dependency vs a slow
+algorithm — the robot can't tell), so the operator sets `timeout_retryable` (default
+`true` → `503`; `false` → `422`). `MEMORY_LIMIT` and the op-count cap are deterministic —
+the same input hits them every time — so they stay **non-retryable (`422`)** no matter
+what.
 
 ## Catching tool errors yourself
 
-`db`, `mail`, `s3`, `redis`, and `amq` **throw** when they fail, so you can `try/catch`
-and turn it into your own friendly answer:
+`db`, `mail`, `s3`, `redis`, and `amq` **throw** when they fail. If you don't catch one it
+becomes the answer, and its `retryable` decides the status (a retryable `DB_DEADLOCK` →
+`503`, a permanent `DB_CONSTRAINT` → `4xx`). Or `try/catch` and turn it into your own
+friendly answer — now it's *your* error (add `retryable: true` to opt into `503`):
 
 ```js
 function handler(ctx) {
@@ -121,13 +147,13 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 
 | `code`              | retry | owner  | When                                                                |
 | ------------------- | ----- | ------ | ------------------------------------------------------------------- |
-| `SCRIPT_TOO_LARGE`  | no    | caller | Script bigger than `max_script_size`.                               |
-| `CONTEXT_TOO_LARGE` | no    | caller | Context bigger than `max_context_size`.                             |
-| `SCRIPT_XOR_KEY`    | no    | caller | Request has both `script` and `key`, or neither — send exactly one. |
+| `SCRIPT_TOO_LARGE`  | no    | caller | Script bigger than `max_script_size` (413).                         |
+| `CONTEXT_TOO_LARGE` | no    | caller | Context bigger than `max_context_size` (413).                       |
+| `SCRIPT_XOR_KEY`    | no    | caller | Request has both `script` and `key`, or neither — send exactly one (400). |
 | `SCRIPT_NOT_FOUND`  | no    | caller | The `key` isn't in the server's script registry (404).              |
-| `MALFORMED_REQUEST` | no    | caller | Body isn't valid JSON, has wrong field types, or is too large.      |
+| `MALFORMED_REQUEST` | no    | caller | Body isn't valid JSON, has wrong field types, or is too large (400). |
 | `RESOURCE_NOT_FOUND` | no   | caller | A `config.io` nickname the operator never set up (or not for your tenant) (400). |
-| `RESOURCE_KIND_MISMATCH` | no | caller | The nickname exists but is a different kind (asked for `db`, it's `redis`) (400). |
+| `RESOURCE_KIND_MISMATCH` | no | operator | The nickname exists but is a different kind (asked for `db`, it's `redis`). Operator misconfig ⇒ 409. |
 
 ### The engine (`type: "runtime"`)
 
@@ -136,21 +162,30 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `SYNTAX_ERROR`         | no    | developer | The script didn't parse.                                                                       |
 | `MODULE_NOT_FOUND`     | no    | developer | An ES-module handler `import`ed a specifier that isn't a registered module.                    |
 | `HANDLER_NOT_DEFINED`  | no    | developer | No `handler(ctx)` function.                                                                    |
-| `TIMEOUT`              | no    | developer | Ran past the time limit.                                                                       |
-| `MEMORY_LIMIT`         | no    | developer | The context was too big to load into the memory limit.                                         |
-| `MALFORMED_RESPONSE`   | no    | developer | Returned something that isn't a `json(...)` answer.                                            |
-| `OVERLOADED`           | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (429).                                    |
-| `PARTITION_OVERLOADED` | yes   | caller    | This partition key hit its concurrency share (per-partition fairness) — back off, retry (429). |
+| `TIMEOUT`              | cfg   | developer | Ran past the time limit. `retryable` follows `timeout_retryable` (default `true` ⇒ 503; `false` ⇒ 422). |
+| `MEMORY_LIMIT`         | no    | developer | The context was too big to load into the memory limit (422, always — deterministic).           |
+| `MALFORMED_RESPONSE`   | no    | developer | Returned something that isn't a `json(...)` answer (422).                                      |
+| `OVERLOADED`           | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (503 + `Retry-After`, never 429).         |
+| `PARTITION_OVERLOADED` | yes   | caller    | This partition key hit its concurrency share (per-partition fairness) — retry (503, never 429). |
+| `QUOTA_EXCEEDED`       | yes   | caller    | Tenant over its plan's in-flight cap — retry as executions free up (503, never 429).           |
 | `EGRESS_UNAVAILABLE`   | yes   | operator  | The request named a driver resource but the egress sidecar (`fabricd`) isn't configured or reachable (503).    |
-| `INTERNAL`             | yes   | operator  | The robot's own fault (rare) — a 500.                                                          |
+| `EGRESS_PROTOCOL`      | no    | operator  | The egress sidecar spoke the protocol wrong — operator misconfig (409).                        |
+| `INTERNAL`             | yes   | operator  | The robot's own fault (rare) — a 500 with `Retry-After`.                                        |
 
 ### Your script (`type: "script"`)
 
-| `code`         | retry | owner     | When                                                                     |
-| -------------- | ----- | --------- | ------------------------------------------------------------------------ |
-| `SCRIPT_ERROR` | no    | developer | Your code threw an error (or hit a bug). `message` is your error's text. |
+| `code`         | retry | owner     | When                                                                            |
+| -------------- | ----- | --------- | ------------------------------------------------------------------------------- |
+| `SCRIPT_ERROR` | no    | developer | Your code threw an error (or hit a bug). `message` is your error's text. Parks at 422 (an uncaught throw is never a `200`). |
 
 ### Tools (`type: "capability"`)
+
+A tool failure that reaches the top of the request (you didn't `try/catch` it) now
+**projects onto the status line** like any other error: a retryable code (`DB_DEADLOCK`,
+`REDIS_TIMEOUT`, …) → `503` + `Retry-After`; a permanent one (`DB_CONSTRAINT`,
+`S3_FORBIDDEN`, …) → `4xx`. (This changed from the old behaviour, where every tool error
+was `200` — a retry worker couldn't see the difference.) The `retry`/`owner` columns below
+are exactly what drives that status.
 
 **`db`** (from the database's `SqlState`):
 
@@ -182,7 +217,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | -------------- | ----- | --------- | --------------------------------------------------------------------------- |
 | `S3_UPSTREAM`  | yes   | operator  | Store errored or was unreachable (`usage`/`delete`). `details.http_status`. |
 | `S3_OP_LIMIT`  | no    | developer | Hit `max_ops` while listing.                                                |
-| `S3_FORBIDDEN` | no    | operator  | `delete` without `config.s3.allow_delete`.                                  |
+| `S3_FORBIDDEN` | no    | operator  | `delete` without `config.s3.allow_delete`. Operator misconfig ⇒ 409.        |
 | `S3_ERROR`     | no    | developer | Bad key/config / signing (fallback).                                        |
 
 **`api`** (returned **in-band** as `{ status: 0, error }`, never thrown):
@@ -221,11 +256,20 @@ thrown). These codes are only for the failures `auth` **throws**:
 | `code`             | retry | owner     | When                                                                          |
 | ------------------ | ----- | --------- | ----------------------------------------------------------------------------- |
 | `AUTH_UNAVAILABLE` | yes   | operator  | Identity server unreachable / 5xx / timeout. `details.http_status`.           |
-| `AUTH_REQUEST`     | no    | operator  | Misconfig: bad endpoint, discovery failed, `introspect` without client creds. |
+| `AUTH_REQUEST`     | no    | operator  | Misconfig: bad endpoint, discovery failed, `introspect` without client creds. Operator misconfig ⇒ 409. |
 | `AUTH_OP_LIMIT`    | no    | developer | Hit `max_ops`.                                                                |
 
 > New codes can show up over time, but they **never change meaning** and never move to a
 > different `type` — so it's always safe to switch on `code`.
+
+## Batches read the body, not the status 📦
+
+`POST /batch` is the exception to the traffic-light rule. An admitted batch always returns
+**`200`**, because its items each have their own outcome and can't share one status line.
+Every item carries its own `{ data, error, meta }` envelope inside `results[]`, so a batch
+consumer is an **envelope-reader** by construction: branch on each item's `error` +
+`retryable`, not on the batch's HTTP status. (Batch-level rejections — bad auth, a
+malformed body, over the item cap — are still non-`200`, since the whole request failed.)
 
 ## The receipt number — `trace_id` 🧾
 

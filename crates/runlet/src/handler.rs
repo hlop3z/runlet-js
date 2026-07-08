@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -49,6 +49,7 @@ use crate::events::{AuditBody, CapabilityOps, Event, EventBody, Sink, UsageBody}
 use crate::identity::TrustedIdentity;
 use crate::quota::{QuotaExceeded, QuotaGuard, TenantQuota};
 use crate::sidecar::{SessionConn, SessionError, SidecarEgress, SidecarTransport, connect_session};
+use crate::status::{Projected, project_envelope};
 
 /// Shared application state for the router: the logic host, the script registry, and
 /// the concurrency bulkhead.
@@ -98,6 +99,36 @@ pub(crate) struct AppState {
     /// `POST /batch` fan-out caps (item count + combined-input / total-response byte bounds). Copied
     /// from server config; the single-`/execute` path never reads it.
     pub(crate) batch: BatchConfig,
+    /// Whether a wall-clock `TIMEOUT` is classified retryable (`true ⇒ 503`, `false ⇒ 422`). Only
+    /// `TIMEOUT` reads it; `MEMORY_LIMIT`/op-cap stay non-retryable. Fed into `into_envelope`.
+    pub(crate) timeout_retryable: bool,
+    /// Seconds advertised in the `Retry-After` header on a retryable `503`/`500`.
+    pub(crate) retry_after_seconds: u32,
+}
+
+impl AppState {
+    /// The response-shaping policy for this request: debug gating, the `TIMEOUT` retryability knob,
+    /// and the `Retry-After` default — threaded together so a response builder takes one `Copy`
+    /// value instead of three loose flags.
+    const fn resp_cfg(&self) -> RespCfg {
+        RespCfg {
+            error_debug: self.error_debug,
+            timeout_retryable: self.timeout_retryable,
+            retry_after_seconds: self.retry_after_seconds,
+        }
+    }
+}
+
+/// Response-shaping policy carried into the error/success builders (a `Copy` bundle so the
+/// signatures stay within the argument-count lint).
+#[derive(Debug, Clone, Copy)]
+struct RespCfg {
+    /// Include `error.debug` (stack + raw cause) in the envelope.
+    error_debug: bool,
+    /// `TIMEOUT` retryability knob (governs only the `TIMEOUT` fault's `retryable`).
+    timeout_retryable: bool,
+    /// `Retry-After` seconds attached to a retryable `503`/`500`.
+    retry_after_seconds: u32,
 }
 
 /// Resolved trusted-header-mode runtime state, shared into the handler. Present only when
@@ -406,42 +437,38 @@ fn raw_null_ref() -> &'static RawValue {
     &RAW_NULL
 }
 
-/// Maps a [`SessionError`] (opening the `fabricd` session) to a `(status, envelope)` pair: a
-/// resolution failure is the caller's `400`, an unreachable/absent sidecar is a retryable `503`, a
-/// protocol slip is a `500`. Shared by the single-`/execute` response path and the per-item `/batch`
-/// path (which renders the envelope inside a `200` batch instead of setting the HTTP status).
-fn session_error_envelope(err: SessionError) -> (u16, ErrorEnvelope) {
+/// Maps a [`SessionError`] (opening the `fabricd` session) to its classified envelope: a
+/// resolution failure is a caller fault, an unreachable/absent sidecar is a retryable operator
+/// fault (`EGRESS_UNAVAILABLE`), a protocol slip a non-retryable operator fault (`EGRESS_PROTOCOL`).
+/// The HTTP status is a *projection* of the envelope's `(retryable, owner)` (design D6) at the
+/// response site — shared by single-`/execute` (which sets the status) and per-item `/batch` (which
+/// renders the envelope inside a `200` batch).
+fn session_error_envelope(err: SessionError) -> ErrorEnvelope {
     match err {
-        SessionError::Resolve { code, message } => (400, request_error(&code, message)),
-        SessionError::Unavailable(message) => (
-            503,
-            ErrorEnvelope::new(
-                ErrorCategory::Runtime,
-                ErrorSource::Engine,
-                "EGRESS_UNAVAILABLE".to_owned(),
-                true,
-                ErrorOwner::Operator,
-            )
-            .with_message(message),
-        ),
-        SessionError::Protocol(_raw) => (
-            500,
-            ErrorEnvelope::new(
-                ErrorCategory::Runtime,
-                ErrorSource::Engine,
-                "EGRESS_PROTOCOL".to_owned(),
-                false,
-                ErrorOwner::Operator,
-            )
-            .with_message("egress protocol error".to_owned()),
-        ),
+        SessionError::Resolve { code, message } => request_error(&code, message),
+        SessionError::Unavailable(message) => ErrorEnvelope::new(
+            ErrorCategory::Runtime,
+            ErrorSource::Engine,
+            "EGRESS_UNAVAILABLE".to_owned(),
+            true,
+            ErrorOwner::Operator,
+        )
+        .with_message(message),
+        SessionError::Protocol(_raw) => ErrorEnvelope::new(
+            ErrorCategory::Runtime,
+            ErrorSource::Engine,
+            "EGRESS_PROTOCOL".to_owned(),
+            false,
+            ErrorOwner::Operator,
+        )
+        .with_message("egress protocol error".to_owned()),
     }
 }
 
-/// Maps a [`SessionError`] to the single-`/execute` HTTP response (status + envelope + meta).
-fn session_error_response(err: SessionError, meta: Meta) -> AxumResponse {
-    let (status, envelope) = session_error_envelope(err);
-    system_error_response(envelope, status, meta)
+/// Maps a [`SessionError`] to the single-`/execute` HTTP response, projecting the status from the
+/// envelope (`EGRESS_UNAVAILABLE ⇒ 503 + Retry-After`, `EGRESS_PROTOCOL ⇒ 409`, resolve ⇒ `400`).
+fn session_error_response(err: SessionError, meta: Meta, cfg: RespCfg) -> AxumResponse {
+    projected_error_response(session_error_envelope(err), meta, cfg)
 }
 
 /// Adapts an axum [`HeaderMap`] to the `OTel` [`Extractor`] interface so the W3C
@@ -622,7 +649,7 @@ async fn run_execute(
     }
 
     let engine_cfg = state.engine_cfg;
-    let error_debug = state.error_debug;
+    let cfg = state.resp_cfg();
 
     // Resolve exactly one of `script` / `key` into the source to execute.
     let source = match resolve_script(script, key.as_deref(), &state.registry) {
@@ -636,11 +663,13 @@ async fn run_execute(
                 "SCRIPT_NOT_FOUND",
                 None,
             );
-            let (status, envelope) = *rejection;
+            let (_status, envelope) = *rejection;
             let meta = Meta::new(trace_id, 0, context_bytes, 0)
                 .with_key(key)
                 .with_partition(partition);
-            return system_error_response(envelope, status, meta);
+            // The status is a projection of the envelope (`SCRIPT_NOT_FOUND ⇒ 404`,
+            // `SCRIPT_XOR_KEY ⇒ 400`); the tuple's status literal is superseded (D6).
+            return projected_error_response(envelope, meta, cfg);
         }
     };
     let script_bytes = source.as_str().len();
@@ -663,7 +692,9 @@ async fn run_execute(
         let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
             .with_key(key)
             .with_partition(partition);
-        return system_error_response(request_error(code, message), 400, meta);
+        // Oversize input is a caller fault that parks at `413` (projected from the
+        // `SCRIPT_TOO_LARGE`/`CONTEXT_TOO_LARGE` code), not a generic `400`.
+        return projected_error_response(request_error(code, message), meta, cfg);
     }
 
     let context_json: String = context.get().into();
@@ -707,7 +738,7 @@ async fn run_execute(
                 let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
                     .with_key(key)
                     .with_partition(partition);
-                return session_error_response(err, meta);
+                return session_error_response(err, meta, cfg);
             }
         }
     } else {
@@ -757,7 +788,7 @@ async fn run_execute(
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
         .with_key(key)
         .with_partition(partition);
-    build_response(result, base_meta, error_debug, &state, identity.as_ref())
+    build_response(result, base_meta, cfg, &state, identity.as_ref())
 }
 
 /// Inputs for the shared blocking-execution core (grouped so the call sites and the
@@ -1238,7 +1269,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
             Ok(conn) => Some(conn),
             Err(err) => {
                 emit_denied(state, identity, trace_id, "EGRESS_UNAVAILABLE", None);
-                let (_status, envelope) = session_error_envelope(err);
+                let envelope = session_error_envelope(err);
                 let meta = base_error_meta(
                     trace_id,
                     script_bytes,
@@ -1369,13 +1400,13 @@ fn render_executed_item(
                 ExecOutcome::Success(js_json) => {
                     emit_executed(state, identity, &meta, "success");
                     metrics.record_success();
-                    render_success_item(&js_json, &meta, id, state.error_debug)
+                    render_success_item(&js_json, &meta, id, state.resp_cfg())
                 }
                 ExecOutcome::Error(engine_err) => {
                     let outcome = engine_error_outcome(&engine_err);
                     emit_executed(state, identity, &meta, outcome);
                     metrics.record_engine_error(&engine_err);
-                    render_engine_error_item(engine_err, &meta, id, state.error_debug)
+                    render_engine_error_item(engine_err, &meta, id, state.resp_cfg())
                 }
             }
         }
@@ -1383,26 +1414,21 @@ fn render_executed_item(
             let outcome = engine_error_outcome(&engine_err);
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
-            render_engine_error_item(engine_err, &base_meta, id, state.error_debug)
+            render_engine_error_item(engine_err, &base_meta, id, state.resp_cfg())
         }
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
             let outcome = engine_error_outcome(&engine_err);
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
-            render_engine_error_item(engine_err, &base_meta, id, state.error_debug)
+            render_engine_error_item(engine_err, &base_meta, id, state.resp_cfg())
         }
     }
 }
 
 /// Serializes a success item from the JS `{data, error}` output + meta + id. A JS output that does
 /// not parse is rendered as a `MALFORMED_RESPONSE` error item instead (mirrors [`success_response`]).
-fn render_success_item(
-    js_json: &str,
-    meta: &Meta,
-    id: Option<&str>,
-    error_debug: bool,
-) -> RenderedItem {
+fn render_success_item(js_json: &str, meta: &Meta, id: Option<&str>, cfg: RespCfg) -> RenderedItem {
     match serde_json::from_str::<Envelope<'_>>(js_json) {
         Ok(env) => {
             let envelope = ItemSuccessEnvelope {
@@ -1418,22 +1444,23 @@ fn render_success_item(
         Err(parse_err) => {
             let envelope =
                 EngineError::Malformed(format!("malformed handler response: {parse_err}"))
-                    .into_envelope(error_debug);
+                    .into_envelope(cfg.error_debug, cfg.timeout_retryable);
             render_error_item(&envelope, meta, id)
         }
     }
 }
 
 /// Serializes an engine-error item, logging the raw cause server-side keyed by `trace_id` (mirrors
-/// [`engine_error_response`]).
+/// [`engine_error_response`]). A `/batch` item's classification rides its rendered envelope inside
+/// the `200` batch (design D4) — the projected HTTP status applies to single `/execute` only.
 fn render_engine_error_item(
     err: EngineError,
     meta: &Meta,
     id: Option<&str>,
-    error_debug: bool,
+    cfg: RespCfg,
 ) -> RenderedItem {
     warn!(trace_id = %meta.trace_id, error = ?err, "batch item system error");
-    let envelope = err.into_envelope(error_debug);
+    let envelope = err.into_envelope(cfg.error_debug, cfg.timeout_retryable);
     render_error_item(&envelope, meta, id)
 }
 
@@ -1632,7 +1659,7 @@ fn emit_denied(
 fn build_response(
     result: Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError>,
     base_meta: Meta,
-    error_debug: bool,
+    cfg: RespCfg,
     state: &AppState,
     identity: Option<&TrustedIdentity>,
 ) -> AxumResponse {
@@ -1650,14 +1677,14 @@ fn build_response(
                     emit_executed(state, identity, &meta, "success");
                     metrics.record_success();
                     record_span_outcome("success");
-                    success_response(&js_json, meta, error_debug)
+                    success_response(&js_json, meta, cfg)
                 }
                 ExecOutcome::Error(engine_err) => {
                     let outcome = engine_error_outcome(&engine_err);
                     emit_executed(state, identity, &meta, outcome);
                     metrics.record_engine_error(&engine_err);
                     record_span_outcome(outcome);
-                    engine_error_response(engine_err, meta, error_debug)
+                    engine_error_response(engine_err, meta, cfg)
                 }
             }
         }
@@ -1666,7 +1693,7 @@ fn build_response(
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
             record_span_outcome(outcome);
-            engine_error_response(engine_err, base_meta, error_debug)
+            engine_error_response(engine_err, base_meta, cfg)
         }
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
@@ -1674,7 +1701,7 @@ fn build_response(
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
             record_span_outcome(outcome);
-            engine_error_response(engine_err, base_meta, error_debug)
+            engine_error_response(engine_err, base_meta, cfg)
         }
     }
 }
@@ -1768,9 +1795,11 @@ fn malformed_request_response(state: &AppState, rejection: &JsonRejection) -> Ax
     system_error_response(envelope, 400, Meta::new(trace_id, 0, 0, 0))
 }
 
-/// Builds the `429 OVERLOADED` response when the bulkhead is saturated: a runtime-category
-/// envelope, retryable, owned by the operator (capacity, not the caller's request).
-fn overloaded_response(meta: Meta) -> AxumResponse {
+/// Builds the `OVERLOADED` response when the bulkhead is saturated: a runtime-category envelope,
+/// retryable, owned by the operator (capacity, not the caller's request). Retryable ⇒ projects to
+/// `503` + `Retry-After` (**never `429`** — a `4xx` digit would make a status-line worker park a
+/// response that only needs to wait; the `Retry-After` value carries the backoff horizon).
+fn overloaded_response(meta: Meta, cfg: RespCfg) -> AxumResponse {
     let envelope = ErrorEnvelope::new(
         ErrorCategory::Runtime,
         ErrorSource::Engine,
@@ -1779,13 +1808,13 @@ fn overloaded_response(meta: Meta) -> AxumResponse {
         ErrorOwner::Operator,
     )
     .with_message("server at capacity, retry shortly".to_owned());
-    system_error_response(envelope, 429, meta)
+    projected_error_response(envelope, meta, cfg)
 }
 
-/// Builds the `429 PARTITION_OVERLOADED` response (Tier 5): this partition exceeded its
-/// concurrency share while global capacity may remain — the caller (that partition) should
-/// back off, so it's owned by the caller, retryable.
-fn partition_overloaded_response(meta: Meta) -> AxumResponse {
+/// Builds the `PARTITION_OVERLOADED` response (Tier 5): this partition exceeded its concurrency
+/// share while global capacity may remain — the caller (that partition) should back off, so it's
+/// owned by the caller, retryable. Retryable ⇒ projects to `503` + `Retry-After` (never `429`).
+fn partition_overloaded_response(meta: Meta, cfg: RespCfg) -> AxumResponse {
     let envelope = ErrorEnvelope::new(
         ErrorCategory::Runtime,
         ErrorSource::Engine,
@@ -1794,7 +1823,7 @@ fn partition_overloaded_response(meta: Meta) -> AxumResponse {
         ErrorOwner::Caller,
     )
     .with_message("partition concurrency limit reached, retry shortly".to_owned());
-    system_error_response(envelope, 429, meta)
+    projected_error_response(envelope, meta, cfg)
 }
 
 /// Outcome of acquiring the per-partition (Tier 5) + global bulkhead (Tier 1) permits.
@@ -1828,11 +1857,14 @@ fn admit(
         } => Ok((partition_permit, global)),
         Admission::PartitionBusy => {
             state.metrics.record_overload_partition();
-            Err(Box::new(partition_overloaded_response(busy_meta)))
+            Err(Box::new(partition_overloaded_response(
+                busy_meta,
+                state.resp_cfg(),
+            )))
         }
         Admission::GlobalBusy => {
             state.metrics.record_overload_global();
-            Err(Box::new(overloaded_response(busy_meta)))
+            Err(Box::new(overloaded_response(busy_meta, state.resp_cfg())))
         }
     }
 }
@@ -2079,7 +2111,11 @@ fn enforce_quota<F: FnOnce() -> Meta>(
                     "usage": exceeded.usage,
                 })),
             );
-            Err(Box::new(quota_exceeded_response(&exceeded, meta())))
+            Err(Box::new(quota_exceeded_response(
+                &exceeded,
+                meta(),
+                state.resp_cfg(),
+            )))
         }
     }
 }
@@ -2104,9 +2140,12 @@ fn quota_exceeded_envelope(exceeded: &QuotaExceeded) -> ErrorEnvelope {
     ))
 }
 
-/// Builds the `429 QUOTA_EXCEEDED` single-`/execute` response from the shared envelope + meta.
-fn quota_exceeded_response(exceeded: &QuotaExceeded, meta: Meta) -> AxumResponse {
-    system_error_response(quota_exceeded_envelope(exceeded), 429, meta)
+/// Builds the `QUOTA_EXCEEDED` single-`/execute` response from the shared envelope + meta.
+/// Retryable (a concurrency cap frees as executions finish) ⇒ projects to `503` + `Retry-After`,
+/// **not `429`** — the header's *value* distinguishes a per-second rate-limit from a hard cap, the
+/// status stays a truthful "retry" for a one-digit worker.
+fn quota_exceeded_response(exceeded: &QuotaExceeded, meta: Meta, cfg: RespCfg) -> AxumResponse {
+    projected_error_response(quota_exceeded_envelope(exceeded), meta, cfg)
 }
 
 /// Enforces the optional `/execute` bearer gate. Returns `Some(401)` when a token is
@@ -2163,33 +2202,103 @@ fn request_error(code: &str, message: String) -> ErrorEnvelope {
 /// Rust-side as opaque handles (see `sys.rs`), so a script can only ever return the
 /// `"[secret:NAME]"` placeholder, never the value. The `{data,error}` borrow stays
 /// zero-copy.
-fn success_response(js_json: &str, meta: Meta, error_debug: bool) -> AxumResponse {
+fn success_response(js_json: &str, meta: Meta, cfg: RespCfg) -> AxumResponse {
     match serde_json::from_str::<Envelope<'_>>(js_json) {
-        Ok(env) => (
-            StatusCode::OK,
-            Json(Response {
-                data: env.data,
-                error: env.error,
-                meta,
-            }),
-        )
-            .into_response(),
+        Ok(env) => handler_envelope_response(&env, meta, cfg),
         Err(parse_err) => engine_error_response(
             EngineError::Malformed(format!("malformed handler response: {parse_err}")),
             meta,
-            error_debug,
+            cfg,
         ),
     }
 }
 
-/// Maps a classified [`EngineError`] to its envelope (debug-gated) + HTTP status, and
-/// logs the full (raw) error server-side keyed by `trace_id` — so the raw cause is
-/// always captured for support even when `error_debug` strips it from the response.
-fn engine_error_response(err: EngineError, meta: Meta, error_debug: bool) -> AxumResponse {
-    let status = err.http_status();
-    warn!(trace_id = %meta.trace_id, status, error = ?err, "execute system error");
-    let envelope = err.into_envelope(error_debug);
-    system_error_response(envelope, status, meta)
+/// Serializes the handler's own `{data, error}` output at a status *projected from the returned
+/// error* (design D5): `2xx` **iff** `error` is null; otherwise the handler's opt-in top-level
+/// boolean `retryable` picks the status (`true ⇒ 503` + `Retry-After`, `false`/absent ⇒ `422`). The
+/// body — both `data` and `error` — is passed through **verbatim** (invariant D1); the box only
+/// *reads* the one key to set the status line, never rewrites the payload.
+fn handler_envelope_response(env: &Envelope<'_>, meta: Meta, cfg: RespCfg) -> AxumResponse {
+    let projected = handler_status(env.error);
+    let status = StatusCode::from_u16(projected.status).unwrap_or(StatusCode::OK);
+    let mut response = (
+        status,
+        Json(Response {
+            data: env.data,
+            error: env.error,
+            meta,
+        }),
+    )
+        .into_response();
+    if projected.retry_after {
+        add_retry_after(&mut response, cfg.retry_after_seconds);
+    }
+    response
+}
+
+/// A handler-returned envelope carrying no top-level `retryable` key is an ordinary business error.
+#[derive(Deserialize)]
+struct HandlerRetryable {
+    /// The opt-in retry hint the box projects to the status line (`503`/`422`); absent ⇒ park.
+    #[serde(default)]
+    retryable: Option<bool>,
+}
+
+/// Projects a handler-returned `error` value onto the HTTP status line (D5). A JSON-null `error`
+/// is a real success (`200`); any non-null `error` is never `2xx` — it parks at `422` unless the
+/// handler opted into retry with a top-level `retryable: true` (then `503` + `Retry-After`). A
+/// non-object or `retryable`-less error is treated as absent ⇒ `422`.
+fn handler_status(error: &RawValue) -> Projected {
+    if error.get().trim() == "null" {
+        return Projected {
+            status: 200,
+            retry_after: false,
+        };
+    }
+    let retryable = serde_json::from_str::<HandlerRetryable>(error.get())
+        .ok()
+        .and_then(|parsed| parsed.retryable);
+    if retryable == Some(true) {
+        Projected {
+            status: 503,
+            retry_after: true,
+        }
+    } else {
+        Projected {
+            status: 422,
+            retry_after: false,
+        }
+    }
+}
+
+/// Maps a classified [`EngineError`] to its projected HTTP response (design D6), and logs the
+/// full (raw) error server-side keyed by `trace_id` — so the raw cause is always captured for
+/// support even when `error_debug` strips it from the response.
+fn engine_error_response(err: EngineError, meta: Meta, cfg: RespCfg) -> AxumResponse {
+    warn!(trace_id = %meta.trace_id, error = ?err, "execute system error");
+    let envelope = err.into_envelope(cfg.error_debug, cfg.timeout_retryable);
+    projected_error_response(envelope, meta, cfg)
+}
+
+/// Serializes a classified system error, projecting its HTTP status from the envelope's
+/// `(retryable, owner, code)` (the single source of truth, design D6) and attaching a `Retry-After`
+/// header on the retryable `5xx` class. The one place a classified fault becomes an HTTP status.
+fn projected_error_response(error: ErrorEnvelope, meta: Meta, cfg: RespCfg) -> AxumResponse {
+    let projected = project_envelope(&error);
+    let mut response = system_error_response(error, projected.status, meta);
+    if projected.retry_after {
+        add_retry_after(&mut response, cfg.retry_after_seconds);
+    }
+    response
+}
+
+/// Attaches (replacing any existing) the `Retry-After` header as a delay in seconds. Seeded from
+/// the configured default — the box's circuit breakers live in `fabricd`, so there is no local
+/// cool-down to read; the status already says "retry", the header only bounds the backoff.
+fn add_retry_after(response: &mut AxumResponse, seconds: u32) {
+    if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+        let _prev = response.headers_mut().insert(RETRY_AFTER, value);
+    }
 }
 
 /// Serializes a `{ data: null, error, meta }` response at the given status.
@@ -2407,6 +2516,8 @@ mod trusted_pipeline_tests {
             events: None,
             event_dropped: None,
             batch: crate::config::BatchConfig::default(),
+            timeout_retryable: true,
+            retry_after_seconds: 1,
         }
     }
 
@@ -2511,9 +2622,11 @@ mod trusted_pipeline_tests {
             ("x-tenant-scope", "acting"),
             ("x-tenant-plan", "denied"),
         ]);
+        // Over-quota is retryable ⇒ `503` (never `429`, whose `4xx` digit would make a status-line
+        // worker park a response that only needs to wait).
         assert_eq!(
             run(&app, hdrs, RequestConfig::default()).await,
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::SERVICE_UNAVAILABLE
         );
         let lines = sink.lines();
         let usage = lines
@@ -2596,9 +2709,10 @@ mod trusted_pipeline_tests {
             ("x-tenant-scope", "acting"),
             ("x-tenant-plan", "denied"),
         ]);
+        // Retryable capacity fault ⇒ `503`, not `429` (see the projection invariant).
         assert_eq!(
             run(&app, hdrs, RequestConfig::default()).await,
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
@@ -2722,6 +2836,8 @@ mod batch_tests {
             events: None,
             event_dropped: None,
             batch: BatchConfig::default(),
+            timeout_retryable: true,
+            retry_after_seconds: 1,
         }
     }
 
@@ -2941,5 +3057,189 @@ mod batch_tests {
             results[1]["data"], "plain",
             "an ungated item in the same batch still runs"
         );
+    }
+}
+
+#[cfg(test)]
+mod execute_status_tests {
+    //! `/execute` HTTP status = projection of the outcome (design D1/D5): a null-error success is
+    //! `200`; a handler-returned error is never `2xx` — it parks at `422` unless the handler opts
+    //! into retry (`retryable: true ⇒ 503` + `Retry-After`); the body is passed through verbatim.
+    //! Also covers the engine-error projections reachable without a wired sidecar (oversize `413`,
+    //! syntax `422`).
+
+    use super::{AppState, ExecRequest, RequestConfig, default_context, execute};
+    use crate::sidecar::SidecarTransport;
+    use axum::Json;
+    use axum::body::to_bytes;
+    use axum::extract::State;
+    use axum::http::header::RETRY_AFTER;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse as _, Response as AxumResponse};
+    use runlet_core::config::EngineConfig;
+    use runlet_core::host::{HostSettings, LogicHost};
+    use runlet_core::metrics::Metrics;
+    use runlet_core::modules::ModuleRegistry;
+    use runlet_core::pool::JsPool;
+    use runlet_core::registry::ScriptRegistry;
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// A non-trusted (single-tenant, no sidecar) app state with a small warm pool.
+    fn state() -> AppState {
+        let mut engine = EngineConfig::default();
+        engine
+            .resolve_limits()
+            .unwrap_or_else(|_err| unreachable!("engine limits resolve"));
+        let pool = JsPool::new(engine, Arc::new(ModuleRegistry::default()))
+            .unwrap_or_else(|_err| unreachable!("pool init"));
+        let registry = Arc::new(ScriptRegistry::default());
+        let host = LogicHost::new(
+            pool,
+            Arc::clone(&registry),
+            HostSettings {
+                limits: engine,
+                allow_private_targets: false,
+            },
+        );
+        AppState {
+            host,
+            registry,
+            engine_cfg: engine,
+            error_debug: false,
+            limiter: Arc::new(Semaphore::new(8)),
+            partition_limiter: None,
+            transport: SidecarTransport::None,
+            metrics: Arc::new(Metrics::default()),
+            bulkhead_capacity: 8,
+            access_token: None,
+            trusted: None,
+            events: None,
+            event_dropped: None,
+            batch: crate::config::BatchConfig::default(),
+            timeout_retryable: true,
+            retry_after_seconds: 7,
+        }
+    }
+
+    /// Drives `/execute` with an inline script and returns the raw response.
+    async fn run(app: &AppState, script: &str) -> AxumResponse {
+        let req = ExecRequest {
+            script: Some(script.to_owned()),
+            key: None,
+            partition: None,
+            context: default_context(),
+            config: RequestConfig::default(),
+        };
+        execute(State(app.clone()), HeaderMap::new(), Ok(Json(req)))
+            .await
+            .into_response()
+    }
+
+    /// Splits a response into `(status, retry_after_header, parsed_body)`.
+    async fn parts(response: AxumResponse) -> (StatusCode, Option<String>, Value) {
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+        (status, retry_after, body)
+    }
+
+    /// A handler returning only `data` (null error) is a real success: `200`, no `Retry-After`.
+    #[tokio::test]
+    async fn null_error_is_200() {
+        let app = state();
+        let (status, retry_after, body) =
+            parts(run(&app, "function handler(){ return { data: 42 }; }").await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(retry_after.is_none(), "no Retry-After on a success");
+        assert_eq!(body["data"], 42);
+        assert!(body["error"].is_null());
+    }
+
+    /// A handler that opts into retry (`retryable: true`) parks the status at `503` with a
+    /// `Retry-After` header, and the `error` body is passed through verbatim.
+    #[tokio::test]
+    async fn handler_opts_into_retry_503() {
+        let app = state();
+        let script =
+            "function handler(){ return json(null, { message: 'later', retryable: true }); }";
+        let (status, retry_after, body) = parts(run(&app, script).await).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            retry_after.as_deref(),
+            Some("7"),
+            "Retry-After seeded from the configured default"
+        );
+        assert_eq!(
+            body["error"]["message"], "later",
+            "the error body is verbatim"
+        );
+        assert_eq!(body["error"]["retryable"], true);
+    }
+
+    /// A handler that opts into park (`retryable: false`) is `422`, body verbatim, no `Retry-After`.
+    #[tokio::test]
+    async fn handler_opts_into_park_422() {
+        let app = state();
+        let script =
+            "function handler(){ return json(null, { message: 'nope', retryable: false }); }";
+        let (status, retry_after, body) = parts(run(&app, script).await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(retry_after.is_none());
+        assert_eq!(body["error"]["message"], "nope");
+    }
+
+    /// An un-annotated handler error (no `retryable` key) defaults to `422` (park), never `200`.
+    #[tokio::test]
+    async fn unannotated_handler_error_parks_422() {
+        let app = state();
+        let script = "function handler(){ return json(null, { message: 'name required' }); }";
+        let (status, _retry_after, body) = parts(run(&app, script).await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["error"]["message"], "name required",
+            "body passed through unchanged"
+        );
+    }
+
+    /// An uncaught handler throw is a non-retryable developer error ⇒ `422` (not the old `200`).
+    #[tokio::test]
+    async fn uncaught_throw_parks_422() {
+        let app = state();
+        let (status, retry_after, _body) =
+            parts(run(&app, "function handler(){ throw new Error('boom'); }").await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(retry_after.is_none());
+    }
+
+    /// A syntax error parks at `422`.
+    #[tokio::test]
+    async fn syntax_error_parks_422() {
+        let app = state();
+        let (status, _retry_after, body) = parts(run(&app, "function handler( {").await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "SYNTAX_ERROR");
+    }
+
+    /// An oversized script is a caller fault that parks at `413`, not `400`.
+    #[tokio::test]
+    async fn oversize_script_is_413() {
+        let mut app = state();
+        app.engine_cfg.max_script_size = 32;
+        let big = format!(
+            "function handler(){{ return {{ data: '{}' }}; }}",
+            "x".repeat(200)
+        );
+        let (status, _retry_after, body) = parts(run(&app, &big).await).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "SCRIPT_TOO_LARGE");
     }
 }
