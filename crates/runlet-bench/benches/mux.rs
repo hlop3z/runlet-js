@@ -61,9 +61,7 @@ fn build_host() -> LogicHost {
 
 /// Runs one invocation of `script` on the warm host and black-boxes the outcome.
 fn run_once(host: &LogicHost, script: &str) {
-    let outcome = host.run(
-        Invocation::inline(script, "{\"n\":1}").caps(CapabilitySet::NONE),
-    );
+    let outcome = host.run(Invocation::inline(script, "{\"n\":1}").caps(CapabilitySet::NONE));
     black_box(outcome.unwrap_or_else(|_err| unreachable!("invocation must run")));
 }
 
