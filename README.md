@@ -535,9 +535,9 @@ script owns (de)serialization. Synchronous (no `await`).
 function handler(ctx) {
   redis.set("user:1", JSON.stringify({ id: 1 }), { ttl: 60 }); // ttl seconds, optional
   var raw = redis.get("user:1"); // string | null (null if missing)
-  var n = redis.incr("visits"); // number (new value)
+  var n = redis.increment("visits"); // number (new value)
   redis.expire("user:1", 120); // bool (true if the key existed)
-  redis.del("user:1"); // number (keys removed)
+  redis.delete("user:1"); // number (keys removed)
   return json({ user: JSON.parse(raw), visits: n }, null);
 }
 ```

@@ -1,17 +1,16 @@
 (function() {
-  // Generic egress wrapper. Per-capability wrappers (db.js, mail.js, …) will call into the
-  // same `__io` FFI underneath; this `io.call` is the explicit, low-level surface.
-  // Mirrors db.js: a successful call returns parsed JSON; a failed call returns a `__runlet`
-  // tagged object the wrapper re-throws so the engine classifies it as a capability error.
+  // Generic egress wrapper over the `__io` FFI. `io.call(name, action, payload)` is the explicit
+  // low-level surface; `io.channel(name)` returns a caller bound to one capability name so a
+  // per-capability wrapper (db.js, redis.js, …) names its capability exactly once. The `__runlet`
+  // tagged-error contract is unwrapped by the shared `__ffi.unwrap` primitive (js/ffi.js) — the
+  // same one the in-engine `s3` bypass uses.
   function call(name, action, payload) {
-    var raw = __io(name, action, JSON.stringify(payload === undefined ? null : payload));
-    var res = JSON.parse(raw);
-    if (res && res.error) {
-      var err = new Error(res.error);
-      err.__runlet = res; // { error, code, retryable, owner, source, details? }
-      throw err;
-    }
-    return res;
+    return __ffi.unwrap(
+      __io(name, action, JSON.stringify(payload === undefined ? null : payload))
+    );
   }
-  globalThis.io = { call: call };
+  function channel(name) {
+    return function(action, payload) { return call(name, action, payload); };
+  }
+  globalThis.io = { call: call, channel: channel };
 })();

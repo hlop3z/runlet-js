@@ -41,6 +41,11 @@ use crate::sys::{self, SysConfig};
 /// The `json()` bridge — loaded from `src/js/bridge.js` at compile time.
 const JSON_BRIDGE: &str = include_str!("js/bridge.js");
 
+/// Shared FFI primitives (`__ffi.unwrap`, the `__runlet` tagged-error contract) — loaded from
+/// `src/js/ffi.js` at compile time. Injected unconditionally with the bridge so it is present for
+/// both egress surfaces (`io.js` and the `s3` bypass), which are gated independently.
+const FFI_PRIMITIVES: &str = include_str!("js/ffi.js");
+
 /// Human-safe message for a missing `handler`.
 const HANDLER_MISSING_MSG: &str = "script must define a `handler(context)` function";
 /// Human-safe message for an out-of-memory abort.
@@ -399,10 +404,14 @@ fn setup_timeout(runtime: &Runtime, timeout: Duration) -> Arc<AtomicBool> {
     timed_out
 }
 
-/// Injects the `json(data, error)` bridge function.
+/// Injects the always-present JS primitives: the `json(data, error)` bridge and the shared
+/// `__ffi` FFI unwrap (both egress wrappers depend on `__ffi`, which is why it lands here rather
+/// than in the independently-gated `io`/`s3` injection paths).
 fn inject_bridge(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let bridge: JsValue<'_> = qctx.eval(JSON_BRIDGE)?;
     drop(bridge);
+    let ffi: JsValue<'_> = qctx.eval(FFI_PRIMITIVES)?;
+    drop(ffi);
     Ok(())
 }
 

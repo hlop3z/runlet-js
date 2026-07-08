@@ -3,10 +3,8 @@
     if (value === undefined || value === null) return [];
     return Array.isArray(value) ? value : [value];
   }
-  // Routes through the generic io egress (throws a tagged capability error on failure).
-  function call(action, payload) {
-    return io.call('mail', action, payload || {});
-  }
+  // Bound to the `mail` capability via io.channel (throws a tagged capability error on failure).
+  var call = io.channel('mail');
   globalThis.mail = {
     send: function(opts) {
       opts = opts || {};

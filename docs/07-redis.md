@@ -81,19 +81,19 @@ var m = redis.get("nope"); // null  (no note under that name)
 
 A missing key gives you **`null`**.
 
-### `redis.del(key)` — erase a note
+### `redis.delete(key)` — erase a note
 
 ```js
-var removed = redis.del("greeting"); // number erased (0 or 1)
+var removed = redis.delete("greeting"); // number erased (0 or 1)
 ```
 
-### `redis.incr(key)` — count things 🔢
+### `redis.increment(key)` — count things 🔢
 
 ```js
-var views = redis.incr("page:views"); // adds 1, returns the new number
+var views = redis.increment("page:views"); // adds 1, returns the new number
 ```
 
-`incr` is the easy way to count: page views, rate limits, "how many times…". It bumps
+`increment` is the easy way to count: page views, rate limits, "how many times…". It bumps
 the number up by one and hands you the result. (If the key didn't exist, it starts at 1.)
 
 ### `redis.expire(key, seconds)` — set a timer ⏳
@@ -111,7 +111,7 @@ Count requests per user, and say "too fast" after 5:
 ```js
 function handler(ctx) {
   var key = "rate:" + ctx.user;
-  var hits = redis.incr(key);
+  var hits = redis.increment(key);
   if (hits === 1) redis.expire(key, 60); // reset the count every minute
   if (hits > 5) return json(null, { message: "slow down!" });
   return json({ ok: true, hits: hits }, null);

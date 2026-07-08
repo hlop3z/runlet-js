@@ -1,8 +1,6 @@
 (function() {
-  // Routes through the generic io egress (throws a tagged capability error on failure).
-  function call(action, payload) {
-    return io.call('amq', action, payload || {});
-  }
+  // Bound to the `amq` capability via io.channel (throws a tagged capability error on failure).
+  var call = io.channel('amq');
   globalThis.amq = {
     // Publish a batch: amq.send([[routingKey, payload], ...]). Rust owns batching.
     // Returns the number published. Synchronous (no await).

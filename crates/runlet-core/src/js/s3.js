@@ -1,13 +1,9 @@
 (function() {
+  // Shares the `__runlet` tagged-error unwrap with the mux via `__ffi.unwrap` (js/ffi.js). `s3` is
+  // the in-engine bypass (its own `__s3` FFI), so it does not route through `io` — only the unwrap
+  // contract is shared, not the transport.
   function call(action, payload) {
-    var raw = __s3(action, JSON.stringify(payload || {}));
-    var res = JSON.parse(raw);
-    if (res && res.error) {
-      var err = new Error(res.error);
-      err.__runlet = res; // { error, code, retryable, owner, source } — engine classifies off this
-      throw err;
-    }
-    return res;
+    return __ffi.unwrap(__s3(action, JSON.stringify(payload || {})));
   }
   function sign(opts) {
     opts = opts || {};

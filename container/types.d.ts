@@ -844,9 +844,9 @@ interface Redis {
   /** `SET key value [EX ttl]` — returns `true`. */
   set(key: string, value: string, opts?: RedisSetOptions): boolean;
   /** `DEL key` — number of keys removed (0 or 1). */
-  del(key: string): number;
+  delete(key: string): number;
   /** `INCR key` — the new value. */
-  incr(key: string): number;
+  increment(key: string): number;
   /** `EXPIRE key seconds` — `true` if the key existed and the TTL was set. */
   expire(key: string, seconds: number): boolean;
 }

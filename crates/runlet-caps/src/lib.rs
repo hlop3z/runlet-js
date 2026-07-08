@@ -38,7 +38,7 @@ pub mod actions {
     /// `mail` action tokens.
     pub const MAIL: &[&str] = &["send"];
     /// `redis` action tokens.
-    pub const REDIS: &[&str] = &["get", "set", "del", "incr", "expire"];
+    pub const REDIS: &[&str] = &["get", "set", "delete", "increment", "expire"];
     /// `amq` action tokens.
     pub const AMQ: &[&str] = &["send", "request"];
     /// `auth` action tokens.
