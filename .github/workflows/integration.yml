@@ -1,15 +1,17 @@
 name: Integration
 
-# The live-backend suite (tests/test_simple.py). Brings up the deterministic backends
-# via docker compose; the Python harness starts its own server (cargo run) and
-# self-skips any backend it can't probe. The auth providers (keycloak/zitadel)
-# are intentionally NOT started here (slow boot + PAT bootstrap) — those paths
-# are covered locally. Kept separate from the release gate until proven stable;
-# promote it into ci.yml's `workflow_call` set once it is reliably green.
+# The box-only, self-contained live suite (tests/test_simple.py). The box links no
+# network driver and needs no `fabricd` sidecar or `../fabricd` checkout: the only
+# backend is a local httpbin for the HTTP `api` tests (real-driver conformance lives
+# in the `fabricd` repo, asserted against this repo's `runlet-wire` contract). The
+# Python harness starts its own server (cargo run) and self-skips anything it can't
+# probe. Runs on every PR/push AND is reused as a release gate (`workflow_call`) so an
+# image can never ship without the end-to-end suite passing.
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_call:
 
 concurrency:
   group: integration-${{ github.ref }}
@@ -20,7 +22,7 @@ env:
 
 jobs:
   integration:
-    name: live-backend suite
+    name: box live suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,35 +38,20 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Start backends
-        run: >
-          docker compose up -d --wait
-          postgres pgbouncer cockroach httpbin redis rabbitmq mongo nats
-
-      # cockroach-init is a one-shot job (create db/user/grant, then exit). It must
-      # NOT be in the --wait set above: `up --wait` treats a waited-on container that
-      # exits — even with code 0 — as a wait failure and returns 1. Run it to
-      # completion here instead, so a genuine init error still fails the step.
-      - name: Initialize CockroachDB
-        run: docker compose run --rm cockroach-init
-
-      # The egress sidecar lives in its own repo; the harness builds it from a sibling
-      # checkout (../fabricd). Best-effort: without it the driver-backed sections
-      # (db/mongo/nats/auth) self-skip and only the in-box suite runs.
-      - name: Checkout fabricd (sibling)
-        run: |
-          git clone --depth 1 https://github.com/${{ github.repository_owner }}/fabricd \
-            "$GITHUB_WORKSPACE/../fabricd" \
-            || echo "::warning::no fabricd sibling — driver-backed sections will self-skip"
+      # The box's ONLY test backend: a local httpbin for the HTTP `api` tests. The
+      # driver backends (Postgres/CockroachDB/NATS/…) moved to the `fabricd` repo with
+      # the driver-conformance suite, so they are not started — and not needed — here.
+      - name: Start httpbin
+        run: docker compose up -d --wait httpbin
 
       # Warm the build so the harness's `cargo run` starts promptly.
       - name: Pre-build server
         run: cargo build -p runlet
 
-      - name: Run integration suite
+      - name: Run box live suite
         run: python tests/test_simple.py
 
-      - name: Dump backend logs on failure
+      - name: Dump httpbin logs on failure
         if: failure()
         run: docker compose logs --tail=100
 

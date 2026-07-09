@@ -23,8 +23,14 @@ jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
+  # Second release gate: the box-only end-to-end live suite (tests/test_simple.py).
+  # The image cannot ship unless the runtime paths (execute/batch/sandbox/isolation/
+  # telemetry/events) actually pass against a running server, not just the unit tests.
+  integration:
+    uses: ./.github/workflows/integration.yml
+
   release:
-    needs: verify
+    needs: [verify, integration]
     runs-on: ubuntu-latest
 
     permissions:

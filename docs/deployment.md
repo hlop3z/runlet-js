@@ -1,6 +1,6 @@
 # Deployment & production hardening
 
-jsbox is a stateless service: `POST /execute` runs a JS `handler(ctx)` in a
+runlet is a stateless service: `POST /execute` runs a JS `handler(ctx)` in a
 sandboxed QuickJS context and returns `{data, error, meta}`. The box ships **three in-engine
 built-ins** — `http`, `s3`, and `io` — and links no network drivers and holds no backend
 credentials. Any other capability (a database, cache, queue, mail relay, …) is reached with
@@ -13,9 +13,30 @@ Depth lives in the design notes ([resilience.md](design/resilience.md),
 [multitenant-trust.md](design/multitenant-trust.md)); this page is the "what to actually
 set, and why" synthesis.
 
+## First run (Docker)
+
+`/execute` runs caller-supplied code, so the box **fails closed** on an exposed bind with no
+auth gate — a bare `docker run ... <image>` refuses to start *by design* (a clear error tells
+you why). Supply the gate at run time via the environment; no secret is ever baked into the
+image:
+
+```bash
+# Real use — authenticate /execute with a bearer token:
+docker run -e RUNLET_ACCESS_TOKEN="$(openssl rand -hex 32)" -p 3000:3000 <image>
+#   → requests must send `Authorization: Bearer <token>`
+
+# Quickstart / auth terminated upstream (gateway or mesh does authn):
+docker run -e RUNLET_ALLOW_UNAUTHENTICATED=1 -p 3000:3000 <image>
+
+curl localhost:3000/health   # → ok
+```
+
+Both env vars override whatever a mounted `config.json` sets, so the same image works either
+way. For anything past a quickstart, mount a full config over `/app/config.json` and read on.
+
 > **TL;DR checklist** (each expanded below)
 >
-> - [ ] `access_token` set (or `allow_unauthenticated: true` if auth is genuinely terminated upstream) — jsbox refuses to start on a non-loopback bind otherwise.
+> - [ ] `access_token` set (or `allow_unauthenticated: true` if auth is genuinely terminated upstream) — runlet refuses to start on a non-loopback bind otherwise.
 > - [ ] `debug: false` in production config (it relaxes the SSRF guard — local-testing only).
 > - [ ] `error_debug` left `false` (default) at an internet-facing edge (keeps stack/raw out of responses).
 > - [ ] `allow_wildcard_hosts` left `false` unless a caller genuinely needs `allowed_hosts: ["*"]` (it collapses the host allowlist to the IP filter alone).
@@ -25,7 +46,7 @@ set, and why" synthesis.
 > - [ ] `max_statement_timeout_ms` set **in `fabricd`'s config** and a server-side `statement_timeout` role default.
 > - [ ] `db_breaker_threshold` > 0 **in `fabricd`'s config** so a dead DB fast-fails instead of pinning threads.
 > - [ ] PgBouncer `query_timeout` set if you front Postgres with a transaction-mode pooler.
-> - [ ] Global per-tenant fairness lives at the gateway; jsbox's is a per-pod backstop only.
+> - [ ] Global per-tenant fairness lives at the gateway; runlet's is a per-pod backstop only.
 > - [ ] Backend credentials live **only** in `fabricd`'s `resources` config — never in the box's config or the request. Driver capabilities need a running `fabricd` (`fabricd_socket` or `fabricd_quic`).
 > - [ ] TLS on every backend connection **from `fabricd`** (`ssl: true` / `tls: true` / `rediss://` / `amqps://` in the resource definitions); secrets via `config.sys`.
 > - [ ] Remote (QUIC) `fabricd`: server cert pinned by fingerprint, client auth on (`sa-token` or `static`), `max_connections` sized, NetworkPolicy scoping who can reach it.
@@ -42,7 +63,7 @@ These are the difference between "internal demo" and "safe to point traffic at."
   unauthenticated reachable port is a full compromise (SSRF pivot, mail relay, use of any
   provisioned resource). (Credentials themselves never ride in the request or the box's
   config — they live in the `fabricd` egress sidecar's `resources` config, §5 — but a
-  reachable executor is still a pivot into everything the operator provisioned.) jsbox
+  reachable executor is still a pivot into everything the operator provisioned.) runlet
   **refuses to start** on a non-loopback bind unless you either set `access_token` (a shared
   secret; requests must send `Authorization: Bearer <token>`, constant-time compared) or
   explicitly set `allow_unauthenticated: true` to assert auth is terminated upstream
@@ -78,7 +99,7 @@ connect breaker — its own config, since it holds the driver connections):
 | `db_breaker_threshold` / `db_breaker_cooldown_ms` (`fabricd`) | 3 | Per-target circuit breaker: fast-fails a DB that keeps failing to connect.                                | Turn it on (`threshold` 3–5). Measured win under a dead DB: 54× throughput, 281× lower p99 (resilience.md). `0` = off (default).                                                                                                                               |
 | `max_concurrent_per_partition` / `partition_buckets` (box) | 5 | Per-`X-Partition-Key` concurrency cap — a noisy key fast-fails `429 PARTITION_OVERLOADED` on its own share. | Optional per-pod backstop. **Global** per-tenant fairness is the gateway's job (see §6). `0` = off.                                                                                                                                                            |
 
-**The Tier 0 server-side default (do not skip).** jsbox issues `statement_timeout` as a
+**The Tier 0 server-side default (do not skip).** runlet issues `statement_timeout` as a
 session `SET` at connect. On a direct connection that's a hard guarantee; behind a
 **transaction-mode PgBouncer** it is best-effort (the `SET` may bind to a different server
 connection than the autocommit query). For a real guarantee set it operator-side:
@@ -92,7 +113,7 @@ or a PgBouncer `connect_query`. See [pooled-capabilities.md](design/pooled-capab
 **Tier 4 — PgBouncer's own timeouts.** If you front Postgres with PgBouncer, set
 `query_timeout` (slightly above your expected `statement_timeout`) and optionally
 `query_wait_timeout`. It's an independent layer that catches a runaway query even when the
-session `SET` is lost, and below jsbox's wall-clock deadline. There's no jsbox code for this —
+session `SET` is lost, and below runlet's wall-clock deadline. There's no runlet code for this —
 it's pooler config.
 
 ## 3. Sizing the sandbox
@@ -143,7 +164,14 @@ IP filter alone, so it is **ignored unless** `allow_wildcard_hosts: true` is set
 honored in `debug` mode). Prefer an explicit host list; reach for the wildcard only when a
 trusted caller genuinely needs open egress.
 
-## 5. Running `fabricd` (the credential / egress broker)
+## 5. Reaching brokered resources (an egress broker)
+
+> **The box ships without a broker.** A deployment serving only deterministic / `http` / `s3` /
+> box-direct requests needs none of this section. A broker is required *only* for `io` resources
+> that resolve to one. The box owns the wire contract (`crates/runlet-wire`); **`fabricd`** is the
+> **reference broker**, maintained in its **own repo** (`github.com/hlop3z/fabricd`) and versioned
+> independently — anything that speaks the contract can stand in for it. The rest of this section
+> describes that broker role using `fabricd` as the concrete example.
 
 `fabricd` owns two things the box deliberately does not: the operator `resources`
 credential table (logical name → driver kind + endpoint + credentials, loaded from
@@ -217,7 +245,7 @@ the `resources` table is read-only config, so scale them like any Deployment.
 The per-partition cap (Tier 5) is a **per-pod** control: under N replicas the effective ceiling
 is per-pod × N and drifts with the HPA. **Global** per-tenant fairness belongs at the gateway —
 the one component with the fleet-wide view (rate limiting, often Redis-backed). The reference
-split: **gateway = global per-key policy** (reject over-quota before fan-out); **jsbox = per-pod
+split: **gateway = global per-key policy** (reject over-quota before fan-out); **runlet = per-pod
 bulkhead + per-pod partition backstop** for sticky-routing / hot-key / gateway-gap cases. Pass
 the key via the `X-Partition-Key` header (it wins over a `partition` body field; both are
 caller-set, never script-set) and it's echoed back in `meta.partition`. In trusted-identity
@@ -259,7 +287,7 @@ trusts blindly. Full model: [multitenant-trust.md](design/multitenant-trust.md).
 a script can only ever return the `"[secret:NAME]"` placeholder, never the value (see
 [docs/09-sys.md](09-sys.md)). Supply them in `config.sys`. The request `config` no longer carries
 driver credentials (they live in `fabricd`'s `resources` config, §5 — keep *that* file secret),
-but `config.sys.secrets` still does, so terminate TLS in front of jsbox and
+but `config.sys.secrets` still does, so terminate TLS in front of runlet and
 don't log request bodies.
 
 **Mail relay abuse (untrusted scripts).** A handler chooses its own `to`/subject/body against the
@@ -271,7 +299,7 @@ they keep a handler from turning the relay into an open spam cannon.
 
 ## 9. Kubernetes specifics
 
-- **Graceful shutdown.** jsbox handles `SIGTERM`/Ctrl-C and drains in-flight requests
+- **Graceful shutdown.** runlet handles `SIGTERM`/Ctrl-C and drains in-flight requests
   (`axum::serve` with graceful shutdown). Set `terminationGracePeriodSeconds` **≥ `timeout_ms`**
   so an in-flight execution can finish before the kill.
 - **Probes.** Liveness and readiness → `GET /health` (returns `200 "ok"`). It's cheap and has no

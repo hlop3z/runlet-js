@@ -8,6 +8,7 @@
 //! or plain numbers in bytes: `8388608`.
 
 use std::collections::HashMap;
+use std::env;
 use std::error::Error;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -73,7 +74,7 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) access_token: Option<String>,
     /// Explicit acknowledgement that `/execute` may run without a token on a non-loopback
-    /// bind (auth handled by an upstream gateway/mesh). Default `false`: jsbox **refuses to
+    /// bind (auth handled by an upstream gateway/mesh). Default `false`: the box **refuses to
     /// start** on a non-loopback address when no `access_token` is set, so a misconfigured
     /// deployment fails closed instead of silently exposing an unauthenticated executor. A
     /// loopback bind never needs this.
@@ -437,8 +438,9 @@ impl Config {
                 "refusing to start: binding {host} (non-loopback) with no `access_token` and \
                  `allow_unauthenticated` unset. /execute runs caller-supplied code with \
                  caller-supplied credentials, so an unauthenticated reachable port is a full \
-                 compromise. Set `access_token`, bind loopback, or set \
-                 `allow_unauthenticated: true` if auth is terminated upstream.",
+                 compromise. Set a token (`access_token` in config, or `RUNLET_ACCESS_TOKEN=<secret>` \
+                 in the environment), bind loopback, or opt out with `allow_unauthenticated: true` \
+                 (or `RUNLET_ALLOW_UNAUTHENTICATED=1`) if auth is terminated upstream.",
                 host = self.server.host,
             )
             .into());
@@ -550,9 +552,53 @@ impl Config {
         } else {
             Self::default()
         };
+        config.apply_env_overrides();
         config.engine.resolve_limits()?;
         Ok(config)
     }
+
+    /// Applies environment-variable overrides for the `/execute` auth gate on top of the
+    /// file/defaults. A container image never bakes credentials into a config file, so the two
+    /// knobs an operator most needs at `docker run` time are injectable via the environment:
+    /// `RUNLET_ACCESS_TOKEN` sets the bearer token (a non-empty value wins over the file), and a
+    /// truthy `RUNLET_ALLOW_UNAUTHENTICATED` opts a non-loopback bind out of the token requirement
+    /// (auth terminated upstream / a local quickstart). Env wins over the file so the same image
+    /// can be pointed either way without editing a mounted config. Reads the env once here and
+    /// delegates the (unsafe-free, testable) merge to [`Self::apply_auth_overrides`].
+    fn apply_env_overrides(&mut self) {
+        let token = env::var("RUNLET_ACCESS_TOKEN").ok();
+        let allow = env::var("RUNLET_ALLOW_UNAUTHENTICATED").ok();
+        self.apply_auth_overrides(token, allow.as_deref());
+    }
+
+    /// Pure merge of the auth-gate env overrides, split out so it is unit-testable without
+    /// mutating process env (`std::env::set_var` is `unsafe` in edition 2024, which this crate
+    /// forbids). A non-empty `access_token` replaces the configured token; a truthy
+    /// `allow_unauthenticated` sets the opt-out (it never *clears* a config-set opt-out).
+    fn apply_auth_overrides(
+        &mut self,
+        access_token: Option<String>,
+        allow_unauthenticated: Option<&str>,
+    ) {
+        if let Some(token) = access_token
+            && !token.is_empty()
+        {
+            self.access_token = Some(token);
+        }
+        if allow_unauthenticated.is_some_and(is_truthy) {
+            self.allow_unauthenticated = true;
+        }
+    }
+}
+
+/// Parses a truthy environment-variable value (case-insensitive, whitespace-trimmed): `1`, `true`,
+/// `yes`, or `on`. Everything else — including the empty string and `0`/`false` — is falsey, so a
+/// stray or unset variable never silently unlocks the exposure guard.
+fn is_truthy(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]
@@ -611,6 +657,58 @@ mod tests {
             cfg.check_exposure().is_ok(),
             "allow_unauthenticated unlocks an exposed bind"
         );
+    }
+
+    /// The `RUNLET_ACCESS_TOKEN` override sets the token, unlocking an otherwise-exposed bind —
+    /// the container path where the secret arrives via env, not a baked config file.
+    #[test]
+    fn env_token_override_unlocks_exposed_bind() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::UNSPECIFIED), None, false);
+        assert!(
+            cfg.check_exposure().is_err(),
+            "exposed + no token fails first"
+        );
+        cfg.apply_auth_overrides(Some("from-env".to_owned()), None);
+        assert_eq!(cfg.access_token.as_deref(), Some("from-env"));
+        assert!(
+            cfg.check_exposure().is_ok(),
+            "an env-supplied token unlocks the exposed bind"
+        );
+    }
+
+    /// A truthy `RUNLET_ALLOW_UNAUTHENTICATED` sets the opt-out; an empty value never does (so a
+    /// stray/blank env var can't silently unlock the guard).
+    #[test]
+    fn env_allow_unauthenticated_override() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::UNSPECIFIED), None, false);
+        cfg.apply_auth_overrides(None, Some(""));
+        assert!(!cfg.allow_unauthenticated, "blank value stays fail-closed");
+        cfg.apply_auth_overrides(None, Some("true"));
+        assert!(cfg.allow_unauthenticated, "`true` opts out");
+        assert!(cfg.check_exposure().is_ok());
+    }
+
+    /// An empty `RUNLET_ACCESS_TOKEN` is ignored (does not blank out a configured token).
+    #[test]
+    fn env_empty_token_is_ignored() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::UNSPECIFIED), Some("configured"), false);
+        cfg.apply_auth_overrides(Some(String::new()), None);
+        assert_eq!(
+            cfg.access_token.as_deref(),
+            Some("configured"),
+            "an empty env token must not clobber the configured one"
+        );
+    }
+
+    /// Truthy parsing is case-insensitive + trimmed; everything else (incl. `0`/`false`) is falsey.
+    #[test]
+    fn truthy_parsing() {
+        for t in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(super::is_truthy(t), "{t:?} should be truthy");
+        }
+        for f in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(!super::is_truthy(f), "{f:?} should be falsey");
+        }
     }
 
     /// Telemetry defaults to disabled (no endpoint), full sampling, service name `runlet`.
