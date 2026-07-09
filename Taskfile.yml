@@ -30,13 +30,13 @@ tasks:
     cmds:
       - python tests/test_simple.py
 
-  test-db-up:
-    desc: Start PostgreSQL and CockroachDB containers
+  test-backends-up:
+    desc: Start the box's test backends (just the local httpbin for the HTTP `api` tests)
     cmds:
       - docker compose up -d --wait
 
-  test-db-down:
-    desc: Stop database containers
+  test-backends-down:
+    desc: Stop the box's test backends
     cmds:
       - docker compose down
 

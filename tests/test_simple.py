@@ -10,21 +10,10 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.error
-import urllib.parse
 import urllib.request
 from urllib.parse import urlparse
 
 BASE_URL = os.environ.get("JSBOX_URL", "http://127.0.0.1:3000")
-
-# -- Database endpoints (override via env when the server runs in-network/CI) ---------
-# Defaults match `docker compose up` on the host. PGBOUNCER is the transaction-mode
-# pooler in front of postgres (see docs/design/pooled-capabilities.md).
-PG_HOST = os.environ.get("PG_HOST", "localhost")
-PG_PORT = int(os.environ.get("PG_PORT", "5432"))
-PGBOUNCER_HOST = os.environ.get("PGBOUNCER_HOST", "localhost")
-PGBOUNCER_PORT = int(os.environ.get("PGBOUNCER_PORT", "6432"))
-CR_HOST = os.environ.get("CR_HOST", "localhost")
-CR_PORT = int(os.environ.get("CR_PORT", "26257"))
 
 # Local httpbin clone (`httpbin` service in docker-compose) â€” the HTTP `api` tests run
 # against it so the suite never depends on httpbin.org uptime. go-httpbin echoes
@@ -33,19 +22,6 @@ CR_PORT = int(os.environ.get("CR_PORT", "26257"))
 # block) â€” the harness-generated config sets it.
 HTTPBIN_URL = os.environ.get("HTTPBIN_URL", "http://localhost:8095").rstrip("/")
 HTTPBIN_HOST = urlparse(HTTPBIN_URL).hostname or "localhost"
-
-# -- Identity providers for the `auth` capability (override via env for CI/in-network) --
-# Defaults match `docker compose up` on the host (Keycloak :8081, ZITADEL :8082).
-KEYCLOAK_ISSUER = os.environ.get("KEYCLOAK_ISSUER", "http://localhost:8081/realms/master")
-KEYCLOAK_ADMIN_USER = os.environ.get("KEYCLOAK_ADMIN", "admin")
-KEYCLOAK_ADMIN_PASS = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
-ZITADEL_ISSUER = os.environ.get("ZITADEL_ISSUER", "http://localhost:8082")
-# ZITADEL needs a service-account PAT. Provide it directly (ZITADEL_PAT) or via a file
-# (ZITADEL_PAT_FILE). Extract it after `docker compose up`:
-#   docker compose exec zitadel cat /tmp/zitadel-admin-sa.pat
-ZITADEL_PAT = os.environ.get("ZITADEL_PAT", "")
-ZITADEL_PAT_FILE = os.environ.get("ZITADEL_PAT_FILE", "")
-
 
 # -- Test runner -------------------------------------------------------------
 
@@ -191,65 +167,10 @@ def _get_text(path: str) -> tuple[int, str] | None:
 
 
 # -- Script helpers ----------------------------------------------------------
-#
-# byo-capabilities: the box no longer ships the `db`/`redis`/`amq`/`auth` wrapper globals — they were
-# sugar over the one primitive `io.call(name, action, payload)`. The suite reconstructs them here as a
-# per-request JS prelude bound to the request's single logical resource name (via `io.channel(name)`),
-# so the driver test bodies keep exercising the box → `fabricd` `io.call` path unchanged. The prelude
-# is injected only when the request lists a `config.io` name; deterministic / `http` tests are
-# unaffected. (The reference broker in the sibling repo owns the real driver contract, §9.)
-
-def _driver_prelude(config) -> str:
-    """The reconstructed `db`/`redis`/`amq`/`auth` wrappers, bound to the request's io name."""
-    if not config:
-        return ""
-    names = config.get("io")
-    if not names:
-        return ""
-    name = json.dumps(names[0])  # the single logical resource this request addresses
-    return (
-        "(function(){"
-        f"var __c = io.channel({name});"
-        # db: packs {sql, params}; begin/commit/rollback carry an empty statement.
-        "globalThis.db = {"
-        "query: function(sql, params){ return __c('query', {sql: sql, params: params || []}); },"
-        "execute: function(sql, params){ return __c('execute', {sql: sql, params: params || []}); },"
-        "begin: function(){ __c('begin', {sql: '', params: []}); },"
-        "commit: function(){ __c('commit', {sql: '', params: []}); },"
-        "rollback: function(){ __c('rollback', {sql: '', params: []}); }"
-        "};"
-        # redis: strings in/out; a missing get returns null.
-        "globalThis.redis = {"
-        "get: function(k){ return __c('get', {key: k}).value; },"
-        "set: function(k, v, o){ o = o || {}; return __c('set', {key: k, value: String(v), ttl: o.ttl}).ok; },"
-        "delete: function(k){ return __c('delete', {key: k}).count; },"
-        "increment: function(k){ return __c('increment', {key: k}).value; },"
-        "expire: function(k, s){ return __c('expire', {key: k, seconds: s}).set; }"
-        "};"
-        # amq: batch publish + NATS request-reply.
-        "globalThis.amq = {"
-        "send: function(list){ list = list || []; if (list.length === 2 && typeof list[0] === 'string') list = [list];"
-        "var m = []; for (var i = 0; i < list.length; i++){ m.push({key: list[i][0], payload: list[i][1]}); }"
-        "return __c('send', {messages: m}).published; },"
-        "request: function(subject, payload){ return __c('request', {subject: subject, payload: payload}).reply; }"
-        "};"
-        # auth: request-scoped memo cache over user_info / introspect.
-        "var __ac = {};"
-        "function __am(action, token){ var k = action + ':' + (token || '');"
-        "if (Object.prototype.hasOwnProperty.call(__ac, k)) return __ac[k];"
-        "var r = __c(action, {token: token || ''}); __ac[k] = r; return r; }"
-        "globalThis.auth = {"
-        "user_info: function(t){ return __am('user_info', t); },"
-        "introspect: function(t){ return __am('introspect', t); }"
-        "};"
-        "})();"
-    )
-
 
 def h(body: str, ctx=None, config=None) -> dict:
-    """Build a request body from a handler function body (injecting driver wrappers when `config.io`
-    names a resource — see `_driver_prelude`)."""
-    req = {"script": f"function handler(ctx) {{ {_driver_prelude(config)}{body} }}"}
+    """Build a request body from a handler function body."""
+    req = {"script": f"function handler(ctx) {{ {body} }}"}
     if ctx is not None:
         req["context"] = ctx
     if config is not None:
@@ -485,301 +406,7 @@ def test_http_api(t: Runner):
            data_eq(302))
 
 
-# -- Database tests ----------------------------------------------------------
-
-PG_CONFIG = {"host": PG_HOST, "port": PG_PORT, "user": "test", "password": "test", "database": "testdb"}
-PGB_CONFIG = {"host": PGBOUNCER_HOST, "port": PGBOUNCER_PORT, "user": "test", "password": "test", "database": "testdb"}
-CR_CONFIG = {"host": CR_HOST, "port": CR_PORT, "user": "root", "password": "", "database": "testdb"}
-
-# -- NATS endpoint (the `nats` service in docker-compose) ----------
-# (`mongo` was dropped as a shipped capability — byo-capabilities D4.)
-NATS_HOST = os.environ.get("NATS_HOST", "localhost")
-NATS_PORT = int(os.environ.get("NATS_PORT", "4222"))
-NATS_CONFIG = {"backend": "nats", "host": NATS_HOST, "port": NATS_PORT}
-
-
-# -- Egress resources (Step 5 trust flip: the box sends logical names; fabricd holds the configs) -
-#
-# After the trust flip the box carries no driver credentials: a request names logical resources in
-# `config.io`, and the `fabricd` sidecar resolves them against its own `resources` table. The
-# harness therefore (1) builds that table from the env endpoints + the per-test variants below,
-# (2) starts `fabricd` with it, and (3) sends names, never configs. A down backend just makes its
-# section self-skip (the live probe through the box fails) â€” the resource still exists in the table.
-
-def _io(name: str) -> dict:
-    """A request `config.io` selecting one logical resource by name — a **flat allowlist**
-    (byo-capabilities D3, e.g. `{"io":["pg"]}`). The box is kind-blind; `fabricd` resolves the name
-    to a kind/endpoint/creds, so the request carries only the logical name."""
-    return {"io": [name]}
-
-
-def _db_io(name: str) -> dict:
-    return _io(name)
-
-
-def _amq_io(name: str) -> dict:
-    return _io(name)
-
-
-def _auth_io(name: str) -> dict:
-    return _io(name)
-
-
-def _db_resources(base: str, cfg: dict) -> dict:
-    """Named `db` bindings for one engine: the base plus the variants the tests reference by name."""
-    return {
-        base: {"kind": "db", **cfg},
-        f"{base}-maxrows5": {"kind": "db", **cfg, "max_rows": 5},
-        f"{base}-badhost": {"kind": "db", **cfg, "host": "nonexistent.invalid", "port": 1},
-        f"{base}-fast": {"kind": "db", **cfg, "statement_timeout_ms": 800},
-        f"{base}-unlimited": {"kind": "db", **cfg, "statement_timeout_ms": 0},
-        f"{base}-huge": {"kind": "db", **cfg, "statement_timeout_ms": 60000},
-    }
-
-
-def _auth_resources(label: str, issuer: str, introspect: dict | None) -> dict:
-    """Named `auth` bindings for one provider: the base (issuer only) + an introspect variant."""
-    base = f"auth-{label.lower()}"
-    res = {base: {"kind": "auth", "issuer": issuer}}
-    if introspect:
-        res[f"{base}-introspect"] = {
-            "kind": "auth",
-            "issuer": issuer,
-            "client_id": introspect["client_id"],
-            "client_secret": introspect["client_secret"],
-        }
-    return res
-
-
-def build_resources(auth_resources: dict) -> dict:
-    """The full `fabricd` resources table: every named resource the suite can reference."""
-    res: dict = {}
-    res.update(_db_resources("pg", PG_CONFIG))
-    res.update(_db_resources("pgbouncer", PGB_CONFIG))
-    res.update(_db_resources("cockroach", CR_CONFIG))
-    res["db-broken"] = {
-        "kind": "db", "host": "broken-db.invalid", "port": 1,
-        "user": "x", "password": "x", "database": "x",
-    }
-    res["nats"] = {"kind": "amq", **NATS_CONFIG}
-    res["nats-fast"] = {"kind": "amq", **NATS_CONFIG, "request_timeout_ms": 500}
-    res.update(auth_resources)
-    return res
-
-SETUP_SQL = """
-    DROP TABLE IF EXISTS test_types;
-    DROP TABLE IF EXISTS test_txn;
-    CREATE TABLE IF NOT EXISTS test_types (
-        id SERIAL PRIMARY KEY,
-        big BIGINT,
-        num NUMERIC(10,2),
-        flag BOOLEAN,
-        name TEXT,
-        data JSONB,
-        ts TIMESTAMPTZ DEFAULT NOW(),
-        uid UUID DEFAULT gen_random_uuid()
-    );
-    INSERT INTO test_types (big, num, flag, name, data)
-    VALUES (9223372036854775807, 12345.67, true, 'Alice', '{"key":"val"}');
-    CREATE TABLE IF NOT EXISTS test_txn (id SERIAL PRIMARY KEY, val TEXT);
-"""
-
-
-def _db_available(name: str) -> bool:
-    """Check if the named `db` resource is reachable (probes through the box â†’ fabricd)."""
-    resp = _post(h("db.query('SELECT 1 as ok'); return json('up', null);", config=_db_io(name)))
-    return resp is not None and resp.get("data") == "up"
-
-
-def _setup_db(name: str):
-    """Create test tables (via the named `db` resource)."""
-    for stmt in SETUP_SQL.strip().split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            _post(h(f"db.execute(\"{stmt}\"); return json('ok', null);", config=_db_io(name)))
-
-
-def test_db_engine(t: Runner, label: str, db: str):
-    """Run DB tests against a specific engine, named by its `db` resource (`db` = the base name)."""
-    t.section(f"Database ({label})")
-
-    # Setup tables
-    setup_script = SETUP_SQL.replace("'", "\\'").replace("\n", " ")
-    for stmt in [s.strip() for s in SETUP_SQL.strip().split(";") if s.strip()]:
-        safe = stmt.replace("'", "\\'").replace("\n", " ")
-        _post(h(f"db.execute('{safe}'); return json('ok', null);", config=_db_io(db)))
-
-    # Basic query (CockroachDB returns INT8 for literals, so "1" as string)
-    is_crdb = label == "CockroachDB"
-    t.test(f"{label}: SELECT 1",
-           h("var r = db.query('SELECT 1 as num'); return json(r.rows[0].num, null);", config=_db_io(db)),
-           data_eq("1") if is_crdb else data_eq(1))
-
-    # Column metadata
-    t.test(f"{label}: columns returned",
-           h("var r = db.query('SELECT 1 as a, 2 as b'); return json(r.columns, null);", config=_db_io(db)),
-           data_eq(["a", "b"]))
-
-    # Row count
-    t.test(f"{label}: row_count",
-           h("var r = db.query('SELECT 1 UNION ALL SELECT 2'); return json(r.row_count, null);", config=_db_io(db)),
-           data_eq(2))
-
-    # Parameterized query
-    t.test(f"{label}: params",
-           h("var r = db.query('SELECT $1::text as name', ['Bob']); return json(r.rows[0].name, null);", config=_db_io(db)),
-           data_eq("Bob"))
-
-    # Boolean param
-    t.test(f"{label}: bool param",
-           h("var r = db.query('SELECT $1::boolean as flag', [true]); return json(r.rows[0].flag, null);", config=_db_io(db)),
-           data_eq(True))
-
-    # BIGINT always string
-    t.test(f"{label}: bigint is string",
-           h("var r = db.query('SELECT big FROM test_types'); return json(typeof r.rows[0].big, null);", config=_db_io(db)),
-           data_eq("string"))
-
-    t.test(f"{label}: bigint value",
-           h("var r = db.query('SELECT big FROM test_types'); return json(r.rows[0].big, null);", config=_db_io(db)),
-           data_eq("9223372036854775807"))
-
-    # NUMERIC as string
-    t.test(f"{label}: numeric is string",
-           h("var r = db.query('SELECT num FROM test_types'); return json(typeof r.rows[0].num, null);", config=_db_io(db)),
-           data_eq("string"))
-
-    # INT4 as number (CockroachDB SERIAL is INT8 â†’ string)
-    t.test(f"{label}: int4 is number",
-           h("var r = db.query('SELECT id FROM test_types'); return json(typeof r.rows[0].id, null);", config=_db_io(db)),
-           data_eq("string") if is_crdb else data_eq("number"))
-
-    # Boolean column
-    t.test(f"{label}: bool column",
-           h("var r = db.query('SELECT flag FROM test_types'); return json(r.rows[0].flag, null);", config=_db_io(db)),
-           data_eq(True))
-
-    # TEXT column
-    t.test(f"{label}: text column",
-           h("var r = db.query('SELECT name FROM test_types'); return json(r.rows[0].name, null);", config=_db_io(db)),
-           data_eq("Alice"))
-
-    # JSONB pass-through
-    t.test(f"{label}: jsonb pass-through",
-           h("var r = db.query('SELECT data FROM test_types'); return json(r.rows[0].data.key, null);", config=_db_io(db)),
-           data_eq("val"))
-
-    # UUID is string
-    t.test(f"{label}: uuid is string",
-           h("var r = db.query('SELECT uid FROM test_types'); return json(typeof r.rows[0].uid, null);", config=_db_io(db)),
-           data_eq("string"))
-
-    # TIMESTAMP is string
-    t.test(f"{label}: timestamp is string",
-           h("var r = db.query('SELECT ts FROM test_types'); return json(typeof r.rows[0].ts, null);", config=_db_io(db)),
-           data_eq("string"))
-
-    # NULL handling
-    t.test(f"{label}: null value",
-           h("var r = db.query('SELECT NULL as x'); return json(r.rows[0].x, null);", config=_db_io(db)),
-           lambda r: r["data"] is None)
-
-    # Execute (INSERT)
-    t.test(f"{label}: execute insert",
-           h("var r = db.execute(\"INSERT INTO test_txn (val) VALUES ('exec_test')\"); return json(r.rows_affected, null);", config=_db_io(db)),
-           data_eq(1))
-
-    # Execute (UPDATE)
-    t.test(f"{label}: execute update",
-           h("var r = db.execute(\"UPDATE test_txn SET val = 'updated' WHERE val = 'exec_test'\"); return json(r.rows_affected, null);", config=_db_io(db)),
-           data_eq(1))
-
-    # Transactions: commit
-    t.test(f"{label}: begin + commit",
-           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_commit')\"); db.commit(); var r = db.query(\"SELECT val FROM test_txn WHERE val = 'txn_commit'\"); return json(r.row_count, null);", config=_db_io(db)),
-           data_eq(1))
-
-    # Transactions: rollback
-    t.test(f"{label}: begin + rollback",
-           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_rollback')\"); db.rollback(); var r = db.query(\"SELECT val FROM test_txn WHERE val = 'txn_rollback'\"); return json(r.row_count, null);", config=_db_io(db)),
-           data_eq(0))
-
-    # Auto-rollback on throw
-    t.test(f"{label}: auto-rollback on error",
-           h("db.begin(); db.execute(\"INSERT INTO test_txn (val) VALUES ('txn_auto')\"); throw new Error('oops');", config=_db_io(db)),
-           has_error())
-
-    # max_rows truncation
-    t.test(f"{label}: max_rows truncation",
-           h("var r = db.query('SELECT generate_series(1, 50)'); return json(r.truncated, null);", config=_db_io(db + "-maxrows5")),
-           data_eq(True))
-
-    # max_rows row_count
-    t.test(f"{label}: max_rows caps count",
-           h("var r = db.query('SELECT generate_series(1, 50)'); return json(r.row_count, null);", config=_db_io(db + "-maxrows5")),
-           data_eq(5))
-
-    # SQL error
-    t.test(f"{label}: sql error throws",
-           h("db.query('SELECT * FROM nonexistent_table_xyz'); return json('should not reach', null);", config=_db_io(db)),
-           has_error())
-    # An uncaught capability error now projects onto the status line (no longer a blanket 200): a
-    # permanent SQL error (non-retryable) parks at a 4xx.
-    _st, _r, _hd = _post_full(h("db.query('SELECT * FROM nonexistent_table_xyz'); return json('x', null);", config=_db_io(db)))
-    t.check(f"{label}: uncaught sql error is a 4xx park (not 200)",
-            _st is not None and 400 <= _st < 500 and _err_code(_r) is not None)
-
-    # db disabled without config
-    t.test(f"{label}: db disabled without config",
-           h("return json(typeof db, null);"),
-           data_eq("undefined"))
-
-    # Bad connection
-    t.test(f"{label}: bad connection",
-           h("db.query('SELECT 1');", config=_db_io(db + "-badhost")),
-           has_error())
-    # A retryable capability outage (can't reach the DB) projects to a retryable 5xx with a
-    # Retry-After header, instead of the old blanket 200 that a queue worker would wrongly ack.
-    _st, _r, _hd = _post_full(h("db.query('SELECT 1');", config=_db_io(db + "-badhost")))
-    t.check(f"{label}: bad connection is a retryable 5xx (not 200)",
-            _st is not None and 500 <= _st < 600 and _err_code(_r) is not None)
-    t.check(f"{label}: bad connection carries Retry-After",
-            _hd is not None and _hd.get("Retry-After") is not None)
-
-    # Metrics tracked
-    t.test(f"{label}: metrics tracked",
-           h("db.query('SELECT 1'); db.query('SELECT 2'); return json(1, null);", config=_db_io(db)),
-           lambda r: len(r["meta"]["io"]["db"]) == 2)
-
-    # Cleanup
-    _post(h("db.execute('DROP TABLE IF EXISTS test_types'); db.execute('DROP TABLE IF EXISTS test_txn'); return json('ok', null);", config=_db_io(db)))
-
-
 # -- Script registry (execute by key) ----------------------------------------
-
-def _nats_available(name: str) -> bool:
-    """Check if the named `amq` (NATS) resource is reachable (publish to an unsubscribed subject)."""
-    resp = _post(h("amq.send([['_probe', {p:1}]]); return json('up', null);", config=_amq_io(name)))
-    return resp is not None and resp.get("data") == "up"
-
-
-def test_nats(t: Runner):
-    """NATS backend of the `amq` capability: publish + request-reply (no subscribe)."""
-    t.section("NATS (amq backend)")
-    cfg = _amq_io("nats")
-
-    t.test("publish batch -> count",
-           h("return json(amq.send([['ev.a', {i:1}], ['ev.b', {i:2}]]), null);", config=cfg),
-           data_eq(2))
-    t.test("single-pair shorthand -> 1",
-           h("return json(amq.send(['ev.c', {i:3}]), null);", config=cfg),
-           data_eq(1))
-    # No responder on the subject -> a classified amq error (short timeout keeps it fast).
-    fast = _amq_io("nats-fast")
-    t.test("request with no responder -> AMQ_ error",
-           h("amq.request('no.responder.here', {ping:1}); return json('nope', null);", config=fast),
-           lambda r: r["data"] is None and str(_err_code(r) or "").startswith("AMQ_"))
-
 
 def test_registry(t: Runner):
     """Exercise `key` mode: XOR validation always; execution if the registry is loaded."""
@@ -918,7 +545,7 @@ def test_isolation_under_concurrency(t: Runner):
            data_eq("undefined"))
 
 
-# -- Resilience: bulkhead (Tier 1) + statement_timeout clamp (Tier 0) ---------
+# -- Resilience: bulkhead (Tier 1) ------------------------------------------
 
 def test_bulkhead(t: Runner):
     """Saturate the bulkhead and prove excess load fast-fails OVERLOADED (a retryable `503` +
@@ -1336,322 +963,6 @@ def test_hasura(t: Runner):
            data_eq(True))
 
 
-def test_circuit_breaker(t: Runner):
-    """Tier 3: repeated connect failures to a dead db target trip the breaker, after which
-    requests to that target fast-fail DB_CIRCUIT_OPEN instead of waiting on the timeout â€”
-    and a healthy target is unaffected."""
-    t.section("Circuit breaker (Tier 3)")
-    # The db breaker moved to `fabricd` with the trust flip (Step 5) and is not yet implemented
-    # there, so repeated connect failures no longer trip `DB_CIRCUIT_OPEN` â€” this test self-skips
-    # until the daemon grows a breaker. `db-broken` is the operator's unreachable resource.
-    bad = "db-broken"
-    script = "db.query('SELECT 1'); return json('ok', null);"
-
-    codes = [_err_code(_post(h(script, config=_db_io(bad)))) for _ in range(7)]
-    if "DB_CIRCUIT_OPEN" not in codes:
-        print("  \033[33mPROBE\033[0m breaker not active (moved to fabricd, not yet implemented) â€” skipping\n")
-        return
-
-    t.test("breaker trips DB_CIRCUIT_OPEN after repeated connect failures",
-           h("return json(1,null);"), lambda _r: "DB_CIRCUIT_OPEN" in codes)
-    # An open breaker fast-fails â€” no connect attempt, so well under any connect wait.
-    start = time.time()
-    r = _post(h(script, config=_db_io(bad)))
-    elapsed = time.time() - start
-    t.test("open breaker fast-fails (no connect wait)",
-           h("return json(1,null);"),
-           lambda _r: _err_code(r) == "DB_CIRCUIT_OPEN" and elapsed < 1.5)
-    # A different, healthy target is not affected by the bad target's open breaker.
-    t.test("healthy db target unaffected by another target's open breaker",
-           h("db.query('SELECT 1'); return json('up', null);", config=_db_io("pg")),
-           data_eq("up"))
-
-
-def test_statement_timeout_clamp(t: Runner, db: str):
-    """Prove the operator ceiling clamps a resource's statement_timeout it cannot raise (Tier 0).
-    The clamp now runs in `fabricd` (`max_statement_timeout_ms`); `db` is the engine base name â€”
-    its `-unlimited` (0) and `-huge` (60000) variants are clamped to the daemon ceiling."""
-    t.section("statement_timeout clamp (Tier 0)")
-
-    def killed(name):
-        r = _post(h("db.query('SELECT pg_sleep(2)'); return json('slept', null);", config=_db_io(name)))
-        return r is not None and r["data"] is None and r["error"] is not None
-
-    # The `-unlimited` resource asks for no timeout. If fabricd's ceiling is active, the 2s sleep is
-    # killed well before it finishes. If no ceiling is configured, the sleep completes â€” probe and
-    # skip rather than fail.
-    if not killed(db + "-unlimited"):
-        print("  \033[33mPROBE\033[0m clamp not active (fabricd has no max_statement_timeout_ms) â€” skipping\n")
-        return
-    t.test("resource statement_timeout=0 (unlimited) is clamped + killed",
-           h("return json(1,null);"), lambda _r: True)
-    t.test("resource statement_timeout=60000 (huge) is clamped + killed",
-           h("return json(1,null);"), lambda _r: killed(db + "-huge"))
-
-
-# -- Adversarial: PgBouncer transaction-mode sharp edges ---------------------
-
-def test_pgbouncer_edges(t: Runner, db: str, direct: bool):
-    """Probe the documented hazards of running jsbox's per-request connect model
-    behind a transaction-pooling PgBouncer. `direct` = same probes against raw
-    Postgres for comparison (those MUST all be safe)."""
-    label = "Postgres-direct" if direct else "PgBouncer"
-    t.section(f"Connection-pool edges ({label})")
-
-    # (1) statement_timeout enforcement. jsbox applies it as a session-level `SET` at
-    # connect (db.rs). On a direct connection this is a hard guarantee â€” assert it. Behind
-    # PgBouncer transaction mode it is BEST-EFFORT: the SET binds to one server connection
-    # and a later autocommit statement may run on a different one, so we probe and record
-    # rather than assert. (A startup parameter would be robust but PgBouncer refuses it:
-    # "unsupported startup parameter in options". The robust path through a txn-mode pooler
-    # is a server-side role default â€” see docs/design/pooled-capabilities.md.) Either way
-    # jsbox's wall-clock interrupt cannot cancel a blocking libpq call, so the DB-side cap
-    # is the only thing that stops a slow query.
-    fast = db + "-fast"
-    r = _post(h("db.query('SELECT pg_sleep(3)'); return json('slept-full', null);",
-                config=_db_io(fast)))
-    enforced = r is not None and r["data"] is None and r["error"] is not None
-    if direct:
-        t.test(f"{label}: statement_timeout enforced (sleep killed)",
-               h("return json(1,null);"), lambda _r: enforced)
-    else:
-        verdict = "ENFORCED" if enforced else "NOT ENFORCED â€” sleep ran full"
-        print(f"  \033[33mPROBE\033[0m {label}: statement_timeout via SET -> {verdict} "
-              f"(best-effort in txn pooling; use a server-side role default for a guarantee)")
-        t.test(f"{label}: server responsive after long query",
-               h("return json('alive', null);"), data_eq("alive"))
-
-    # (2) Explicit transactions pin to one server connection in txn mode â€” multi-step
-    # work and session-scoped temp tables MUST hold within begin/commit. This is the
-    # safe pattern and must pass on both.
-    t.test(f"{label}: temp table within one transaction",
-           h("db.begin();"
-             "db.execute('CREATE TEMP TABLE t_edge(x int) ON COMMIT DROP');"
-             "db.execute('INSERT INTO t_edge VALUES (7)');"
-             "var r = db.query('SELECT x FROM t_edge');"
-             "db.commit();"
-             "return json(r.rows[0].x, null);", config=_db_io(db)),
-           data_eq(7))
-
-    # (3) Prepared-statement reuse: the Rust driver prepares each query; hammering the
-    # same parameterized query many times must not trip "prepared statement does not
-    # exist" as PgBouncer rotates server connections (needs max_prepared_statements>0).
-    t.test(f"{label}: 25x parameterized query reuse",
-           h("var n=0; for (var i=0;i<25;i++){var r=db.query('SELECT $1::int AS v',[i]); n+=r.rows[0].v;} return json(n, null);",
-             config=_db_io(db)),
-           data_eq(sum(range(25))))
-
-
-def test_pooler_query_timeout(t: Runner, db: str):
-    """Tier 4: PgBouncer's own query_timeout is an INDEPENDENT backstop. Through a
-    transaction-mode pooler the session `SET statement_timeout` is best-effort and can be
-    lost; query_timeout (2s, set on the pooler) guarantees a runaway query is still killed
-    â€” and below jsbox's 4s wall-clock deadline (Tier 2). See docs/design/resilience.md."""
-    t.section("Pooler query_timeout (Tier 4)")
-
-    # pg_sleep(3) outlives the 2s pooler ceiling but is under jsbox's 4s wall clock, so the
-    # *pooler* is what must catch it (whether or not the session SET also fired).
-    cfg = db + "-fast"
-    start = time.time()
-    r = _post(h("db.query('SELECT pg_sleep(3)'); return json('slept', null);", config=_db_io(cfg)))
-    elapsed = time.time() - start
-    killed = r is not None and r["data"] is None and r["error"] is not None
-
-    # No kill means neither the SET nor a pooler query_timeout fired (sleep ran ~3s under
-    # jsbox's 4s budget) â€” the pooler has no ceiling configured. Probe + skip rather than fail.
-    if not killed:
-        print(f"  \033[33mPROBE\033[0m pooler did not terminate the 3s query (query_timeout unset?) "
-              f"elapsed={elapsed:.1f}s\n")
-        return
-    t.test("pooler terminates an over-budget query (error returned)",
-           h("return json(1,null);"), lambda _r: killed)
-    t.test("terminated below jsbox wall-clock deadline (independent of Tier 2)",
-           h("return json(1,null);"), lambda _r: elapsed < 3.7)
-    t.test("pooler healthy immediately after the kill",
-           h("return json('alive', null);"), data_eq("alive"))
-
-
-# -- Auth (OIDC/IAM) tests ---------------------------------------------------
-
-def _provider_req(url: str, method: str = "GET", form=None, payload=None, headers=None):
-    """Talk directly to an identity provider. Returns (status, parsed_json|None)."""
-    data = None
-    hdrs = dict(headers or {})
-    if form is not None:
-        data = urllib.parse.urlencode(form).encode()
-        hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
-    elif payload is not None:
-        data = json.dumps(payload).encode()
-        hdrs.setdefault("Content-Type", "application/json")
-    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read()
-            return resp.status, (json.loads(raw) if raw else None)
-    except urllib.error.HTTPError as err:
-        try:
-            return err.code, json.loads(err.read())
-        except Exception:
-            return err.code, None
-    except Exception:
-        return None, None
-
-
-def _discovery_ok(issuer: str) -> bool:
-    """True if the issuer publishes a usable OIDC discovery document."""
-    status, body = _provider_req(f"{issuer}/.well-known/openid-configuration")
-    return status == 200 and bool(body) and "userinfo_endpoint" in body
-
-
-def _keycloak_token() -> str | None:
-    """Mint a real user access token via the admin-cli password grant (openid scope)."""
-    status, body = _provider_req(
-        f"{KEYCLOAK_ISSUER}/protocol/openid-connect/token",
-        method="POST",
-        form={
-            "grant_type": "password",
-            "client_id": "admin-cli",
-            "scope": "openid",
-            "username": KEYCLOAK_ADMIN_USER,
-            "password": KEYCLOAK_ADMIN_PASS,
-        },
-    )
-    return body.get("access_token") if status == 200 and body else None
-
-
-def _keycloak_introspect_creds(admin_token: str) -> dict | None:
-    """Ensure a confidential client exists and return its client_id/secret for RFC 7662."""
-    base, _, realm = KEYCLOAK_ISSUER.rpartition("/realms/")
-    auth = {"Authorization": f"Bearer {admin_token}"}
-    cid = "jsbox-introspect"
-    # Create it (ignore an "already exists" 409 from a previous run).
-    _provider_req(
-        f"{base}/admin/realms/{realm}/clients",
-        method="POST",
-        payload={
-            "clientId": cid,
-            "publicClient": False,
-            "serviceAccountsEnabled": True,
-            "standardFlowEnabled": False,
-            "directAccessGrantsEnabled": False,
-        },
-        headers=auth,
-    )
-    status, arr = _provider_req(f"{base}/admin/realms/{realm}/clients?clientId={cid}", headers=auth)
-    if status != 200 or not arr:
-        return None
-    internal_id = arr[0]["id"]
-    status, sec = _provider_req(
-        f"{base}/admin/realms/{realm}/clients/{internal_id}/client-secret", headers=auth
-    )
-    if status != 200 or not sec or not sec.get("value"):
-        return None
-    return {"client_id": cid, "client_secret": sec["value"]}
-
-
-def _zitadel_token() -> str | None:
-    """Read the ZITADEL service-account PAT from env or a file."""
-    if ZITADEL_PAT.strip():
-        return ZITADEL_PAT.strip()
-    if ZITADEL_PAT_FILE and os.path.exists(ZITADEL_PAT_FILE):
-        with open(ZITADEL_PAT_FILE, encoding="utf-8") as handle:
-            return handle.read().strip()
-    return None
-
-
-def test_auth_provider(t: Runner, label: str, token: str, has_introspect: bool):
-    """Drive the `auth` capability against a real OIDC/IAM (provider-agnostic). The auth resources
-    (`auth-<label>` and, if creds were minted, `auth-<label>-introspect`) were registered with
-    `fabricd` at startup; here we reference them by name."""
-    t.section(f"Auth ({label})")
-    base = f"auth-{label.lower()}"
-    cfg = _auth_io(base)
-    ctx = {"token": token}
-
-    t.test(f"{label}: disabled without config",
-           h("return json(typeof auth, null);"),
-           data_eq("undefined"))
-
-    # Valid token: OIDC discovery + bearer userinfo â†’ claims.
-    t.test(f"{label}: user_info(valid) -> ok:true",
-           h("return json(auth.user_info(ctx.token).ok, null);", ctx, cfg),
-           data_eq(True))
-    t.test(f"{label}: user_info resolves claims.sub",
-           h("var u = auth.user_info(ctx.token); return json(u.ok && typeof u.claims.sub === 'string', null);", ctx, cfg),
-           data_eq(True))
-
-    # Bad token is the caller's business flow â†’ in-band, never thrown.
-    t.test(f"{label}: user_info(bad) -> in-band, no throw",
-           h("return json(auth.user_info('garbage-token-value'), null);", config=cfg),
-           lambda r: r["data"]["ok"] is False
-                     and r["data"]["code"] == "AUTH_INVALID_TOKEN"
-                     and r["error"] is None)
-
-    # Metered + per-request cache (two calls for one token = one round trip).
-    t.test(f"{label}: metered in meta.io.auth",
-           h("auth.user_info(ctx.token); return json(1, null);", ctx, cfg),
-           lambda r: len(r["meta"]["io"]["auth"]) == 1
-                     and r["meta"]["io"]["auth"][0]["action"] == "user_info")
-    t.test(f"{label}: per-token cache (2 calls, 1 op)",
-           h("auth.user_info(ctx.token); auth.user_info(ctx.token); return json(1, null);", ctx, cfg),
-           lambda r: len(r["meta"]["io"]["auth"]) == 1)
-
-    # Infra/misconfig throws a tagged capability error (here: introspect w/o creds).
-    t.test(f"{label}: introspect without creds throws",
-           h("try { auth.introspect('x'); return json('no-throw', null); } catch (e) { return json('threw', null); }", config=cfg),
-           data_eq("threw"))
-
-    if has_introspect:
-        icfg = _auth_io(f"{base}-introspect")
-        t.test(f"{label}: introspect(valid) -> active:true",
-               h("return json(auth.introspect(ctx.token).claims.active, null);", ctx, icfg),
-               data_eq(True))
-        t.test(f"{label}: introspect(bogus) -> active:false",
-               h("return json(auth.introspect('bogus').claims.active, null);", config=icfg),
-               data_eq(False))
-
-
-def discover_auth() -> tuple[dict, list]:
-    """Talk **directly** to the identity providers (before the box/fabricd start) to mint tokens +
-    introspection client creds. Returns `(auth_resources, providers)` where `auth_resources` is the
-    nameâ†’binding map to merge into the `fabricd` table (so credentials are present at startup), and
-    `providers` is `[(label, token, has_introspect), ...]` for the reachable ones.
-    """
-    auth_resources: dict = {}
-    providers: list = []
-
-    # Keycloak â€” mint a token + a confidential client live.
-    if _discovery_ok(KEYCLOAK_ISSUER):
-        kc_token = _keycloak_token()
-        if kc_token:
-            creds = _keycloak_introspect_creds(kc_token)
-            auth_resources.update(_auth_resources("Keycloak", KEYCLOAK_ISSUER, creds))
-            providers.append(("Keycloak", kc_token, creds is not None))
-        else:
-            print("\n  \033[33mSKIP\033[0m Keycloak auth tests (reachable but token mint failed)\n")
-    else:
-        print("\n  \033[33mSKIP\033[0m Keycloak auth tests (not running â€” use: docker compose up -d keycloak)\n")
-
-    # ZITADEL â€” needs a service-account PAT (introspection needs an API app, so it is
-    # exercised on Keycloak; ZITADEL covers discovery + userinfo + the throw path).
-    zt_token = _zitadel_token()
-    if zt_token and _discovery_ok(ZITADEL_ISSUER):
-        auth_resources.update(_auth_resources("Zitadel", ZITADEL_ISSUER, None))
-        providers.append(("Zitadel", zt_token, False))
-    elif zt_token:
-        print("\n  \033[33mSKIP\033[0m Zitadel auth tests (PAT set but issuer unreachable)\n")
-    else:
-        print("\n  \033[33mSKIP\033[0m Zitadel auth tests (no ZITADEL_PAT â€” see docker-compose.yml)\n")
-
-    return auth_resources, providers
-
-
-def run_auth_tests(t: Runner, providers: list):
-    """Run the auth suite for each provider discovered before startup."""
-    for label, token, has_introspect in providers:
-        test_auth_provider(t, label, token, has_introspect)
-
-
 # -- Main --------------------------------------------------------------------
 
 def _wait_for_server() -> bool:
@@ -1662,51 +973,17 @@ def _wait_for_server() -> bool:
     return False
 
 
-def _locate_fabricd(repo: str):
-    """Locate (or build) the `fabricd` binary. `fabricd` lives in its own repo
-    (github.com/hlop3z/fabricd); the box repo stays independent of it. Lookup order:
-      1. `FABRICD_BIN` — explicit path to a prebuilt binary.
-      2. a sibling checkout `../fabricd` — built there with its own workspace (it path-depends
-         on this repo's `crates/runlet-wire`, so the sibling layout is the expected one).
-    Returns the binary path, or None — the box then runs WITHOUT a sidecar and every
-    driver-backed section self-skips (probes answer 503 EGRESS_UNAVAILABLE)."""
-    explicit = os.environ.get("FABRICD_BIN")
-    if explicit:
-        return explicit if os.path.exists(explicit) else None
-    sibling = os.path.join(os.path.dirname(repo), "fabricd")
-    if os.path.isdir(os.path.join(sibling, "crates", "fabricd")):
-        try:
-            subprocess.run(["cargo", "build", "-p", "fabricd"], cwd=sibling, check=True)
-        except Exception:
-            return None
-        exe = "fabricd.exe" if os.name == "nt" else "fabricd"
-        path = os.path.join(sibling, "target", "debug", exe)
-        if os.path.exists(path):
-            return path
-    return None
-
-
-# Set by `_start_servers`: whether a `fabricd` sidecar is up. Sections that would FAIL (not
-# self-skip) without one — auth runs against providers probed before startup — key off this.
-FABRICD_UP = False
-
-
-def _start_servers(resources: dict) -> list:
-    """Start the two-process topology in `.test-run/`: `fabricd` (holds the credential `resources`
-    table + the drivers) over a UDS, then `runlet` (the box, driver-free) pointed at that socket.
-
-    The box reads `config.json` from its cwd; `fabricd` reads its table from `FABRICD_CONFIG`. Both
-    live in a gitignored scratch dir so this doesn't change `task run` behavior. Returns the
-    started processes (caller terminates them). If no `fabricd` binary can be found (see
-    `_locate_fabricd`), only the box starts and driver-backed sections self-skip.
-    """
-    global FABRICD_UP
+def _start_servers() -> list:
+    """Start a single `runlet` box in `.test-run/` for the box-owned tests. Driver-backed egress is
+    gone from this suite (real-driver conformance lives in the `fabricd` repo, see
+    docs/design/tenant-egress and docs/design/resource-egress.md); the box links no driver and needs
+    no sidecar. Returns the started process (caller terminates it)."""
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".test-run")
     os.makedirs(run_dir, exist_ok=True)
-    # Merge the test-fixture modules (tests/modules) with the shipped operator modules
-    # (modules/, e.g. hasura/client.mjs) into one scratch modules_dir, so both are
-    # importable without duplicating the shipped module as a fixture (single source of truth).
+    # Merge the test-fixture modules (tests/modules) with the shipped operator modules (modules/,
+    # e.g. hasura/client.mjs) into one scratch modules_dir, so both are importable without
+    # duplicating the shipped module as a fixture (single source of truth).
     merged_modules = os.path.join(run_dir, "modules")
     if os.path.isdir(merged_modules):
         shutil.rmtree(merged_modules)
@@ -1715,18 +992,7 @@ def _start_servers(resources: dict) -> list:
         if os.path.isdir(src):
             shutil.copytree(src, merged_modules, dirs_exist_ok=True)
 
-    fabricd_bin = _locate_fabricd(repo)
-    socket = os.path.join(run_dir, "fabricd.sock")
-    if fabricd_bin is not None:
-        # fabricd: the operator credential table + the Tier-0 statement_timeout ceiling. Credentials
-        # live ONLY here â€” the box never sees them.
-        fabricd_cfg = {"socket": socket, "max_statement_timeout_ms": 800, "resources": resources}
-        with open(os.path.join(run_dir, "fabricd.json"), "w", encoding="utf-8") as fh:
-            json.dump(fabricd_cfg, fh)
-    else:
-        print("NOTE: no `fabricd` binary (set FABRICD_BIN or clone github.com/hlop3z/fabricd "
-              "as a sibling of this repo) â€” driver-backed sections will self-skip")
-    # Box: a fabricd socket + scripts/modules + low bounds. NO `resources`, NO credentials.
+    # Box config: scripts/modules + low bounds. NO fabricd sidecar, NO `resources`, NO credentials.
     # debug=true relaxes the SSRF private-IP block so the `api` tests can reach the local httpbin.
     box_cfg = {
         "debug": True,
@@ -1737,35 +1003,15 @@ def _start_servers(resources: dict) -> list:
         # cheap items; the item/input caps keep their generous defaults.
         "batch": {"max_response_bytes": 4096},
     }
-    if fabricd_bin is not None:
-        box_cfg["fabricd_socket"] = socket
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(box_cfg, fh)
 
-    # Build the box up front, then launch the binaries directly â€” a concurrent `cargo run`
-    # would race on the target/ build lock. (`fabricd` was already built by `_locate_fabricd`
-    # in its own repo/workspace.)
     subprocess.run(["cargo", "build", "-p", "runlet"], cwd=repo, check=True)
     bindir = os.path.join(repo, "target", "debug")
-    procs = []
-    if fabricd_bin is not None:
-        if os.path.exists(socket):
-            os.remove(socket)
-        fabricd = subprocess.Popen(
-            [fabricd_bin], cwd=run_dir,
-            env={**os.environ, "FABRICD_CONFIG": os.path.join(run_dir, "fabricd.json")},
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        procs.append(fabricd)
-        for _ in range(60):  # wait for fabricd to bind the socket before starting the box
-            if os.path.exists(socket):
-                break
-            time.sleep(0.5)
-        FABRICD_UP = True
     runlet = subprocess.Popen(
         [os.path.join(bindir, "runlet")], cwd=run_dir,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    procs.append(runlet)
-    return procs
+    return [runlet]
 
 
 def _start_trusted_box(port: int = 3010):
@@ -2136,14 +1382,9 @@ def test_per_tenant_events(t: Runner):
 def main():
     procs: list = []
 
-    # Auth discovery talks DIRECTLY to the identity providers (no box), so it must run BEFORE
-    # fabricd starts â€” the minted introspection client creds have to be in fabricd's resource table
-    # at startup (the box never carries them).
-    auth_resources, auth_providers = discover_auth()
-
     if not _wait_for_server():
-        print("Starting fabricd + runlet...")
-        procs = _start_servers(build_resources(auth_resources))
+        print("Starting runlet...")
+        procs = _start_servers()
         if not _wait_for_server():
             print("ERROR: Server failed to start")
             sys.exit(1)
@@ -2170,53 +1411,16 @@ def main():
     test_esm(t)
     test_hasura(t)
 
-    # Database tests â€” only if the backend is reachable (probed by resource name through fabricd).
-    if _db_available("pg"):
-        test_db_engine(t, "PostgreSQL", "pg")
-        test_pgbouncer_edges(t, "pg", direct=True)
-        test_statement_timeout_clamp(t, "pg")
-        test_circuit_breaker(t)
-    else:
-        print("\n  \033[33mSKIP\033[0m PostgreSQL tests (not running â€” use: docker compose up -d)\n")
-
-    # Same db suite through PgBouncer (transaction pooling) â€” proves the per-request
-    # connect model works unchanged behind a pooler (docs/design/pooled-capabilities.md).
-    if _db_available("pgbouncer"):
-        test_db_engine(t, "PgBouncer", "pgbouncer")
-        test_pgbouncer_edges(t, "pgbouncer", direct=False)
-        test_pooler_query_timeout(t, "pgbouncer")
-    else:
-        print("\n  \033[33mSKIP\033[0m PgBouncer tests (not running â€” use: docker compose up -d pgbouncer)\n")
-
-    if _db_available("cockroach"):
-        test_db_engine(t, "CockroachDB", "cockroach")
-    else:
-        print("\n  \033[33mSKIP\033[0m CockroachDB tests (not running â€” use: docker compose up -d)\n")
-
-    # NATS â€” only if its container is running
-    if _nats_available("nats"):
-        test_nats(t)
-    else:
-        print("\n  \033[33mSKIP\033[0m NATS tests (not running â€” use: docker compose up -d nats)\n")
-
-    # Auth tests â€” for whichever providers were reachable at discovery (before startup).
-    # They run through the box â†’ fabricd, so they need the sidecar (unlike the probed
-    # sections above, they would fail rather than self-skip without it).
-    if FABRICD_UP or not procs:
-        run_auth_tests(t, auth_providers)
-    elif auth_providers:
-        print("\n  \033[33mSKIP\033[0m auth tests (no fabricd sidecar â€” see FABRICD_BIN)\n")
-
-    # Trusted-mode acting-org gate (nexus N5): needs its own box in trusted mode. Only when this
-    # harness owns the local build/run (it spins up a second runlet on a loopback port); skipped when
-    # pointed at an already-running / remote server (JSBOX_URL), which we don't reconfigure.
+    # Box-owned egress + trusted-mode + telemetry + events: each spins up its own dedicated box on a
+    # loopback port, so they run only when this harness owns the local build/run (skipped when
+    # pointed at an already-running / remote server via JSBOX_URL).
     if procs:
         test_box_direct_local(t)
         test_trusted_acting_scope(t)
         test_telemetry_tracing(t)
         test_per_tenant_events(t)
     else:
-        print("\n  \033[33mSKIP\033[0m trusted-mode N5 + telemetry + events tests (external server; harness didn't start it)\n")
+        print("\n  \033[33mSKIP\033[0m box-direct + trusted-mode + telemetry + events tests (external server; harness didn't start it)\n")
 
     t.summary()
 

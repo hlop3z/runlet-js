@@ -478,3 +478,35 @@ fn build_auth(quic: &FabricdQuic) -> Result<BoxAuth, IoError> {
         (None, None) => Ok(BoxAuth::None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The fail-closed egress invariant: with no sidecar configured, opening an egress session
+    //! refuses before any execution rather than falling back to an ambient path.
+
+    use super::{SessionError, SidecarTransport, connect_session};
+    use runlet_wire::wire::WireInit;
+
+    /// No `fabricd_socket` and no `fabricd_quic` in config ⇒ the `None` transport (nothing to reach).
+    #[test]
+    fn absent_config_selects_no_transport() {
+        let transport = SidecarTransport::from_config(None, None)
+            .unwrap_or_else(|_err| unreachable!("None/None is always a valid config"));
+        assert!(matches!(transport, SidecarTransport::None));
+        assert_eq!(transport.label(), "none");
+    }
+
+    /// Opening a session with no transport fails closed with `Unavailable` — the handler maps this
+    /// to a retryable `503 EGRESS_UNAVAILABLE`, decided before the blocking execution is admitted.
+    #[tokio::test]
+    async fn no_sidecar_session_fails_closed() {
+        let init = WireInit {
+            resources: vec!["orders".to_owned()],
+            timeout_ms: 1000,
+            tenant: None,
+            token: None,
+        };
+        let result = connect_session(&SidecarTransport::None, &init).await;
+        assert!(matches!(result, Err(SessionError::Unavailable(_))));
+    }
+}
