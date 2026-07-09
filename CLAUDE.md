@@ -73,7 +73,7 @@ as a sibling checkout `../fabricd` for dev/tests) and are **replaceable at any t
 repo owns the entire contract (`crates/runlet-wire`), and anything that speaks it can stand in
 for `fabricd`. Nothing here depends on the fabricd repo — the dependency points the other way.
 
-**Cargo workspace (four crates + a bench crate):**
+**Cargo workspace (three crates + a bench crate):**
 
 - **`runlet-wire`** (`crates/runlet-wire/`) — the shared, driver-free, QuickJS-free egress
   contract, depended on by every other crate (including, cross-repo, the fabricd repo's
@@ -95,23 +95,25 @@ for `fabricd`. Nothing here depends on the fabricd repo — the dependency point
   is `runlet_core::host::LogicHost`. Capabilities are **composed as `CapabilityDef` values** via
   `LogicHost::builder(...)` (the capability registry + egress mux — `capability.rs`), not baked in;
   a deterministic-only consumer builds with `default-features = false` and links nothing. **Links
-  no network driver even with `full`** — the driver-backed capabilities are no longer here at all
-  (they moved to `runlet-caps`); core keeps only the two in-engine, code-carrying capabilities as
-  cargo features: `http` (SSRF-guarded) and `s3` (pure SigV4 signing). The mux enforces the sandbox
-  invariants centrally and **fails closed**; `Profile::Deterministic` *removes* ambient authority.
-  See `docs/design/composable-core.md`.
-- **`runlet-caps`** (`crates/runlet-caps/`) — the standard capability preset: the six driver-backed
-  capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) as composable `CapabilityDef`s (JS wrapper
-  + `.d.ts` fragment + `Trust::OperatorSupplied` + action-token list). **Data only, no drivers** —
-  depends on `runlet-core` with `default-features = false`. The stock `runlet` bin composes
-  `runlet_caps::preset()`; a custom box picks a subset or adds its own defs. Carries the D10
-  action-token fixture and the D11 `types.d.ts` golden drift test.
+  no network driver even with `full`** — **no driver-backed capability ships here at all** (the six
+  old wrappers `db`/`mongo`/`mail`/`redis`/`amq`/`auth` and the whole `runlet-caps` preset crate were
+  removed on the byo-capabilities change; users compose their own via `CapabilityDef`). Core keeps
+  exactly **three built-in primitives**: `http` (SSRF-guarded, script-controlled URL) and `s3` (pure
+  SigV4 signing) as cargo features, plus **`io`** — the operator-named logical-egress primitive
+  (`js/io.js`: `io.call(name, action, payload)`) that routes through the egress mux. The mux enforces
+  the sandbox invariants centrally and **fails closed**; `Profile::Deterministic` *removes* ambient
+  authority. See `docs/design/composable-core.md`.
 - **`runlet`** (`crates/runlet/`) — the binary: the axum HTTP `/execute` front + server config,
   a thin adapter over `LogicHost::run`. **Links no network driver and holds no credentials**
-  (it does not depend on `fabric-backends`): when a request names a driver resource in
-  `config.io`, it opens a `fabricd` session over a **local UDS or a remote QUIC link**
-  (`sidecar::SidecarEgress`, transport chosen by config — `fabricd_socket` vs `fabricd_quic`) and
-  forwards the logical names; `fabricd` resolves the credentials. On the QUIC path the box pins the
+  (it does not depend on `fabric-backends`): when a request names an `io` resource in `config.io`
+  (now a **flat allowlist of logical names**), the box resolves it either **box-direct** to a
+  co-located loopback endpoint declared in the operator's global `local_resources`
+  (`local_io::BoxEgress` — box-direct HTTP POST of the identical `{action, payload}` envelope, no
+  broker, no creds; guarded to loopback/private by the `Config::check_local_resources` boot guard),
+  else over
+  a `fabricd` session on a **local UDS or a remote QUIC link** (`sidecar::SidecarEgress`, transport
+  chosen by config — `fabricd_socket` vs `fabricd_quic`), forwarding the logical name for `fabricd` to
+  resolve to a kind+endpoint+credentials. On the QUIC path the box pins the
   daemon cert by fingerprint and presents an auth token (`BoxAuth`: static secret or a re-read k8s
   SA-token file). No sidecar configured + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.
   Deterministic/`http`/`s3` requests need no sidecar. Prometheus metric names use the `runlet_*`
@@ -135,11 +137,13 @@ for `fabricd`. Nothing here depends on the fabricd repo — the dependency point
   guard refuses trusted mode on a non-loopback bind unless network isolation is asserted. See
   `docs/design/multitenant-trust.md`.
 
-**In the sibling repo** (`github.com/hlop3z/fabricd`): **`fabricd`** — the egress sidecar /
-broker (bin) holding the operator credential table and **all** the vendor drivers (via its
-`fabric-backends` crate), hosting a `BackendSet` per session behind the `runlet-wire` protocol
-over UDS or QUIC. Required for driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
-`auth`); deterministic/`http`/`s3` requests never need it. Its design docs stay canonical
+**In the sibling repo** (`github.com/hlop3z/fabricd`): **`fabricd`** — now an **optional reference
+broker** (demoted from shipped-core on byo-capabilities): the egress sidecar (bin) holding the
+operator credential table and **all** the vendor drivers (via its `fabric-backends` crate), hosting a
+`BackendSet` per session behind the `runlet-wire` protocol over UDS or QUIC. It resolves the flat
+`WireInit.resources` names → kind → endpoint → credentials (the `mongo` driver + `mongocrypt` are
+dropped). Needed only for `io` resources that resolve to a broker (a box-direct `local_resources`
+binding, `http`, `s3`, and deterministic requests never touch it). Its design docs stay canonical
 here: `docs/design/resource-egress.md`, `docs/design/network-fabric.md`.
 
 ## Commands
@@ -148,7 +152,7 @@ The project uses [Task](https://taskfile.dev) (`Taskfile.yml`). Raw `cargo` equi
 
 - **Build:** `task build` (`cargo build`, whole workspace) · release: `task build-release` (`cargo build --release`)
 - **Run:** `task run` (`cargo run -p runlet`) — serves on `http://127.0.0.1:3000`
-- **Deterministic-only core build (no network drivers):** `cargo build -p runlet-core --no-default-features` (optionally `--features db,http,…` to opt specific capabilities back in)
+- **Deterministic-only core build (no built-in primitives):** `cargo build -p runlet-core --no-default-features` (optionally `--features http,s3` to opt the in-engine primitives back in)
 - **Format:** `task fmt` / `task fmt-check`
 - **Lint:** `task clippy` (`cargo clippy`) — see the lint warning below
 - **Unit tests:** `cargo test`
@@ -188,65 +192,73 @@ Module paths below are under `crates/runlet-core/src/` unless prefixed with `run
 
 `config.rs` (core) owns `EngineConfig` (engine sandbox limits, human-readable byte sizes like `"32mb"`: memory, stack, wall-clock timeout, max script/context bytes, `max_ops`). The server `Config` (bind address, `/execute` auth token, `scripts_dir`/`modules_dir`) lives in `runlet/src/config.rs` and embeds `EngineConfig`.
 
-### The capability pattern — two kinds (post composable-capability-core)
+### The capability model — three built-ins, bring your own for the rest (post byo-capabilities)
 
-A capability is now a **first-class value**, not a hard-wired module. There are two kinds; pick by
-whether it needs in-engine code (see `docs/design/composable-core.md`).
+The box ships **exactly three built-in primitives** and lets you add everything else; there is no
+shipped driver preset anymore (see `docs/design/composable-core.md` and the user-facing
+`docs/03-capabilities.md`).
 
-**1. Driver-backed / egress capability (`db`, `mongo`, `mail`, `redis`, `amq`, `auth`, or your own)** —
-the common case. It is a [`CapabilityDef`](crates/runlet-core/src/capability.rs) composed onto the
-host via `LogicHost::builder(...).capability(def)`; **no core change, no cargo feature**.
-- A hand-written JS wrapper (`js/<cap>.js`) that routes every op through `io.call('<cap>', '<action>', payload)`
-  — the **string-in / string-out JSON FFI contract** (no rich types cross the QuickJS boundary).
-  Its editor `.d.ts` fragment (`js/<cap>.d.ts`) travels with it (D11), prefixing its interface
-  names by convention (`Db`, `Mongo`, …) to keep the shared TS namespace flat.
-- A mandatory `Trust` declaration: `OperatorSupplied` (targets from operator config, no SSRF — the
-  db/mail model) or `ScriptControlled(SsrfPolicy)` (targets from script input — the framework
-  applies the SSRF guard pre-connect).
-- **Per-request, opt-in:** the wrapper is injected only when the request names the capability in
-  `config.io` **and** the `Profile` allows I/O; the name routes through the egress mux to a
-  locally-bound backend, else the per-request/registry fallback (the `fabricd` sidecar), else
-  `EGRESS_UNAVAILABLE`. **Metered + limited + deadline-propagated + fail-closed centrally** by the
-  mux — an author cannot opt out.
-- The stock six live in **`runlet-caps`** (`preset()`); each is a `CapabilityDef::new(name, js, d.ts, Trust)`.
-  Files touched to add one there: `crates/runlet-caps/src/js/<cap>.js` + `<cap>.d.ts`, a `pub fn <cap>()`
-  + a `preset()` entry + an `actions::<CAP>` token list + the fixture assertion in
-  `crates/runlet-caps/src/lib.rs`. Metrics surface automatically under `meta.io.<name>` (the sidecar's
-  `BackendMetrics`); the D11 golden test (`types_dts_is_up_to_date`) regenerates `container/types.d.ts`.
-  **`runlet-core` is not touched.**
+**The three built-ins (in `runlet-core`):**
+- **`http`** (`http.rs`, `http` feature) — SSRF-guarded because the URL is **script-controlled**.
+- **`s3`** (`s3.rs`, `s3` feature) — pure SigV4 request signing (no network of its own).
+- **`io`** (`js/io.js`) — the operator-named logical-egress primitive: `io.call(name, action, payload)`,
+  the one **string-in / string-out JSON FFI** everything driver-shaped rides. `config.io` is a **flat
+  allowlist of logical names** (nicknames); a name not in the list fails `RESOURCE_NOT_FOUND` before
+  connect. The box is **kind-blind** — it never knows whether a name is Postgres or Redis.
 
-**2. In-engine capability (`http`, `s3`)** — the rare case that carries real in-engine Rust code
-(the SSRF-guarded reqwest client; the SigV4 signing), so it stays in `runlet-core` and is the
-enumerated **mux-bypass surface** (`engine.rs::inject_apis`, gated by the `http`/`s3` cargo features,
-metered via `sandbox.rs` `Collector<T>` → `ExecMetrics` → `meta.io.http`/`meta.io.s3`). Adding one is
-a core change (module + feature + `inject_apis` block + `ExecParams`/`CapabilitySet` config field +
-its `js/<cap>.d.ts` fragment wired into `types.rs`) and must be justified against composing it as an
-egress capability instead.
+`http`/`s3` are the enumerated **mux-bypass surface** (`engine.rs::inject_apis`, gated by their cargo
+features, metered via `sandbox.rs` `Collector<T>` → `ExecMetrics` → `meta.io.http`/`meta.io.s3`);
+adding another in-engine primitive is a core change and must be justified against composing over `io`.
 
-### Two trust models — pick the right one
+**Three ways to reach everything else (the extension spectrum, less→more isolation):**
+- **(a) `http` to a local service** — allowlisted `localhost:8000`; no wire protocol, you run the service.
+- **(b) your own Rust `CapabilityDef`** — compile your driver + creds into *your own* binary via the
+  library: [`CapabilityDef::new(name, js, d.ts, Trust)`](crates/runlet-core/src/capability.rs) composed
+  via `LogicHost::builder(...).capability(def)`. The JS wrapper routes every op through
+  `io.call('<name>', '<action>', payload)`; its `.d.ts` fragment travels with it (prefix interface
+  names to keep the shared TS namespace flat). Mandatory `Trust`: `OperatorSupplied` (targets from
+  operator config, no SSRF) or `ScriptControlled(SsrfPolicy)` (targets from script input, framework
+  applies the SSRF guard pre-connect). **`runlet-core` is not touched.**
+- **(c) `io` → a broker** (`fabricd`) that holds **all** the credentials — the multitenant path, box
+  holds nothing. A broker-free variant resolves a name **box-direct** to a co-located loopback service
+  declared in the global `local_resources` map (`local_io::BoxEgress`, D8/D9) — the on-the-wire
+  `{action, payload}` envelope is identical, so a service moves between box-direct and broker with
+  zero script change.
 
-- **`http` (`http.rs`) is SSRF-guarded** because the URL is **script-controlled**: host allowlist (`allowed_hosts`), private/internal IP blocking, redirect re-validation.
-- **`db` (`db.rs`) and `mail` (`mail.rs`) are trusted** because the connection is **operator-supplied** in `config.db` / `config.mail` — they connect to whatever host the config names, **no SSRF block**. This is intentional (internal Postgres / self-hosted SMTP relays must work). A new capability that takes operator config follows the db/mail model; one that takes script-supplied targets must guard like http.
+Whichever path, an `io` call is **injected only** when the request names it in `config.io` **and** the
+`Profile` allows I/O, and is **metered + limited + deadline-propagated + fail-closed centrally** by the
+mux — an author cannot opt out. Metrics surface under `meta.io.<name>`. The D11 golden test
+(`types_dts_is_up_to_date`, now in `runlet-core`) keeps `container/types.d.ts` in sync.
 
-### `db` is async (Tier 2 resilience)
+### Trust: script-controlled vs operator-supplied
 
-`db.rs` uses **async `tokio-postgres`**, not the sync `postgres` crate: each query runs
-via `handle.block_on(tokio::time::timeout(deadline, fut))` on the `spawn_blocking` thread,
-so a hung query is bounded by the execution wall-clock budget (`DB_TIMEOUT`) even when the
-server-side `statement_timeout` is lost through a transaction-mode pooler. The `block_on`
-**must** run on the blocking thread (never a runtime worker). The string-in/string-out FFI
-contract is unchanged — but `db.rs` is no longer a pure copy of the _sync_ capability
-template; other capabilities (`mail`/`s3`/`redis`/`amq`) remain sync. See
-`docs/design/resilience.md`.
+- **`http` (`http.rs`) is SSRF-guarded** because the URL is **script-controlled**: host allowlist
+  (`allowed_hosts`), private/internal IP blocking, redirect re-validation.
+- **`io` names are operator-supplied** — the script only ever sees a nickname; the real host/creds live
+  in the broker (or the box-direct `local_resources` binding, which the boot guard pins to
+  loopback/private). No SSRF surface. When you build a `CapabilityDef` (path b), pick `Trust` the same
+  way: `OperatorSupplied` for config-named targets, `ScriptControlled(SsrfPolicy)` for script-named ones.
+
+### Resilience / deadlines
+
+The execution wall-clock deadline is **propagated to egress by the mux**, so a hung `io` call is bounded
+even when a server-side timeout is lost through a transaction-mode pooler. The driver-side detail (async
+`block_on(timeout(...))` on the blocking thread, pooler behavior) now lives in `fabricd`'s
+`fabric-backends`, not this repo; `docs/design/resilience.md` + `docs/design/pooled-capabilities.md`
+stay the canonical write-ups.
 
 ### Numbers / decimals
 
-`db.rs` maps Postgres types to JSON with one rule: values that don't fit a JS number exactly come back as **strings** — `BIGINT` (INT8) and `NUMERIC`/`DECIMAL` are strings; INT2/INT4 and floats are numbers. The `$`/`Decimal` global (`decimal.rs`, backed by `rust_decimal` — the same engine that decodes `NUMERIC`) gives exact in-script math. JS has no operator overloading, so it's method-based (`.add().mul().round()`), not `+ - * /`; `__decimal(op, a, b)` does the work and stays panic-free via `Decimal::checked_*`.
+A driver behind an `io` name returns values that don't fit a JS number exactly as **strings** (e.g.
+Postgres `BIGINT`/`NUMERIC`) — that mapping is now the broker's (`fabric-backends`) concern, over the
+wire. In-script, the `$`/`Decimal` global (`decimal.rs`, backed by `rust_decimal`) gives exact math. JS
+has no operator overloading, so it's method-based (`.add().mul().round()`), not `+ - * /`;
+`__decimal(op, a, b)` does the work and stays panic-free via `Decimal::checked_*`.
 
 ## Conventions
 
-- **Lint gauntlet:** `[workspace.lints]` in the root `Cargo.toml` (inherited by both crates via `[lints] workspace = true`) forbids `unsafe`, denies `clippy::{all,pedantic,nursery,cargo}` plus many restriction lints (no `unwrap`/`expect`/`panic`, no bare arithmetic — use `checked_*`/`saturating_*`, no `as` casts, `missing_docs_in_private_items`, no `#[allow]` — use `#[expect(..., reason="...")]`). Mirror an existing module (`db.rs` is the canonical template) and keep functions small (cognitive-complexity and line thresholds in `clippy.toml`).
+- **Lint gauntlet:** `[workspace.lints]` in the root `Cargo.toml` (inherited by both crates via `[lints] workspace = true`) forbids `unsafe`, denies `clippy::{all,pedantic,nursery,cargo}` plus many restriction lints (no `unwrap`/`expect`/`panic`, no bare arithmetic — use `checked_*`/`saturating_*`, no `as` casts, `missing_docs_in_private_items`, no `#[allow]` — use `#[expect(..., reason="...")]`). Mirror an existing module (`http.rs` / `s3.rs` are the canonical in-engine templates; `local_io.rs` for an egress adapter) and keep functions small (cognitive-complexity and line thresholds in `clippy.toml`).
 - **Beginner docs** live in `docs/` (a kid-friendly guide to each capability). Keep them in sync with API changes; `README.md` is the reference version.
-- **Capability method names are `snake_case` — always.** Every method on a capability global (`api`/`db`/`mongo`/`mail`/`s3`/`redis`/`amq`/`auth`, and any future one) uses `snake_case`, e.g. `s3.upload_url`, `auth.user_info`, `mongo.find_one`/`insert_many`/`update_one`. **Do not** copy the underlying library's casing — MongoDB's `findOne`/`insertMany` etc. become `find_one`/`insert_many`. The internal string-in/string-out FFI **action token** (the first arg to `__<cap>`) must use the same `snake_case` name as the JS method, kept in sync between `src/js/<cap>.js` and the Rust dispatch `match`. (Exception: the value-util globals `$`/`Decimal` use JS-idiomatic camelCase fluent methods like `toCents`/`toString` — see the next bullet. The snake_case rule is for the I/O capabilities only.)
+- **Capability method names are `snake_case` — always.** Every method on a built-in or user-composed capability global (`http`/`s3`, and any `CapabilityDef` you add) uses `snake_case`, e.g. `s3.upload_url`. **Do not** copy the underlying library's casing — a MongoDB-style `findOne`/`insertMany` becomes `find_one`/`insert_many`. The `action` token passed to `io.call(name, action, payload)` (and any internal `__<cap>` FFI) must use the same `snake_case` name as the JS method, kept in sync between the JS wrapper and the resolver's dispatch. (Exception: the value-util globals `$`/`Decimal` use JS-idiomatic camelCase fluent methods like `toCents`/`toString` — see the next bullet. The snake_case rule is for I/O capabilities only.)
 - **Util API surface — one canonical, IntelliSense-discoverable form.** New helpers on a value-util global like `$`/`Decimal` (and any future util we add) are exposed as **chainable instance methods only** (e.g. `$(x).toCents()`, camelCase to match JS natives like `toString`), never duplicated as static shortcuts on the factory (no `$.toCents(x)`). Every public method must be declared in `container/types.d.ts` so editor autocomplete (the bundled `tsconfig.json` runs `checkJs`) is the single source of truth for what's callable. One way to do a thing, and it shows up in IntelliSense.
 - **Releases** are CI-only (`.github/workflows/release.yml`, manual `workflow_dispatch` with a version bump) — it bumps `Cargo.toml`, tags, and pushes the image to GHCR. Don't hand-edit versions for a release.
