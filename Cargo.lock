@@ -1976,7 +1976,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "quinn",
- "runlet-caps",
+ "reqwest",
  "runlet-core",
  "runlet-wire",
  "rustls",
@@ -1995,13 +1995,6 @@ version = "0.1.1"
 dependencies = [
  "criterion",
  "rquickjs",
- "runlet-core",
-]
-
-[[package]]
-name = "runlet-caps"
-version = "0.1.1"
-dependencies = [
  "runlet-core",
 ]
 

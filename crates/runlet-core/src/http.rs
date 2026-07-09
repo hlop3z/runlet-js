@@ -4,7 +4,7 @@
 //! Access controlled per-request via `allowed_hosts`.
 //! Each call is metered in `HttpMetric` for auditing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -134,8 +134,12 @@ pub fn inject_http(
         .timeout(HTTP_TIMEOUT)
         .redirect(policy)
         // Pin resolution: the address reqwest connects to is the one the SSRF filter passed,
-        // closing the DNS-rebinding TOCTOU window between a pre-check and the connect lookup.
-        .dns_resolver(Arc::new(ssrf::SsrfResolver::new(allow_private)))
+        // closing the DNS-rebinding TOCTOU window between a pre-check and the connect lookup. The
+        // resolver also permits the D6 `host:port`-allowlisted local hosts, matching the pre-check.
+        .dns_resolver(Arc::new(ssrf::SsrfResolver::with_bypass(
+            allow_private,
+            Arc::new(bypass_host_set(allowed_hosts)),
+        )))
         .build()?;
 
     let closure_hosts = Arc::clone(&hosts);
@@ -257,12 +261,16 @@ fn validate_url(
         .host_str()
         .ok_or_else(|| format!("URL has no host: {url}"))?;
 
-    if !is_host_allowed(host, allowed, wildcard_allowed) {
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    if !is_host_allowed(host, port, allowed, wildcard_allowed) {
         return Err(format!("host '{host}' is not in allowed_hosts"));
     }
 
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    block_private_ip(host, port, allow_private)?;
+    // A target explicitly allowlisted as `host:port` (D6) skips the private-IP block for that one
+    // host — the production-safe way to reach a co-located service without the blanket `debug` relax.
+    if !is_local_bypass(host, port, allowed) {
+        block_private_ip(host, port, allow_private)?;
+    }
 
     Ok(host.into())
 }
@@ -284,27 +292,84 @@ fn validate_redirect(
         return attempt.stop();
     }
     let host = url.host_str().unwrap_or("");
-    if !is_host_allowed(host, hosts, wildcard_allowed) {
+    let port = url.port_or_known_default().unwrap_or(80);
+    if !is_host_allowed(host, port, hosts, wildcard_allowed) {
         return attempt.stop();
     }
-    let port = url.port_or_known_default().unwrap_or(80);
-    if block_private_ip(host, port, allow_private).is_err() {
+    // Honor the D6 local bypass on redirect hops too, so a redirect to an allowlisted co-located
+    // `host:port` is followed while every other private target stays blocked.
+    if !is_local_bypass(host, port, hosts) && block_private_ip(host, port, allow_private).is_err() {
         return attempt.stop();
     }
     attempt.follow()
 }
 
-/// Returns `true` if the host is in the allowed list. The wildcard `*` matches every host
-/// **only** when `wildcard_allowed` is set — otherwise it is treated as a literal (and so
-/// matches nothing), because `*` collapses the host layer down to the IP filter alone and is
-/// only safe as an explicit operator opt-in (never in debug/private mode). See
-/// `EngineConfig::allow_wildcard_hosts`.
-fn is_host_allowed(host: &str, allowed: &[String], wildcard_allowed: bool) -> bool {
+/// Returns `true` if the host is in the allowed list. An entry may be a bare `host` (matches that
+/// host on any port) or a `host:port` (matches only that exact target — the D6 targeted local
+/// allowlist form). The wildcard `*` matches every host **only** when `wildcard_allowed` is set —
+/// otherwise it is treated as a literal (and so matches nothing), because `*` collapses the host
+/// layer down to the IP filter alone and is only safe as an explicit operator opt-in (never in
+/// debug/private mode). See `EngineConfig::allow_wildcard_hosts`.
+fn is_host_allowed(host: &str, port: u16, allowed: &[String], wildcard_allowed: bool) -> bool {
     if wildcard_allowed && allowed.iter().any(|ah| ah == "*") {
         return true;
     }
     let host_lower = host.to_lowercase();
-    allowed.iter().any(|ah| ah.to_lowercase() == host_lower)
+    let host_port = format!("{host_lower}:{port}");
+    allowed
+        .iter()
+        .any(|ah| ah.to_lowercase() == host_lower || ah.to_lowercase() == host_port)
+}
+
+/// Returns `true` when `allowed` names this exact `host:port` — the D6 targeted local bypass: an
+/// explicitly-allowlisted local target skips the private-IP block for that one host:port (all other
+/// guards still apply), so reaching a co-located service (`localhost:8000`) is production-safe
+/// without the blanket `debug` relax. A bare `host` entry never grants the bypass.
+fn is_local_bypass(host: &str, port: u16, allowed: &[String]) -> bool {
+    let host_port = format!("{}:{port}", host.to_lowercase());
+    allowed.iter().any(|ah| ah.to_lowercase() == host_port)
+}
+
+/// The set of host names that carry an explicit `host:port` entry in `allowed_hosts` (the D6
+/// bypass hosts) — passed to the connect-time [`ssrf::SsrfResolver`] so its private-IP filter also
+/// permits those hosts, matching the pre-check's bypass. A bare `host` entry contributes nothing.
+fn bypass_host_set(allowed: &[String]) -> HashSet<String> {
+    allowed
+        .iter()
+        .filter_map(|entry| {
+            let (host, port) = entry.rsplit_once(':')?;
+            // Only a numeric-port `host:port` entry is a bypass; a bare host (or an IPv6 literal
+            // fragment) is not.
+            (port.parse::<u16>().is_ok() && !host.is_empty()).then(|| host.to_lowercase())
+        })
+        .collect()
+}
+
+/// Validates a **box-direct local-egress** binding URL (byo-capabilities D8) targets loopback only.
+///
+/// Reuses the `http` guard's scheme check plus the shared IP classifier
+/// ([`ssrf::require_private_target`]), so one policy governs both script-controlled `http` targets
+/// and operator-declared box-direct bindings. A remote target is rejected (it must go through a
+/// broker).
+///
+/// # Errors
+///
+/// Returns an error if the URL is unparseable, uses a non-http(s) scheme, has no host, or the host
+/// is (or resolves to) any public address.
+pub fn check_local_egress_url(url: &str) -> Result<(), String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|err| format!("invalid box-direct url '{url}': {err}"))?;
+    if !is_scheme_allowed(parsed.scheme()) {
+        return Err(format!(
+            "box-direct url scheme '{}' is not allowed (only http/https)",
+            parsed.scheme()
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("box-direct url has no host: {url}"))?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    ssrf::require_private_target(host, port)
 }
 
 /// Extracts the host from a URL (privacy: no path/query). Used for metrics only.
@@ -414,7 +479,7 @@ mod tests {
     //! Host-allowlist wildcard gating, the explicit scheme allowlist, and the alt-encoding
     //! canonicalization the guard inherits from the `url` crate (pinned by our own tests).
 
-    use super::{is_host_allowed, is_scheme_allowed, validate_url};
+    use super::{is_host_allowed, is_local_bypass, is_scheme_allowed, validate_url};
     use crate::ssrf::block_private_ip;
 
     /// Builds a single-element allow list.
@@ -426,11 +491,11 @@ mod tests {
     #[test]
     fn wildcard_honored_only_when_allowed() {
         assert!(
-            is_host_allowed("evil.example", &allow("*"), true),
+            is_host_allowed("evil.example", 443, &allow("*"), true),
             "wildcard matches when allowed"
         );
         assert!(
-            !is_host_allowed("evil.example", &allow("*"), false),
+            !is_host_allowed("evil.example", 443, &allow("*"), false),
             "wildcard is inert when not allowed"
         );
     }
@@ -439,12 +504,54 @@ mod tests {
     #[test]
     fn explicit_hosts_match_case_insensitively() {
         assert!(
-            is_host_allowed("API.Example.com", &allow("api.example.com"), false),
+            is_host_allowed("API.Example.com", 443, &allow("api.example.com"), false),
             "case-insensitive exact match"
         );
         assert!(
-            !is_host_allowed("other.example", &allow("api.example.com"), false),
+            !is_host_allowed("other.example", 443, &allow("api.example.com"), false),
             "unlisted host rejected"
+        );
+    }
+
+    /// D6: a `host:port` allowlist entry matches only that exact target; a bare host matches any
+    /// port; and only the `host:port` form grants the private-IP bypass.
+    #[test]
+    fn hostport_allowlist_is_port_specific() {
+        let listed = allow("localhost:8000");
+        assert!(
+            is_host_allowed("localhost", 8000, &listed, false),
+            "the exact host:port is allowed"
+        );
+        assert!(
+            !is_host_allowed("localhost", 9999, &listed, false),
+            "a different port on the same host is not allowed by a host:port entry"
+        );
+        assert!(
+            is_local_bypass("localhost", 8000, &listed),
+            "the exact host:port grants the local bypass"
+        );
+        assert!(
+            !is_local_bypass("localhost", 9999, &listed),
+            "a different port does not grant the bypass"
+        );
+        assert!(
+            !is_local_bypass("localhost", 8000, &allow("localhost")),
+            "a bare host entry never grants the bypass"
+        );
+    }
+
+    /// D6 end-to-end pre-check: an allowlisted `localhost:8000` target is permitted with `debug`
+    /// off, while an un-named local port is still blocked by the private-IP guard.
+    #[test]
+    fn named_local_target_bypasses_private_block() {
+        let listed = allow("localhost:8000");
+        assert!(
+            validate_url("http://localhost:8000/health", &listed, false, false).is_ok(),
+            "the named local target is reachable with debug off"
+        );
+        assert!(
+            validate_url("http://localhost:9999/health", &listed, false, false).is_err(),
+            "an un-named local port is still blocked by the private-IP guard"
         );
     }
 

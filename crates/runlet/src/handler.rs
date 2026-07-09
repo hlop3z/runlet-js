@@ -47,6 +47,7 @@ use crate::authz::authorize_capabilities;
 use crate::config::{BatchConfig, TrustedHeaders};
 use crate::events::{AuditBody, CapabilityOps, Event, EventBody, LogBody, Sink, UsageBody};
 use crate::identity::{RunMode, TrustedIdentity};
+use crate::local_io::{BoxEgress, LocalIoMetric};
 use crate::quota::{QuotaExceeded, QuotaGuard, TenantQuota};
 use crate::sidecar::{SessionConn, SessionError, SidecarEgress, SidecarTransport, connect_session};
 use crate::status::{Projected, project_envelope};
@@ -78,6 +79,13 @@ pub(crate) struct AppState {
     /// its own operator config and performs the I/O. [`SidecarTransport::None`] ⇒ driver
     /// capabilities are unavailable (`503 EGRESS_UNAVAILABLE`).
     pub(crate) transport: SidecarTransport,
+    /// Box-direct local egress bindings (byo-capabilities D8): logical resource name → co-located
+    /// loopback endpoint URL. A name in `config.io` bound here resolves **box-direct** (a POST of the
+    /// `{action, payload}` envelope) instead of forwarding to the broker; empty = every name forwards
+    /// to the broker. Operator-declared in global config, loopback-only (boot-guard validated).
+    pub(crate) local_resources: Arc<HashMap<String, String>>,
+    /// Shared `reqwest` client for box-direct POSTs (reuses the process rustls/aws-lc-rs stack).
+    pub(crate) local_client: reqwest::Client,
     /// Process-wide observability counters, exposed at `GET /metrics`.
     pub(crate) metrics: Arc<Metrics>,
     /// Configured global bulkhead capacity, surfaced as the `_total` permit gauge.
@@ -211,98 +219,64 @@ pub(crate) struct RequestConfig {
     /// `$sys` env/secrets context (omit to leave `$sys.env`/`$sys.secrets` empty).
     #[serde(default)]
     pub(crate) sys: Option<SysConfig>,
-    /// Logical resources this invocation may reach, keyed by capability kind (e.g.
-    /// `{"db":["orders-db"]}`). The names are sent to `fabricd`, which resolves them against its
-    /// operator config; the request never carries endpoints or credentials.
+    /// Logical resources this invocation may reach — a plain allowlist of names (e.g.
+    /// `["orders","cache"]`). The box is kind-blind: it forwards the names to `fabricd` (which
+    /// resolves each to a kind/endpoint/creds) or, for a name the operator bound box-direct, POSTs
+    /// to the co-located endpoint. The request never carries endpoints or credentials.
     #[serde(default)]
     pub(crate) io: RequestIo,
 }
 
-/// The `config.io` allowlist: which logical resources the script may address, per capability
-/// kind. The box selects the first named resource of each kind (single binding per kind) and
-/// sends those names to `fabricd` in the session `WireInit`.
+/// The `config.io` allowlist: a **flat list of logical resource names** the script may address
+/// (byo-capabilities D3). No per-kind structure — "kind" is resolved operator-side (by the broker
+/// or the box-direct binding). The allowlist is both the enabled set (`io.call(name, …)` is gated
+/// by it) and the set of names forwarded to the broker in `WireInit`.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct RequestIo {
-    /// `db` logical resource names.
-    #[serde(default)]
-    pub(crate) db: Vec<String>,
-    /// `mongo` logical resource names.
-    #[serde(default)]
-    pub(crate) mongo: Vec<String>,
-    /// `mail` logical resource names.
-    #[serde(default)]
-    pub(crate) mail: Vec<String>,
-    /// `redis` logical resource names.
-    #[serde(default)]
-    pub(crate) redis: Vec<String>,
-    /// `amq` logical resource names.
-    #[serde(default)]
-    pub(crate) amq: Vec<String>,
-    /// `auth` logical resource names.
-    #[serde(default)]
-    pub(crate) auth: Vec<String>,
-}
+#[serde(transparent)]
+pub(crate) struct RequestIo(pub(crate) Vec<String>);
 
 impl RequestIo {
-    /// `true` if any driver capability is requested (so a `fabricd` session is needed).
-    fn any(&self) -> bool {
-        [
-            &self.db,
-            &self.mongo,
-            &self.mail,
-            &self.redis,
-            &self.amq,
-            &self.auth,
-        ]
-        .iter()
-        .any(|names| !names.is_empty())
+    /// `true` if the request names any egress resource (so the `io` global + an egress port are
+    /// wired for this request).
+    const fn any(&self) -> bool {
+        !self.0.is_empty()
     }
 
-    /// The registered capability names to enable for this request — a kind is enabled iff the
-    /// request named a resource for it. Passed to the engine as `CapabilitySet.io`; a registered
-    /// def's wrapper is injected only for a name in this list.
-    fn enabled_names(&self) -> Vec<&'static str> {
-        let mut names = Vec::new();
-        if !self.db.is_empty() {
-            names.push("db");
-        }
-        if !self.mongo.is_empty() {
-            names.push("mongo");
-        }
-        if !self.mail.is_empty() {
-            names.push("mail");
-        }
-        if !self.redis.is_empty() {
-            names.push("redis");
-        }
-        if !self.amq.is_empty() {
-            names.push("amq");
-        }
-        if !self.auth.is_empty() {
-            names.push("auth");
-        }
-        names
+    /// The allowlisted names. Passed to the engine as `CapabilitySet.io`: `io` is injected globally
+    /// under `Profile::Full`, and `io.call(name, …)` is gated by this list (an unlisted name is
+    /// rejected `RESOURCE_NOT_FOUND` before any egress).
+    fn enabled_names(&self) -> Vec<&str> {
+        self.0.iter().map(String::as_str).collect()
     }
 
-    /// The `fabricd` session-open message: the first named resource per kind, the per-execution
-    /// deadline, and the request's trusted tenant id (so `fabricd` scopes resolution to that
-    /// tenant's bindings). `fabricd` resolves each name against its operator config.
-    fn wire_init(&self, timeout: Duration, tenant: Option<&str>) -> WireInit {
-        WireInit {
-            db: self.db.first().cloned(),
-            mongo: self.mongo.first().cloned(),
-            mail: self.mail.first().cloned(),
-            redis: self.redis.first().cloned(),
-            amq: self.amq.first().cloned(),
-            auth: self.auth.first().cloned(),
-            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-            // The trusted tenant id, sourced only from the trusted-header extractor (never the
-            // script). `None` on the single-tenant/loopback path.
-            tenant: tenant.map(str::to_owned),
-            // The token (QUIC path) is attached by `connect_session` from the transport's auth
-            // provider — the box-request layer never sees it.
-            token: None,
-        }
+    /// The names that must be resolved by the **broker** — every allowlisted name not bound
+    /// box-direct in the global `local_resources` map. Box-direct names are served locally, so they
+    /// are never sent to `fabricd` (which would fail to resolve them).
+    fn broker_names(&self, local: &HashMap<String, String>) -> Vec<String> {
+        self.0
+            .iter()
+            .filter(|name| !local.contains_key(*name))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The `fabricd` session-open message: the flat list of broker-resolved resource names, the
+/// per-execution deadline, and the request's trusted tenant id (so `fabricd` scopes resolution to
+/// that tenant's bindings). `fabricd` resolves each name against its operator config.
+fn wire_init(resources: Vec<String>, timeout: Duration, tenant: Option<&str>) -> WireInit {
+    WireInit {
+        resources,
+        timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        // The trusted tenant id, sourced only from the trusted-header extractor (never the script).
+        // `None` on the single-tenant/loopback path. Its **presence** is itself the multitenant
+        // signal: `fabricd` treats any tenant-scoped session as least-privilege-mandatory (the
+        // `allow_privileged` opt-out is void), so the box carries no separate privilege flag. See
+        // `docs/design/resource-egress.md` (least-privilege / trust model).
+        tenant: tenant.map(str::to_owned),
+        // The token (QUIC path) is attached by `connect_session` from the transport's auth
+        // provider — the box-request layer never sees it.
+        token: None,
     }
 }
 
@@ -372,9 +346,11 @@ impl Meta {
     }
 
     /// Attaches the per-capability metrics into the dynamic `meta.io` map: `http`/`s3` from the
-    /// engine outcome, the driver-backed capabilities from the egress adapter. Only capabilities
-    /// that actually ran get an entry.
-    fn with_metrics(mut self, metrics: ExecMetrics, backend: BackendMetrics) -> Self {
+    /// engine outcome, the broker-resolved capabilities (keyed by kind) from the egress adapter, and
+    /// the **box-direct** local calls (keyed by logical name, D8) from the local egress. Only
+    /// capabilities that actually ran get an entry.
+    fn with_metrics(mut self, metrics: ExecMetrics, egress: EgressMetrics) -> Self {
+        let EgressMetrics { backend, local } = egress;
         insert_io(&mut self.io, "http", metrics.http);
         insert_io(&mut self.io, "s3", metrics.s3);
         insert_io(&mut self.io, "db", backend.db);
@@ -383,8 +359,22 @@ impl Meta {
         insert_io(&mut self.io, "redis", backend.redis);
         insert_io(&mut self.io, "amq", backend.amq);
         insert_io(&mut self.io, "auth", backend.auth);
+        for (name, ops) in local {
+            insert_io(&mut self.io, &name, ops);
+        }
         self
     }
+}
+
+/// The drained egress metrics for one execution: the broker's per-kind [`BackendMetrics`] plus the
+/// box-direct local per-op metrics keyed by logical name (byo-capabilities D8). Both feed the
+/// dynamic `meta.io` map.
+#[derive(Debug, Default)]
+struct EgressMetrics {
+    /// Broker-resolved per-capability metrics (keyed by kind: `db`/`redis`/…).
+    backend: BackendMetrics,
+    /// Box-direct local per-op metrics, keyed by logical resource name.
+    local: BTreeMap<String, Vec<LocalIoMetric>>,
 }
 
 /// Serializes a capability's per-op metrics into the `meta.io` map under `name`, skipping the
@@ -744,12 +734,17 @@ async fn run_execute(
         }
     };
 
-    // Open the `fabricd` egress session when any driver capability is requested. The box holds no
-    // credentials: it sends the selected logical names + the trusted tenant id; `fabricd` resolves
-    // them within that tenant's binding set. An unknown/out-of-tenant name (400), or an
-    // unreachable/absent sidecar (503), is rejected here — before admission.
-    let session = if config.io.any() {
-        let init = config.io.wire_init(engine_cfg.timeout(), tenant.as_deref());
+    // Open the `fabricd` egress session only for names the broker must resolve — every allowlisted
+    // name **not** bound box-direct in the global `local_resources` map (D8). A box-direct-only
+    // request opens no broker session. The box holds no credentials: it sends the broker names + the
+    // trusted tenant id; `fabricd` resolves them within that tenant's binding set. An unknown/
+    // out-of-tenant name (400), or an unreachable/absent sidecar (503), is rejected here — before
+    // admission.
+    let broker_names = config.io.broker_names(&state.local_resources);
+    let session = if broker_names.is_empty() {
+        None
+    } else {
+        let init = wire_init(broker_names, engine_cfg.timeout(), tenant.as_deref());
         match connect_session(&state.transport, &init).await {
             Ok(conn) => Some(conn),
             Err(err) => {
@@ -767,8 +762,6 @@ async fn run_execute(
                 return session_error_response(err, meta, cfg);
             }
         }
-    } else {
-        None
     };
 
     let start = Instant::now();
@@ -801,6 +794,8 @@ async fn run_execute(
         handle: Handle::current(),
         timeout: engine_cfg.timeout(),
         session,
+        local_resources: Arc::clone(&state.local_resources),
+        local_client: state.local_client.clone(),
         source,
         context_json,
         config,
@@ -829,8 +824,12 @@ struct ExecuteBlocking {
     handle: Handle,
     /// Per-execution wall-clock budget bounding every egress round-trip.
     timeout: Duration,
-    /// The pre-connected `fabricd` session, when the request named driver resources.
+    /// The pre-connected `fabricd` session, when the request named broker-resolved resources.
     session: Option<SessionConn>,
+    /// Box-direct local egress bindings (name → loopback URL), consulted before the broker (D8).
+    local_resources: Arc<HashMap<String, String>>,
+    /// Shared `reqwest` client for the box-direct POSTs.
+    local_client: reqwest::Client,
     /// The resolved script source (inline or registered).
     source: ScriptSource,
     /// Raw context JSON handed straight to `QuickJS`.
@@ -851,25 +850,40 @@ struct ExecuteBlocking {
 /// round-trips + drain `block_on` must run on the `spawn_blocking` thread, never a runtime worker).
 async fn execute_blocking(
     params: ExecuteBlocking,
-) -> Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError> {
+) -> Result<(Result<Outcome, EngineError>, EgressMetrics), task::JoinError> {
     let ExecuteBlocking {
         host,
         handle,
         timeout,
         session,
+        local_resources,
+        local_client,
         source,
         context_json,
         config,
         cache_ns,
         log_floor,
     } = params;
-    task::spawn_blocking(move || -> (Result<Outcome, EngineError>, BackendMetrics) {
-        let adapter =
+    task::spawn_blocking(move || -> (Result<Outcome, EngineError>, EgressMetrics) {
+        // The broker session (if any) is wrapped as a `SidecarEgress`, then composed with the
+        // box-direct bindings into a single `BoxEgress` (D8): a listed local name resolves
+        // box-direct, everything else forwards to the broker. The `io` port is wired whenever the
+        // request named any resource; a box-direct-only request opened no broker session.
+        let broker =
             session.map(|conn| Arc::new(SidecarEgress::new(conn, handle.clone(), timeout)));
-        let egress: Option<Arc<dyn Egress>> = adapter.as_ref().map(|metered| {
-            // Upcast `Arc<SidecarEgress>` → `Arc<dyn Egress>`; the turbofish pins the source type so
-            // the clone resolves before the coercion (the original `adapter` stays for draining).
-            let dynamic: Arc<dyn Egress> = Arc::<SidecarEgress>::clone(metered);
+        let box_egress = config.io.any().then(|| {
+            Arc::new(BoxEgress::new(
+                Arc::clone(&local_resources),
+                local_client.clone(),
+                handle.clone(),
+                timeout,
+                broker,
+            ))
+        });
+        let egress: Option<Arc<dyn Egress>> = box_egress.as_ref().map(|metered| {
+            // Upcast `Arc<BoxEgress>` → `Arc<dyn Egress>`; the turbofish pins the source type so the
+            // clone resolves before the coercion (the original `box_egress` stays for draining).
+            let dynamic: Arc<dyn Egress> = Arc::<BoxEgress>::clone(metered);
             dynamic
         });
         // The HTTP front always runs the full-capability profile (the default) with no read-hook, so
@@ -892,8 +906,10 @@ async fn execute_blocking(
             invocation = invocation.log_level(floor);
         }
         let outcome = host.run(invocation);
-        let metrics =
-            adapter.map_or_else(BackendMetrics::default, |metered| metered.drain_metrics());
+        let metrics = box_egress.map_or_else(EgressMetrics::default, |metered| EgressMetrics {
+            backend: metered.drain_metrics(),
+            local: metered.drain_local(),
+        });
         (outcome, metrics)
     })
     .await
@@ -1297,10 +1313,13 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         }
     };
 
-    // Open the fabricd session when the item names driver resources.
-    let session = if config.io.any() {
+    // Open the fabricd session only for broker-resolved names (box-direct names are served locally).
+    let broker_names = config.io.broker_names(&state.local_resources);
+    let session = if broker_names.is_empty() {
+        None
+    } else {
         let tenant = identity.and_then(|trusted| trusted.tenant.as_deref());
-        let init = config.io.wire_init(state.engine_cfg.timeout(), tenant);
+        let init = wire_init(broker_names, state.engine_cfg.timeout(), tenant);
         match connect_session(&state.transport, &init).await {
             Ok(conn) => Some(conn),
             Err(err) => {
@@ -1316,8 +1335,6 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
                 return render_error_item(&envelope, &meta, id_ref);
             }
         }
-    } else {
-        None
     };
 
     // Admit: acquire this batch's fair-share slot (queues past the ceiling) then a global bulkhead
@@ -1331,6 +1348,8 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         handle: Handle::current(),
         timeout: state.engine_cfg.timeout(),
         session,
+        local_resources: Arc::clone(&state.local_resources),
+        local_client: state.local_client.clone(),
         source,
         context_json: context.get().to_owned(),
         config,
@@ -1424,16 +1443,16 @@ fn batch_item_quota(
 fn render_executed_item(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
-    result: Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError>,
+    result: Result<(Result<Outcome, EngineError>, EgressMetrics), task::JoinError>,
     base_meta: Meta,
     id: Option<&str>,
 ) -> RenderedItem {
     let metrics: &Metrics = &state.metrics;
     metrics.observe_execution(base_meta.exec_time_us);
     match result {
-        Ok((Ok(exec), backend)) => {
-            record_capability_latencies(metrics, &exec.metrics, &backend);
-            let meta = base_meta.with_metrics(exec.metrics, backend);
+        Ok((Ok(exec), egress)) => {
+            record_capability_latencies(metrics, &exec.metrics, &egress.backend);
+            let meta = base_meta.with_metrics(exec.metrics, egress);
             match exec.result {
                 ExecOutcome::Success(js_json) => {
                     emit_executed(state, identity, &meta, "success");
@@ -1738,7 +1757,7 @@ impl LogPolicy {
 /// diagnostic logs to the tenant (live mode, §2), and mirrors them on the response when the trusted
 /// gateway requested capture (§3, both success and error paths).
 fn build_response(
-    result: Result<(Result<Outcome, EngineError>, BackendMetrics), task::JoinError>,
+    result: Result<(Result<Outcome, EngineError>, EgressMetrics), task::JoinError>,
     base_meta: Meta,
     cfg: RespCfg,
     state: &AppState,
@@ -1749,8 +1768,8 @@ fn build_response(
     // Record latency for every execution that ran (shed/rejected requests return earlier).
     metrics.observe_execution(base_meta.exec_time_us);
     match result {
-        Ok((Ok(exec), backend)) => {
-            record_capability_latencies(metrics, &exec.metrics, &backend);
+        Ok((Ok(exec), egress)) => {
+            record_capability_latencies(metrics, &exec.metrics, &egress.backend);
             // Surface the declarative `emit(kind, value)` effects and — when captured — the diagnostic
             // `logs` on the response, on both the success and error paths (capture-on-failure).
             let Outcome {
@@ -1759,7 +1778,7 @@ fn build_response(
                 logs,
                 metrics: exec_metrics,
             } = exec;
-            let meta = base_meta.with_metrics(exec_metrics, backend);
+            let meta = base_meta.with_metrics(exec_metrics, egress);
             // Stream the captured logs to the tenant (live mode only, §2/OQ1) before shaping the
             // response — a test/playground run never enters the live stream.
             stream_logs(state, identity, &meta, &logs, policy.mode);
@@ -2143,36 +2162,18 @@ fn resolve_partition(
     identity.map_or(caller_asserted, |id| id.tenant.clone())
 }
 
-/// The capability kinds a request exercises — the driver kinds named in `config.io` plus the
-/// in-engine `http`/`s3` when their config is present. Used by the member-authz gate.
-fn requested_capabilities(config: &RequestConfig) -> Vec<&'static str> {
-    let io = &config.io;
-    let mut kinds = Vec::new();
-    if !io.db.is_empty() {
-        kinds.push("db");
-    }
-    if !io.mongo.is_empty() {
-        kinds.push("mongo");
-    }
-    if !io.mail.is_empty() {
-        kinds.push("mail");
-    }
-    if !io.redis.is_empty() {
-        kinds.push("redis");
-    }
-    if !io.amq.is_empty() {
-        kinds.push("amq");
-    }
-    if !io.auth.is_empty() {
-        kinds.push("auth");
-    }
+/// The capabilities a request exercises — the flat logical resource names in `config.io` plus the
+/// in-engine `http`/`s3` when their config is present. Used by the member-authz gate (which now
+/// keys `capability_entitlements` by logical resource name, not kind).
+fn requested_capabilities(config: &RequestConfig) -> Vec<&str> {
+    let mut names: Vec<&str> = config.io.enabled_names();
     if !config.allowed_hosts.is_empty() {
-        kinds.push("http");
+        names.push("http");
     }
     if config.s3.is_some() {
-        kinds.push("s3");
+        names.push("s3");
     }
-    kinds
+    names
 }
 
 /// Coarse member-capability authz (trusted mode): reject a member lacking the entitlement a
@@ -2692,46 +2693,67 @@ mod log_mirror_tests {
 
 #[cfg(test)]
 mod request_io_tests {
-    //! The box-side `config.io` interpretation: which capabilities are requested, the engine
-    //! gates, and the `fabricd` session-open `WireInit` (the first name per kind). Name→config
-    //! resolution itself now lives in `fabricd` (`fabric_backends::resolve`).
+    //! The box-side `config.io` interpretation (byo-capabilities: a flat allowlist of logical
+    //! names): which names are enabled, which need the broker vs box-direct, and the session-open
+    //! `WireInit` (the flat `resources` list). Name→kind/endpoint resolution itself lives in
+    //! `fabricd`; box-direct bindings live in the operator's global config.
 
-    use super::RequestIo;
+    use super::{RequestIo, wire_init};
+    use std::collections::HashMap;
 
-    /// A `RequestIo` naming one db resource (other kinds empty).
-    fn io_db(name: &str) -> RequestIo {
-        RequestIo {
-            db: vec![name.to_owned()],
-            ..RequestIo::default()
-        }
+    /// A `RequestIo` naming a flat list of logical resources.
+    fn io(names: &[&str]) -> RequestIo {
+        RequestIo(names.iter().map(|name| (*name).to_owned()).collect())
     }
 
-    /// `any()` is true iff some kind is named; `enabled_names()` mirrors per-kind presence.
+    /// `any()` is true iff a name is listed; `enabled_names()` is the flat allowlist.
     #[test]
-    fn any_and_enabled_names_track_named_kinds() {
-        let io = io_db("orders-db");
-        assert!(io.any(), "a named db means a session is needed");
+    fn any_and_enabled_names_track_the_flat_allowlist() {
+        let listed = io(&["orders", "cache"]);
+        assert!(listed.any(), "a named resource means the io port is wired");
         assert_eq!(
-            io.enabled_names(),
-            vec!["db"],
-            "only the named kind is enabled"
+            listed.enabled_names(),
+            vec!["orders", "cache"],
+            "the flat allowlist is the enabled set"
         );
 
         let empty = RequestIo::default();
-        assert!(!empty.any(), "no names → no session");
+        assert!(!empty.any(), "no names → no io port");
         assert!(empty.enabled_names().is_empty(), "no names enabled");
     }
 
-    /// `wire_init` carries the first name per kind and the deadline.
+    /// `broker_names` excludes names bound box-direct in the global local map; a box-direct-only
+    /// request needs no broker session.
     #[test]
-    fn wire_init_selects_first_name() {
-        let io = RequestIo {
-            db: vec!["orders-db".to_owned(), "ignored".to_owned()],
-            ..RequestIo::default()
-        };
-        let init = io.wire_init(std::time::Duration::from_millis(1500), Some("ws_acme"));
-        assert_eq!(init.db.as_deref(), Some("orders-db"), "first name selected");
-        assert_eq!(init.mongo, None, "unnamed kinds stay None");
+    fn broker_names_exclude_box_direct_bindings() {
+        let mut local = HashMap::new();
+        drop(local.insert("pricing".to_owned(), "http://127.0.0.1:8080".to_owned()));
+        let listed = io(&["orders", "pricing"]);
+        assert_eq!(
+            listed.broker_names(&local),
+            vec!["orders".to_owned()],
+            "only the non-local name goes to the broker"
+        );
+
+        let local_only = io(&["pricing"]);
+        assert!(
+            local_only.broker_names(&local).is_empty(),
+            "a box-direct-only request opens no broker session"
+        );
+    }
+
+    /// `wire_init` carries the flat resource list, the deadline, and the trusted tenant.
+    #[test]
+    fn wire_init_carries_flat_resources() {
+        let init = wire_init(
+            vec!["orders".to_owned(), "cache".to_owned()],
+            std::time::Duration::from_millis(1500),
+            Some("ws_acme"),
+        );
+        assert_eq!(
+            init.resources,
+            vec!["orders".to_owned(), "cache".to_owned()]
+        );
         assert_eq!(init.timeout_ms, 1500);
         assert_eq!(
             init.tenant.as_deref(),
@@ -2828,6 +2850,8 @@ mod trusted_pipeline_tests {
             limiter: Arc::new(Semaphore::new(8)),
             partition_limiter: None,
             transport: SidecarTransport::None,
+            local_resources: Arc::new(HashMap::new()),
+            local_client: reqwest::Client::new(),
             metrics: Arc::new(Metrics::default()),
             bulkhead_capacity: 8,
             access_token: None,
@@ -3017,10 +3041,7 @@ mod trusted_pipeline_tests {
             ("x-user-entitlements", "mail.send"),
         ]);
         let config = RequestConfig {
-            io: RequestIo {
-                db: vec!["orders-db".to_owned()],
-                ..RequestIo::default()
-            },
+            io: RequestIo(vec!["db".to_owned()]),
             ..RequestConfig::default()
         };
         assert_eq!(run(&app, hdrs, config).await, StatusCode::FORBIDDEN);
@@ -3158,6 +3179,8 @@ mod batch_tests {
             limiter: Arc::new(Semaphore::new(8)),
             partition_limiter: None,
             transport: SidecarTransport::None,
+            local_resources: Arc::new(HashMap::new()),
+            local_client: reqwest::Client::new(),
             metrics: Arc::new(Metrics::default()),
             bulkhead_capacity: 8,
             access_token: None,
@@ -3366,10 +3389,7 @@ mod batch_tests {
         let items = vec![
             BatchItem {
                 config: RequestConfig {
-                    io: RequestIo {
-                        db: vec!["orders-db".to_owned()],
-                        ..RequestIo::default()
-                    },
+                    io: RequestIo(vec!["db".to_owned()]),
                     ..RequestConfig::default()
                 },
                 ..item("function handler(){ return { data: 'db' }; }")
@@ -3413,6 +3433,7 @@ mod execute_status_tests {
     use runlet_core::pool::JsPool;
     use runlet_core::registry::ScriptRegistry;
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
 
@@ -3441,6 +3462,8 @@ mod execute_status_tests {
             limiter: Arc::new(Semaphore::new(8)),
             partition_limiter: None,
             transport: SidecarTransport::None,
+            local_resources: Arc::new(HashMap::new()),
+            local_client: reqwest::Client::new(),
             metrics: Arc::new(Metrics::default()),
             bulkhead_capacity: 8,
             access_token: None,

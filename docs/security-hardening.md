@@ -14,7 +14,15 @@ the **attack** it closes, and the **control**. Status is tracked here as work la
 2. **Script → host process** — QuickJS sandbox (mem/stack/timeout/op caps; `eval`/`Proxy`
    removed). Design is trending toward *untrusted, customer-authored* scripts.
 3. **Script-chosen target → outside world** — `http`/`s3` SSRF-guarded (script picks URL);
-   `db`/`mail`/`redis`/`amq` trusted (operator picks host).
+   `io.call` targets are operator-controlled (the script names a logical nickname, never a host),
+   so they carry no SSRF surface — the box resolves the name box-direct (loopback-only) or via the
+   broker.
+
+> **byo-capabilities note.** The driver capabilities referenced in the historical log below
+> (`mail.rs`, `db`/`redis`/`amq`/`auth`) have since moved **out of the box** to the reference
+> broker (sibling repo). The box now ships only three in-engine built-ins (`http`, `s3`, `io`);
+> the SSRF/boot-guard controls recorded here remain in the box and were extended for the
+> `http` targeted-local allowlist + the box-direct loopback boot guard.
 
 ## Work items
 

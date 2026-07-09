@@ -45,11 +45,11 @@ moka.workspace = true
 reqwest = { workspace = true, optional = true }
 
 # ── Capability features ──
-# The core now exposes exactly two capability features — `http` (SSRF-guarded) and `s3` (pure
-# SigV4 signing) — the only two in-engine, code-carrying capabilities. The six driver-backed
-# capabilities moved to the `runlet-caps` preset crate as composable `CapabilityDef`s (no cargo
-# feature: registration replaces feature gating). A deterministic-only host builds with
-# `default-features = false` and links nothing here. `runlet` (the HTTP front) enables `full`.
+# The core exposes exactly two capability features — `http` (SSRF-guarded) and `s3` (pure
+# SigV4 signing) — the only two in-engine, code-carrying capabilities. Driver-backed capabilities
+# are user-composed as `CapabilityDef`s (no cargo feature: registration replaces feature gating) or
+# serviced over `io.call` by a broker; the box ships none (byo-capabilities). A deterministic-only
+# host builds with `default-features = false` and links nothing here. `runlet` enables `full`.
 [features]
 default = ["full"]
 full = ["http", "s3"]

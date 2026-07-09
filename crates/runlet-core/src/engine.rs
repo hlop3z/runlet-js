@@ -937,13 +937,7 @@ fn inject_registry(qctx: &Ctx<'_>, params: &ExecParams<'_>) -> Result<(), rquick
     if !registry.is_active() && params.egress.is_none() {
         return Ok(());
     }
-    inject_mux(
-        qctx,
-        registry.clone(),
-        params.egress.clone(),
-        params.max_ops,
-        params.allow_private_targets,
-    )?;
+    inject_mux(qctx, registry.clone(), params)?;
     for def in registry.defs() {
         if params.enabled_io.contains(&def.name()) {
             let wrapper: JsValue<'_> = qctx.eval(def.js_wrapper())?;
@@ -962,14 +956,34 @@ fn inject_registry(qctx: &Ctx<'_>, params: &ExecParams<'_>) -> Result<(), rquick
 fn inject_mux(
     qctx: &Ctx<'_>,
     registry: CapabilityRegistry,
-    fallback: Option<Arc<dyn Egress>>,
-    max_ops: usize,
-    allow_private: bool,
+    params: &ExecParams<'_>,
 ) -> Result<(), rquickjs::Error> {
+    let fallback = params.egress.clone();
+    let max_ops = params.max_ops;
+    let allow_private = params.allow_private_targets;
+    // The per-request `config.io` allowlist: `io.call(name, …)` is gated by it centrally, so an
+    // unlisted name is rejected (`RESOURCE_NOT_FOUND`) before it can reach any backend (D3).
+    let allowed: Vec<String> = params
+        .enabled_io
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
     let used = Arc::new(AtomicUsize::new(0));
     let io_fn = Function::new(
         qctx.clone(),
         move |name: String, action: String, payload: String| -> String {
+            // Allowlist gate (D3): only a name the request listed in `config.io` may be addressed;
+            // an unlisted name is rejected before any backend, metering, or op-budget spend.
+            if !allowed.iter().any(|listed| listed == &name) {
+                return errors::dynamic_fault_json(&errors::DynamicFault {
+                    error: "resource is not in the request's io allowlist",
+                    code: "RESOURCE_NOT_FOUND",
+                    retryable: false,
+                    owner: ErrorOwner::Developer,
+                    source: &name,
+                    details: None,
+                });
+            }
             if used.load(Ordering::Relaxed) >= max_ops {
                 let message = format!("too many operations: limit is {max_ops} per execution");
                 return errors::dynamic_fault_json(&errors::DynamicFault {
@@ -1658,6 +1672,15 @@ mod egress_tests {
                 enabled,
             }
         }
+
+        /// No registry, but the given names allowlisted (a fallback-only run whose `io.call` names
+        /// must still pass the D3 allowlist gate).
+        const fn names(enabled: &'a [&'a str]) -> Self {
+            Self {
+                registry: None,
+                enabled,
+            }
+        }
     }
 
     /// Builds `ExecParams` for the no-capability build with a registry wiring and an optional
@@ -1713,7 +1736,7 @@ mod egress_tests {
             &runtime,
             script,
             Profile::Full,
-            Reg::NONE,
+            Reg::names(&["orders"]),
             Some(egress),
         ));
         assert!(
@@ -1737,7 +1760,7 @@ mod egress_tests {
             &runtime,
             script,
             Profile::Full,
-            Reg::NONE,
+            Reg::names(&["orders"]),
             Some(egress),
         ))
         .unwrap_or_else(|_err| unreachable!());
@@ -1821,6 +1844,37 @@ mod egress_tests {
         );
     }
 
+    /// D3 allowlist gate: an `io.call` to a name absent from the request allowlist is rejected
+    /// with `RESOURCE_NOT_FOUND` before the fallback backend is ever reached.
+    #[test]
+    fn unlisted_name_is_rejected_before_egress() {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let called = Arc::new(AtomicBool::new(false));
+        let backend: Arc<dyn Egress> = Arc::new(RecordingEgress {
+            called: Arc::clone(&called),
+            reply: "{}".to_owned(),
+        });
+        let script = "function handler() { \
+            try { io.call('secret', 'query', {}); return json('no throw'); } \
+            catch (e) { return json(e.__runlet ? e.__runlet.code : 'untagged'); } }";
+        // Allowlist enables only `orders`; the script asks for `secret`.
+        let json = run_ok(&params(
+            &runtime,
+            script,
+            Profile::Full,
+            Reg::names(&["orders"]),
+            Some(backend),
+        ));
+        assert!(
+            json.contains("RESOURCE_NOT_FOUND"),
+            "an unlisted name is rejected: {json}"
+        );
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "the fallback backend must never be reached for an unlisted name"
+        );
+    }
+
     /// D1: two defs sharing a name are rejected at build time, before any request.
     #[test]
     fn duplicate_registration_is_rejected() {
@@ -1851,7 +1905,7 @@ mod egress_tests {
             &runtime,
             script,
             Profile::Full,
-            Reg::new(&reg, &[]),
+            Reg::new(&reg, &["db"]),
             None,
         ))
         .unwrap_or_else(|_err| unreachable!());
@@ -1883,7 +1937,7 @@ mod egress_tests {
             &runtime,
             script,
             Profile::Full,
-            Reg::new(&reg, &[]),
+            Reg::new(&reg, &["db"]),
             None,
         ));
         assert!(
@@ -1915,7 +1969,7 @@ mod egress_tests {
             &runtime,
             script,
             Profile::Full,
-            Reg::new(&reg, &[]),
+            Reg::new(&reg, &["db"]),
             None,
         ))
         .unwrap_or_else(|_err| unreachable!());
@@ -1949,7 +2003,7 @@ mod egress_tests {
             &runtime,
             script,
             Profile::Full,
-            Reg::new(&reg, &[]),
+            Reg::new(&reg, &["db"]),
             None,
         ))
         .unwrap_or_else(|_err| unreachable!());
@@ -1987,7 +2041,7 @@ mod egress_tests {
             &runtime,
             script,
             Profile::Full,
-            Reg::new(&reg, &[]),
+            Reg::new(&reg, &["orders", "amq"]),
             Some(fallback),
         ));
         assert!(
@@ -2018,7 +2072,7 @@ mod egress_tests {
             &runtime,
             script,
             Profile::Full,
-            Reg::new(&reg, &[]),
+            Reg::new(&reg, &["db"]),
             None,
         ));
         assert!(

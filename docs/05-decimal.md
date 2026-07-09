@@ -123,21 +123,23 @@ function handler(ctx) {
 }
 ```
 
-## Works great with the database 🗄️
+## Works great with a database 🗄️
 
-Decimals from the database arrive as strings (see
-[Talk to a Database](03-database.md)). Wrap them in `$` to do exact math,
-then send the result back as a string:
+Values that don't fit a JS number exactly — big integers, `NUMERIC`/`DECIMAL` columns —
+arrive as **strings** (from `io.call`, see [Build your own capability](03-capabilities.md)).
+Wrap them in `$` to do exact math, then send the result back as a string:
 
 ```js
 function handler(ctx) {
-  var row = db.query("SELECT price FROM products WHERE id = $1", [ctx.id])
-    .rows[0];
+  var row = io.call("products", "query", {
+    sql: "SELECT price FROM products WHERE id = $1",
+    params: [ctx.id],
+  }).rows[0];
   var newPrice = $(row.price).mul("1.10").round(2); // +10%, rounded
-  db.execute("UPDATE products SET price = $1 WHERE id = $2", [
-    newPrice.toString(),
-    ctx.id,
-  ]);
+  io.call("products", "execute", {
+    sql: "UPDATE products SET price = $1 WHERE id = $2",
+    params: [newPrice.toString(), ctx.id],
+  });
   return json({ price: newPrice }, null);
 }
 ```
@@ -155,6 +157,6 @@ function handler(ctx) {
 - `.toString()` to show/save, `.round(2)` for cents.
 - In `json(...)`, decimals become exact strings for free.
 
-**Next:** [Signed Upload & Download Links →](06-s3.md)
+**Next:** [`s3` — Signed Upload & Download Links →](06-s3.md)
 
 [← Back to the guide](README.md)

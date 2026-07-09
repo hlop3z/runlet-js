@@ -8,6 +8,24 @@ Companion to [resilience.md](resilience.md) and [network-fabric.md](network-fabr
 > the box links no driver and holds no credentials. This doc is the rationale + the (now-historical)
 > staged plan; the live system is the source of truth. Next horizon is
 > [network-fabric.md](network-fabric.md) (Project B): `fabricd` growing into a cross-node fabric.
+>
+> **Update — byo-capabilities (framework, not service).** The box now ships **exactly three
+> in-engine built-ins** — `http` (script-controlled URL, SSRF-guarded), `s3` (pure signing), and
+> `io` (operator-named logical egress). The six *shipped* driver-cap wrappers were deleted (they
+> were sugar over `io.call(name, action, payload)`); `mongo` (and its `mongocrypt` tail) is dropped
+> entirely. Driver-backed capabilities are now **user-composed** `CapabilityDef`s or serviced by the
+> (demoted-to-optional) reference broker. The wire/config flattened: `config.io` is a **plain
+> allowlist of logical names** (`["orders","cache"]`) and the session handshake carries
+> `WireInit.resources: Vec<String>` — the box is kind-blind; the broker resolves name → kind →
+> endpoint → creds. **Model 1 gains one bounded exception:** a logical name may resolve
+> **box-direct** to an operator-declared, co-located **loopback** endpoint (global
+> `local_resources` config), reached over plain HTTP with the identical `{action, payload}`
+> envelope — logical local egress without a broker or Rust. The box still holds **no remote**
+> endpoint or credential (a remote target must go through a broker; the boot guard refuses a
+> non-loopback box-direct binding). The least-privilege / trust-model section below (carried from
+> the superseded `resource-privilege-guard` change) is unchanged: a tenant-scoped session is
+> least-privilege-mandatory, derived from the trusted tenant id, with no separate box-side privilege
+> signal.
 
 ## The principle
 
@@ -110,6 +128,105 @@ because its target is still script-controlled.
 resolved by the consumer and opaque to the core. The originally-sketched
 `fn("db.path", js_json, internal_dev_settings_json)` maps to `__resource(cap, payload,
 binding)` where `internal_dev_settings_json` is operator-bound and unreachable from JS.
+
+## Least-privilege / the resource trust model {#least-privilege}
+
+> **The principle, stated once:** *a script gets exactly the privilege of the account behind the
+> logical name.* The box faithfully forwards the operation; the only thing standing between a
+> sandboxed script and the backend host is the **backend account's own grants**. A resource pointed
+> at an over-privileged account hands every script that account's full power.
+
+This is not hypothetical. A pentest of the `box → fabricd → Postgres` path showed a `db` resource
+bound to a Postgres **superuser** role let a script run `COPY (SELECT 1) TO PROGRAM 'id'` — real
+command execution on the database host (`uid=70(postgres)`). The identical attack against a
+least-privilege read-only role was blocked by the backend's own grants. The hazard generalizes to
+every driver: a no-ACL `redis` reaches `CONFIG SET`+`SAVE` (write a webshell); a `mongo` `root` role
+reaches every database and server-side JS; an open `mail` relay sends to anyone; an `amq` admin/
+management user reconfigures the broker.
+
+The box cannot see or fix this — it holds no credentials and never connects. Only `fabricd`, which
+resolves the logical name and opens the connection, can inspect a resource's privilege. So the
+control lives in two places:
+
+- **In `fabricd` (enforcement — see its own repo):** a startup **privilege preflight** connects to
+  each configured resource once (connect → probe → disconnect) and asks a per-driver
+  `privilege_concern()` whether the account is over-privileged. On an affirmative over-privileged
+  verdict — or an *inconclusive* probe (an unverifiable resource is not served) — `fabricd`
+  **refuses to boot** unless the operator has set `allow_privileged: true` on that resource. This
+  mirrors the box's existing fail-closed guards (`allow_unauthenticated` on a non-loopback bind; the
+  trusted-mode network-isolation assertion): removing a guard requires an explicit, recorded
+  acknowledgement. A new driver added without a probe defaults to "cannot verify ⇒ not served," so
+  coverage can never silently regress.
+- **The multitenant opt-out ban (contract — this repo):** when the box opens an egress session
+  carrying a **trusted tenant identity** (multitenant/nexus mode), `fabricd` treats
+  `allow_privileged: true` as **void** for that session and refuses to serve any resource its
+  preflight flagged, regardless of config. The opt-out exists only for a trusted solo operator
+  accepting the risk for their own scripts — it must never silently weaken a deployment that serves
+  untrusted tenants. This needs **no new wire field:** the box already forwards the trusted tenant id
+  in the `WireInit` handshake (`WireInit.tenant`), and a tenant-scoped session *is* the multitenant
+  context — `fabricd` derives the mandate from that identity. The box stays dumb (it forwards
+  identity, never privilege policy), and the cross-repo wire contract is unchanged.
+
+We deliberately do **not** blocklist specific statements (`COPY … PROGRAM`, `lo_export`,
+`CONFIG SET`, …): a blocklist is a perpetual arms race, breaks the "the box faithfully forwards the
+operation" contract that lets legitimate scripts do real work, and does not generalize across
+drivers. The correct control is the backend account's privilege.
+
+### Hardened-role recipes (the remediation the boot refusal points at) {#hardened-roles}
+
+When `fabricd` refuses to boot on an over-privileged resource, its remediation message points here.
+Give each resource a dedicated least-privilege account. Copy-pasteable starting points per driver
+(tighten the scoped grants to the exact tables/keys/vhosts your scripts need):
+
+**`db` (PostgreSQL)** — a `NOSUPERUSER` role with only the DML it needs; revoke the file/program
+roles that yield host command execution:
+
+```sql
+CREATE ROLE app_ro LOGIN PASSWORD '…'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
+GRANT CONNECT ON DATABASE orders TO app_ro;
+GRANT USAGE ON SCHEMA public TO app_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_ro;   -- add INSERT/UPDATE/DELETE only where needed
+-- Ensure it holds NONE of the host-reaching roles:
+REVOKE pg_execute_server_program, pg_read_server_files, pg_write_server_files FROM app_ro;
+```
+
+**`redis`** — an ACL user scoped to its keyspace and commands; never the unrestricted `default`
+user. Deny the config/scripting/introspection commands that enable persistence-webshell tricks:
+
+```
+ACL SETUSER app on >… ~app:* +@read +@write -@dangerous \
+  -config -module -debug -script -acl -save -bgsave -shutdown
+ACL SETUSER default off        # disable the all-powerful default user
+```
+
+**`mongo`** — a role scoped to the one database, not a cluster/admin role. Avoid `root`, `__system`,
+`dbOwner`, `dbAdminAnyDatabase`, and any `AnyDatabase` role:
+
+```js
+db.getSiblingDB("orders").createUser({
+  user: "app", pwd: "…",
+  roles: [ { role: "readWrite", db: "orders" } ]   // scoped to one DB; not root/dbOwner
+})
+```
+
+**`mail` (SMTP)** — an authenticated account that may send **as its own domain only**, never an open
+relay. Configure the MTA to reject relaying to arbitrary recipients for this account (e.g. Postfix
+`smtpd_sender_restrictions` / `reject_authenticated_sender_login_mismatch`, a sender-login map
+pinning the account to its allowed From).
+
+**`amq` (RabbitMQ)** — a per-vhost user with scoped `configure`/`write`/`read` regexes and **no**
+`administrator`/`management`/`monitoring` tag:
+
+```sh
+rabbitmqctl add_user app '…'
+rabbitmqctl set_permissions -p /orders app '^app\.' '^app\.' '^app\.'   # scoped, not '.*'
+# deliberately no `set_user_tags app administrator` — the account stays a plain messaging user
+```
+
+**`auth` (OIDC/IdP)** — a client scoped to **token validation only** (introspection / userinfo), not
+user/realm management. Grant no admin or user-management scope; if introspection needs a confidential
+client, give it the introspection scope and nothing else.
 
 ## Stays in-box vs. moves to `fabricd`
 

@@ -4,9 +4,15 @@
 //! This lives in `runlet-wire` (not `fabric-backends`) so the sandbox box links it **without** any
 //! driver: after the trust flip the box sends only logical resource *names*, then reads back
 //! results and metrics, while `fabricd` (which links the drivers) resolves the names to operator
-//! configs. One client connection = one box-request session — an `Init` (names + deadline), then
-//! one `Call` (kind, action, payload) per `io.call(...)`, then a `Drain` for the metrics. See
-//! `docs/design/resource-egress.md`.
+//! configs. One client connection = one box-request session — an `Init` (a **flat list of logical
+//! names** + deadline), then one `Call` (name, action, payload) per `io.call(...)`, then a `Drain`
+//! for the metrics. See `docs/design/resource-egress.md`.
+//!
+//! **BREAKING cross-repo wire change (byo-capabilities, D3):** [`WireInit`] carries a flat
+//! `resources: Vec<String>` instead of six per-kind `Option<String>` slots — the box is now
+//! kind-blind and the broker resolves name → kind → endpoint → creds. This is a deliberate,
+//! non-additive break coordinated in lockstep with the reference broker (`fabricd`, sibling repo);
+//! an older broker cannot parse the new frame and vice versa.
 
 use std::fmt::{self, Formatter};
 use std::io::{Error as IoError, ErrorKind};
@@ -166,11 +172,13 @@ pub trait MeteredEgress: Egress {
 
 // -- Session protocol -------------------------------------------------------
 
-/// The session-open message: the logical resource *name* selected per capability kind, + deadline.
+/// The session-open message: the flat list of logical resource *names* the request may touch,
+/// + deadline.
 ///
-/// The box no longer holds credentials — `fabricd` resolves each name against its operator config.
-/// `None` = that capability is not requested this session; `timeout_ms` is the per-execution
-/// wall-clock budget (the per-op client-side deadline).
+/// The box is **kind-blind** and holds no credentials — it forwards only the logical names the
+/// request listed in `config.io`; `fabricd` resolves each name against its operator config (name →
+/// kind → endpoint → creds). An empty `resources` = no egress requested this session; `timeout_ms`
+/// is the per-execution wall-clock budget (the per-op client-side deadline).
 ///
 /// `Debug` is hand-written to **redact** the secret [`token`](Self::token): the derived impl would
 /// print it, and a `WireInit` rides inside [`WireRequest`]'s derived `Debug` — so any accidental
@@ -178,24 +186,11 @@ pub trait MeteredEgress: Egress {
 /// whether a token is present.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct WireInit {
-    /// Selected `db` resource name.
+    /// The flat list of logical resource names this session may address (the request's `config.io`
+    /// allowlist). The box forwards names only; `fabricd` resolves each to its kind/endpoint/creds
+    /// operator-side. Never per-kind slots (D3).
     #[serde(default)]
-    pub db: Option<String>,
-    /// Selected `mongo` resource name.
-    #[serde(default)]
-    pub mongo: Option<String>,
-    /// Selected `mail` resource name.
-    #[serde(default)]
-    pub mail: Option<String>,
-    /// Selected `redis` resource name.
-    #[serde(default)]
-    pub redis: Option<String>,
-    /// Selected `amq` resource name.
-    #[serde(default)]
-    pub amq: Option<String>,
-    /// Selected `auth` resource name.
-    #[serde(default)]
-    pub auth: Option<String>,
+    pub resources: Vec<String>,
     /// Per-execution wall-clock budget in milliseconds (the per-op client-side deadline).
     pub timeout_ms: u64,
     /// The request's **trusted** tenant id (the acting-workspace id the edge authorized), forwarded
@@ -221,12 +216,7 @@ impl fmt::Debug for WireInit {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WireInit")
-            .field("db", &self.db)
-            .field("mongo", &self.mongo)
-            .field("mail", &self.mail)
-            .field("redis", &self.redis)
-            .field("amq", &self.amq)
-            .field("auth", &self.auth)
+            .field("resources", &self.resources)
             .field("timeout_ms", &self.timeout_ms)
             .field("tenant", &self.tenant)
             // The token is a secret: print only its presence, never its value.
@@ -235,10 +225,10 @@ impl fmt::Debug for WireInit {
     }
 }
 
-/// One egress call: capability kind, action, and the script's JSON payload.
+/// One egress call: the logical resource name, action, and the script's JSON payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireCall {
-    /// Capability kind (`"db"`, `"mongo"`, …).
+    /// Logical resource name (`"orders"`, `"cache"`, …) — `fabricd` resolves it to a kind/backend.
     pub name: String,
     /// Action (`"query"`, `"send"`, …).
     pub action: String,
@@ -344,8 +334,39 @@ where
 mod tests {
     //! Frame round-trip over an in-memory duplex stream, plus the clean-EOF signal.
 
-    use super::{BackendMetrics, WireCall, WireRequest, WireResponse, read_frame, write_frame};
+    use super::{
+        BackendMetrics, WireCall, WireInit, WireRequest, WireResponse, read_frame, write_frame,
+    };
     use crate::{EgressError, ErrorOwner};
+
+    /// An `Init` frame carries the flat `resources` name list (+ tenant) intact across a round-trip.
+    #[tokio::test]
+    async fn init_frame_carries_flat_resources() {
+        let (mut sink, mut source) = tokio::io::duplex(1024);
+        let sent = WireRequest::Init(Box::new(WireInit {
+            resources: vec!["orders".to_owned(), "cache".to_owned()],
+            timeout_ms: 5000,
+            tenant: Some("acme".to_owned()),
+            token: None,
+        }));
+        write_frame(&mut sink, &sent)
+            .await
+            .unwrap_or_else(|_err| unreachable!("write"));
+        let got: WireRequest = read_frame(&mut source)
+            .await
+            .unwrap_or_else(|_err| unreachable!("read"))
+            .unwrap_or_else(|| unreachable!("a frame"));
+        match got {
+            WireRequest::Init(init) => {
+                assert_eq!(
+                    init.resources,
+                    vec!["orders".to_owned(), "cache".to_owned()]
+                );
+                assert_eq!(init.tenant.as_deref(), Some("acme"));
+            }
+            WireRequest::Call(_) | WireRequest::Drain => unreachable!("expected an Init"),
+        }
+    }
 
     /// A request frame written then read back is structurally equivalent.
     #[tokio::test]

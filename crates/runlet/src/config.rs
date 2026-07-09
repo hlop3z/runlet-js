@@ -94,6 +94,14 @@ pub(crate) struct Config {
     /// `docs/design/network-fabric.md` (QUIC remote transport).
     #[serde(default)]
     pub(crate) fabricd_quic: Option<FabricdQuic>,
+    /// Box-direct local egress bindings (byo-capabilities D8): logical resource name → a co-located
+    /// loopback endpoint the box POSTs the `{action, payload}` envelope to **directly**, without a
+    /// broker. Operator-only (global config; never per-request, never script-influenced). A name in
+    /// `config.io` that is bound here resolves box-direct; any other named name forwards to the
+    /// broker. Each target MUST be loopback/private — the boot guard ([`Self::check_local_resources`])
+    /// refuses a remote binding (a remote logical target must go through a broker). Empty by default.
+    #[serde(default)]
+    pub(crate) local_resources: HashMap<String, LocalResource>,
     /// Trusted-identity ("nexus edge") mode — off by default. When enabled the box consumes
     /// trusted identity headers the edge injects (tenant/user/roles/entitlements/suspended/
     /// anonymous), keys fairness + cache + egress + quota off the trusted tenant id, and rejects
@@ -152,6 +160,7 @@ impl Default for Config {
             allow_unauthenticated: false,
             fabricd_socket: None,
             fabricd_quic: None,
+            local_resources: HashMap::new(),
             trusted: TrustedConfig::default(),
             telemetry: TelemetryConfig::default(),
             events: EventsConfig::default(),
@@ -347,6 +356,18 @@ pub(crate) struct QuotaConfig {
     pub(crate) plans: HashMap<String, PlanLimit>,
 }
 
+/// One box-direct local-egress binding (byo-capabilities D8/D9): a co-located loopback endpoint a
+/// logical resource name resolves to. The box POSTs the identical `{action, payload}` envelope a
+/// broker would receive, so a name can be moved between box-direct and broker resolution with no
+/// script change.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalResource {
+    /// The co-located endpoint URL (e.g. `http://localhost:8080`). Loopback/private only — the boot
+    /// guard rejects a remote target.
+    pub(crate) url: String,
+}
+
 /// Remote-`fabricd` QUIC transport settings (the box client side).
 ///
 /// The box pins the daemon's self-signed certificate by fingerprint (no CA / cert manager) and
@@ -424,6 +445,36 @@ impl Config {
         }
         self.check_trusted_isolation(exposed)?;
         self.check_ssrf_relaxation(exposed)?;
+        self.check_local_resources()?;
+        Ok(())
+    }
+
+    /// Box-direct local-egress boot guard (byo-capabilities D8): every declared binding must target
+    /// a loopback/private (co-located) address. A remote target is refused — a remote logical name
+    /// must go through a broker, so the box never holds a remote endpoint. Reuses the `http`
+    /// capability's classifier ([`runlet_core::check_local_egress_url`]) so one policy governs both
+    /// script-controlled `http` targets and operator-declared box-direct bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first binding whose URL is unparseable, non-http(s), or resolves
+    /// to any public address.
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "boot-guard validation order is irrelevant; every binding is checked and any \
+                  failure aborts startup"
+    )]
+    fn check_local_resources(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for (name, resource) in &self.local_resources {
+            runlet_core::check_local_egress_url(&resource.url).map_err(|err| {
+                format!(
+                    "refusing to start: box-direct local resource '{name}' -> '{}' is invalid: \
+                     {err}. A box-direct binding must be a loopback/private (co-located) http(s) \
+                     endpoint; a remote target must go through a broker.",
+                    resource.url,
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -755,6 +806,38 @@ mod tests {
         assert!(
             cfg.check_exposure().is_ok(),
             "the SSRF guard applies only when a relaxation is active"
+        );
+    }
+
+    /// A loopback-only box-direct binding (D8) passes the boot guard.
+    #[test]
+    fn local_resource_loopback_ok() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), None, false);
+        drop(cfg.local_resources.insert(
+            "pricing".to_owned(),
+            super::LocalResource {
+                url: "http://127.0.0.1:8080".to_owned(),
+            },
+        ));
+        assert!(
+            cfg.check_exposure().is_ok(),
+            "a loopback box-direct binding is accepted"
+        );
+    }
+
+    /// A remote box-direct binding is refused (a remote logical target must go through a broker).
+    #[test]
+    fn local_resource_remote_fails_closed() {
+        let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), None, false);
+        drop(cfg.local_resources.insert(
+            "pricing".to_owned(),
+            super::LocalResource {
+                url: "http://93.184.216.34:8080".to_owned(),
+            },
+        ));
+        assert!(
+            cfg.check_exposure().is_err(),
+            "a remote box-direct binding must refuse to start"
         );
     }
 }

@@ -1,10 +1,12 @@
 # Deployment & production hardening
 
 jsbox is a stateless service: `POST /execute` runs a JS `handler(ctx)` in a
-sandboxed QuickJS context and returns `{data, error, meta}`. The box itself links no
-network drivers and holds no backend credentials — driver-backed capabilities
-(`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) are brokered by the **`fabricd` egress
-sidecar** (§5). This guide is the operator's checklist for running it safely under load.
+sandboxed QuickJS context and returns `{data, error, meta}`. The box ships **three in-engine
+built-ins** — `http`, `s3`, and `io` — and links no network drivers and holds no backend
+credentials. Any other capability (a database, cache, queue, mail relay, …) is reached with
+`io.call("<name>", …)` and resolved either **box-direct** to a co-located loopback service
+(`local_resources` config) or by the **`fabricd` egress sidecar** (which holds the drivers +
+credentials). This guide is the operator's checklist for running it safely under load.
 Depth lives in the design notes ([resilience.md](design/resilience.md),
 [pooled-capabilities.md](design/pooled-capabilities.md),
 [resource-egress.md](design/resource-egress.md), [network-fabric.md](design/network-fabric.md),
@@ -109,14 +111,13 @@ Sizes accept human-readable byte strings (`"32mb"`, `"1mb"`). The body limit is 
 
 ## 4. TLS to backends (connections originate from `fabricd`)
 
-The driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) connect to
+The broker-serviced capabilities (`db`/`mail`/`redis`/`amq`/`auth`) connect to
 **operator-supplied** hosts, so they are trusted and not SSRF-guarded — but the connection
 originates from **`fabricd`**, not the box: the box only forwards logical resource names over
 its `fabricd` session (§5). Encrypt the backend hop in transit in the **resource
 definitions** in `fabricd`'s config:
 
 - `db`: `"ssl": true` (e.g. AWS RDS/Aurora, managed Postgres).
-- `mongo`: `"tls": true` (+ optional `"ca_cert"` PEM for a private CA).
 - `redis`: `rediss://…` (e.g. ElastiCache in-transit encryption).
 - `amq`: `"tls": true` for `amqps://` (+ optional `"ca_cert"`).
 - `mail`: `"tls": "starttls"` (or `"wrapper"` for implicit SMTPS).
@@ -146,18 +147,25 @@ trusted caller genuinely needs open egress.
 
 `fabricd` owns two things the box deliberately does not: the operator `resources`
 credential table (logical name → driver kind + endpoint + credentials, loaded from
-`FABRICD_CONFIG`, default `fabricd.json`) and every network driver. A request enables a
-driver capability by naming a resource in `config.io` (e.g. `"io": {"db": ["orders-db"]}`);
-the box forwards only the *names*, and `fabricd` resolves them — credentials never reach
-the box. Treat `fabricd.json` as a secret file (it replaces every per-request credential
-that used to exist). Full rationale: [resource-egress.md](design/resource-egress.md);
-QUIC transport details: [network-fabric.md](design/network-fabric.md).
+`FABRICD_CONFIG`, default `fabricd.json`) and every network driver. A request lists the
+resources it may use as a **flat allowlist** of logical names (e.g. `"io": ["orders","cache"]`)
+and reaches them with `io.call("orders", …)`; the box forwards only the *names*, and `fabricd`
+resolves them — credentials never reach the box. Treat `fabricd.json` as a secret file. Full
+rationale: [resource-egress.md](design/resource-egress.md); QUIC transport details:
+[network-fabric.md](design/network-fabric.md).
 
-**No `fabricd`, no drivers — by design.** A deployment serving only deterministic /
-`http` / `s3` requests needs no sidecar at all. If a request names a driver resource and
-neither `fabricd_socket` nor `fabricd_quic` is configured, it is rejected
-`503 EGRESS_UNAVAILABLE`; a name the operator never bound (or bound to another tenant)
-is a `400 RESOURCE_NOT_FOUND`.
+**Box-direct local egress (no broker).** For a **co-located** service the operator can skip
+`fabricd` entirely: bind a logical name to a loopback endpoint in the box's global
+`local_resources` map (`{"pricing": {"url": "http://localhost:8080"}}`). `io.call("pricing", …)`
+then POSTs the identical `{action, payload}` envelope straight to that endpoint. Box-direct
+targets are **loopback-only** — the box refuses to start if one points at a public address (a
+remote target must go through a broker).
+
+**No `fabricd`, no broker drivers — by design.** A deployment serving only deterministic /
+`http` / `s3` / box-direct requests needs no sidecar at all. If a request names a
+broker-resolved resource and neither `fabricd_socket` nor `fabricd_quic` is configured, it is
+rejected `503 EGRESS_UNAVAILABLE`; a name absent from the request's `config.io` allowlist (or
+one the operator never bound) is a `400 RESOURCE_NOT_FOUND`.
 
 ### As a local sidecar (UDS — the zero-config default)
 
@@ -238,8 +246,9 @@ trusts blindly. Full model: [multitenant-trust.md](design/multitenant-trust.md).
   `tenant` — a name bound to another tenant resolves as `RESOURCE_NOT_FOUND`, so existence
   never leaks across workspaces).
 - **Authorization + quota (optional).** `trusted.capability_entitlements` maps a
-  capability kind (`"db"`, `"mongo"`, …) to the entitlement/role a member must hold; an
-  unlisted kind is ungated. `trusted.quota` gates per-tenant in-flight usage by plan (from
+  capability name — a logical resource name in `config.io`, or `"http"`/`"s3"` — to the
+  entitlement/role a member must hold; an unlisted name is ungated. `trusted.quota` gates
+  per-tenant in-flight usage by plan (from
   the plan header): an unknown plan gets the most restrictive configured limit, and an
   **empty** `plans` map while enabled denies everything — fail-closed, never unbounded.
 - Identity rides **spans, logs, and events** as attributes — never metric labels (§10).
@@ -257,7 +266,7 @@ don't log request bodies.
 operator's SMTP relay, so for untrusted scripts constrain it in the operator's `mail` resource
 (in `fabricd`'s config): set
 `allowed_recipient_domains` (a recipient whose domain is off-list is rejected before send) and
-`max_sends` (per-execution cap on `mail.send`, on top of `max_recipients` per message). Together
+`max_sends` (per-execution cap on mail `send` operations, on top of `max_recipients` per message). Together
 they keep a handler from turning the relay into an open spam cannon.
 
 ## 9. Kubernetes specifics

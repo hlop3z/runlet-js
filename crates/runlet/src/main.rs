@@ -5,11 +5,13 @@ mod config;
 mod events;
 mod handler;
 mod identity;
+mod local_io;
 mod quota;
 mod sidecar;
 mod status;
 mod telemetry;
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -173,12 +175,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         label => info!(transport = label, "fabricd egress sidecar configured"),
     }
 
+    // Box-direct local egress bindings (byo-capabilities D8): logical name → co-located loopback
+    // endpoint, validated loopback-only by the boot guard above. A shared `reqwest` client (reusing
+    // the process rustls/aws-lc-rs stack) POSTs the `{action, payload}` envelope; an empty map means
+    // every `io` name forwards to the broker.
+    let local_resources: Arc<HashMap<String, String>> = Arc::new(
+        config
+            .local_resources
+            .iter()
+            .map(|(name, resource)| (name.clone(), resource.url.clone()))
+            .collect(),
+    );
+    if !local_resources.is_empty() {
+        info!(
+            "box-direct local egress: {} binding(s)",
+            local_resources.len()
+        );
+    }
+    let local_client = reqwest::Client::builder().build()?;
+
     let registry = Arc::new(script_registry);
     // The callable logic host owns the pool + engine limits; the HTTP front is one consumer of it
-    // (a non-HTTP scheduler could be another). It drives no I/O itself — driver capabilities run in
-    // the wired `fabricd` egress. The stock server composes the `runlet-caps` preset (the six
-    // driver-backed `CapabilityDef`s); their wrappers inject through the registry when named in
-    // `config.io`, and their calls route to the per-request sidecar egress (the mux fallback).
+    // (a non-HTTP scheduler could be another). It drives no I/O itself. The box ships **zero**
+    // capability defs (byo-capabilities D1): the three built-ins `http`/`s3`/`io` are in-engine, not
+    // defs. A script reaches a logical resource via `io.call(name, …)`, which the mux routes to the
+    // box-direct local endpoint (if the operator declared one) or the per-request `fabricd` egress
+    // fallback; driver-backed capabilities are **user-composed** `CapabilityDef`s, not shipped.
     let host = LogicHost::builder(
         js_pool,
         Arc::clone(&registry),
@@ -187,7 +209,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             allow_private_targets: config.debug,
         },
     )
-    .capabilities(runlet_caps::preset())
     .build()
     .map_err(|err| err.to_string())?;
     // A cheap clone (all `Arc`-backed) kept out of `AppState` so the warm runtime pool can be
@@ -219,6 +240,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         limiter: Arc::new(Semaphore::new(max_concurrent)),
         partition_limiter,
         transport,
+        local_resources,
+        local_client,
         metrics: Arc::new(Metrics::default()),
         bulkhead_capacity: max_concurrent,
         access_token,

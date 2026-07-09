@@ -54,6 +54,8 @@ pub use crate::engine::{Effect, EngineError, ExecOutcome, Gate, LogEntry, LogLev
 pub use crate::host::{
     CapabilitySet, CodeRef, ExecMetrics, HostSettings, Invocation, LogicHost, Outcome,
 };
+#[cfg(feature = "http")]
+pub use crate::http::check_local_egress_url;
 pub use crate::pool::PoolStats;
 pub use crate::types::{
     BASE_TYPES_DTS, HTTP_TYPES_DTS, S3_TYPES_DTS, def_fragments, generate_types_dts,

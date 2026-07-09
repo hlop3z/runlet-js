@@ -97,7 +97,7 @@ capability a developer marks *script-controlled* gets it automatically, for free
 
 ## It shows up on the receipt 🧾
 
-Every call you make is listed in `meta.http_requests` in the answer, so you can see
+Every call you make is listed in `meta.io.http` in the answer, so you can see
 what happened (which website, how long it took, the status). Handy for checking your work!
 
-**Next:** [`db` — talk to a database →](03-database.md)
+**Next:** [Build your own capability (`io.call`) →](03-capabilities.md)

@@ -16,9 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 runlet-core = { path = "../runlet-core" }
-# The standard capability preset (the six driver-backed `CapabilityDef`s: JS wrappers + trust
-# declarations + `.d.ts` fragments). Data only — no drivers; composed onto the `LogicHost`.
-runlet-caps = { path = "../runlet-caps" }
 # The box links NO network driver: it talks to the `fabricd` sidecar over UDS or QUIC using the
 # driver-free wire contract in `runlet-wire` (the `Egress` trait, the wire + QUIC transport, the
 # metric types). Credentials live in `fabricd`, never here.
@@ -43,6 +40,10 @@ rustls.workspace = true
 quinn.workspace = true
 # Decodes the configured server-cert pin (hex SHA-256) for the QUIC client.
 hex.workspace = true
+# Box-direct local egress (`local_io.rs`, byo-capabilities D8/D9): POSTs the `{action, payload}`
+# envelope to an operator-declared co-located loopback endpoint. Reuses the same rustls/aws-lc-rs
+# client stack `runlet-core`'s `http`/`s3` already link — no new crypto stack (`ring` stays empty).
+reqwest.workspace = true
 
 [lints]
 workspace = true

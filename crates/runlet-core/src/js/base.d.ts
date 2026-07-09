@@ -16,14 +16,15 @@
  * (No `/// <reference>` or `// @ts-check` needed; the tsconfig wires it up.)
  *
  * @remarks
- * **Capabilities are opt-in.** The driver-backed capabilities (`db`, `mongo`,
- * `mail`, `redis`, `amq`, `auth`) exist **only** when the request names a
- * logical resource for them in `config.io` (e.g. `"io": { "db": ["main-pg"] }`).
- * The name refers to an operator-defined resource resolved by the egress
- * sidecar — the request never carries endpoints or credentials. The in-engine
- * capabilities keep their own config: `api` exists when `config.allowed_hosts`
- * is non-empty, `s3` when `config.s3` is present. Otherwise the global is
- * `undefined` (e.g. `typeof mail === "undefined"`). They are declared here as
+ * **Capabilities are opt-in.** The box ships three built-ins. `io` (logical
+ * egress) exists when the request lists a resource name in `config.io` — a
+ * **flat allowlist** of logical names, e.g. `"io": ["orders", "cache"]`; call a
+ * named resource with `io.call(name, action, payload)`. Each name is an
+ * operator-defined resource resolved box-direct or by a broker — the request
+ * never carries endpoints or credentials. The in-engine capabilities keep their
+ * own config: `api` exists when `config.allowed_hosts` is non-empty, `s3` when
+ * `config.s3` is present. Otherwise the global is `undefined` (e.g.
+ * `typeof s3 === "undefined"`). They are declared here as
  * always-present for convenient autocomplete; guard with `typeof` if a
  * capability is optional.
  * `json`, `$`, `Decimal`, and `$sys.crypto` / `$sys.date` are pure and **always**
@@ -218,7 +219,7 @@ type IoMetric = Record<string, unknown>;
 
 /**
  * The `meta` object the server attaches to every response. `io` carries one entry per capability
- * the request actually used, keyed by capability name (`meta.io.db`, `meta.io.http`, …), each an
+ * the request actually used, keyed by name (`meta.io.http`, `meta.io.<resource-name>`, …), each an
  * array of that capability's per-operation metrics. Empty capabilities are omitted.
  */
 interface ResponseMeta {

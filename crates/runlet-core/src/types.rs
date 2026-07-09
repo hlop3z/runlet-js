@@ -39,3 +39,25 @@ pub fn generate_types_dts(fragments: &[&str]) -> String {
 pub fn def_fragments(defs: &[CapabilityDef]) -> Vec<&str> {
     defs.iter().map(CapabilityDef::types).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    //! D11 drift guard (relocated from `runlet-caps` on the byo-capabilities change): the checked-in
+    //! `container/types.d.ts` equals what the stock **three-primitive** surface generates — the base
+    //! fragment (which carries `json`/`$`/`Decimal`/`$sys`/`io`/`meta`) plus the in-engine `http` and
+    //! `s3` fragments. No driver-capability defs ship, so there are no `Db`/`Mongo`/… interfaces.
+
+    use super::{HTTP_TYPES_DTS, S3_TYPES_DTS, generate_types_dts};
+
+    /// The checked-in `container/types.d.ts` is regenerable from base + `http` + `s3`. If this
+    /// fails, regenerate the file — see `docs/design/composable-core.md`.
+    #[test]
+    fn types_dts_is_up_to_date() {
+        let generated = generate_types_dts(&[HTTP_TYPES_DTS, S3_TYPES_DTS]);
+        let checked_in = include_str!("../../../container/types.d.ts");
+        assert_eq!(
+            generated, checked_in,
+            "container/types.d.ts is stale — regenerate from base + http + s3 fragments"
+        );
+    }
+}

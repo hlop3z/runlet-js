@@ -56,18 +56,18 @@ The answer is **always** the same shape. Three boxes: `data`, `error`, and `meta
   "data": { "greeting": "hi Mia" },
   "error": null,
   "meta": {
+    "trace_id": "be04...",
     "exec_time_us": 950,
-    "http_requests": [],
-    "db_requests": [],
-    "mail_requests": []
+    "io": {}
   }
 }
 ```
 
 - **`data`** — what your script returned as the good stuff.
 - **`error`** — `null` if all went well, or your error message if not.
-- **`meta`** — a little **receipt** 🧾 the robot fills in for you: how long it took,
-  and a list of every internet/database/email action it did. You don't write this —
+- **`meta`** — a little **receipt** 🧾 the robot fills in for you: a `trace_id`, how long
+  it took, and `io` — a list of every internet/service action it did, one entry per
+  capability it used (`meta.io.http`, `meta.io.<nickname>`, …). You don't write this —
   the robot does.
 
 ## Saying "oops, something went wrong"

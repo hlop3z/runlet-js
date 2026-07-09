@@ -38,7 +38,7 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
                       +-> db (auth, rate limits, config)
 ```
 
-- **Auth & token validation** — Decode JWTs, validate API keys, check permissions against `db.query` — reject before hitting upstream.
+- **Auth & token validation** — Decode JWTs, validate API keys, check permissions against `io.call` — reject before hitting upstream.
 - **Request transformation** — Reshape incoming payloads, inject headers, normalize formats before proxying via `http.post`.
 - **Response aggregation** — Fan out to multiple upstreams with `http.get`, merge into one response, return to client.
 - **Rate limiting** — Query a counter in DB, increment it, reject if over quota. Custom rules per tenant, endpoint, or plan tier.
@@ -76,7 +76,7 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 ## DAM — Digital Asset Management
 
 - **Upload processing** — On asset upload, script generates metadata: extracts dimensions from context, assigns tags, sets expiration dates.
-- **Access control rules** — Script evaluates who can download what: check user role, asset license type, region restrictions via `db.query`.
+- **Access control rules** — Script evaluates who can download what: check user role, asset license type, region restrictions via `io.call`.
 - **Auto-tagging & classification** — Call an external AI tagging API via `http.post`, write results back to DB. Per-tenant tagging rules.
 - **Asset transformation requests** — Script composes a transformation order (resize, watermark, format) and dispatches to a processing service via `http.post`.
 - **Expiration & lifecycle** — Scheduled script queries DB for assets past retention date, flags for archival or deletion.
@@ -99,7 +99,7 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 
 ## ERP — Enterprise Resource Planning
 
-- **Order validation** — Script checks inventory levels, credit limits, and shipping restrictions before order confirmation via `db.query`.
+- **Order validation** — Script checks inventory levels, credit limits, and shipping restrictions before order confirmation via `io.call`.
 - **Invoice computation** — Calculate line items, taxes, currency conversion, and discounts. Each business unit gets its own tax script.
 - **Approval workflows** — Script evaluates approval rules: purchase over $10k needs VP sign-off, cross-department transfers need finance review.
 - **Inter-system sync** — Script bridges ERP and external systems: push orders to fulfillment API, pull tracking numbers back, update DB.
@@ -121,7 +121,7 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 
 - **Input validation** — Server-side validation rules as JS. Share the same script between frontend preview and backend enforcement.
 - **Synthetic monitoring** — Periodically run scripts that test your APIs and alert on failures or latency spikes.
-- **Data migration scripts** — One-off backfills via `db.query` + `db.execute` with transaction support and automatic timeout.
+- **Data migration scripts** — One-off backfills via `io.call` with transaction support and automatic timeout.
 - **Custom CI/CD steps** — Teams define build, test, or deploy steps as sandboxed scripts within a pipeline.
 
 ## Security & Observability

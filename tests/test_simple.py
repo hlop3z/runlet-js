@@ -6,7 +6,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -189,10 +191,65 @@ def _get_text(path: str) -> tuple[int, str] | None:
 
 
 # -- Script helpers ----------------------------------------------------------
+#
+# byo-capabilities: the box no longer ships the `db`/`redis`/`amq`/`auth` wrapper globals — they were
+# sugar over the one primitive `io.call(name, action, payload)`. The suite reconstructs them here as a
+# per-request JS prelude bound to the request's single logical resource name (via `io.channel(name)`),
+# so the driver test bodies keep exercising the box → `fabricd` `io.call` path unchanged. The prelude
+# is injected only when the request lists a `config.io` name; deterministic / `http` tests are
+# unaffected. (The reference broker in the sibling repo owns the real driver contract, §9.)
+
+def _driver_prelude(config) -> str:
+    """The reconstructed `db`/`redis`/`amq`/`auth` wrappers, bound to the request's io name."""
+    if not config:
+        return ""
+    names = config.get("io")
+    if not names:
+        return ""
+    name = json.dumps(names[0])  # the single logical resource this request addresses
+    return (
+        "(function(){"
+        f"var __c = io.channel({name});"
+        # db: packs {sql, params}; begin/commit/rollback carry an empty statement.
+        "globalThis.db = {"
+        "query: function(sql, params){ return __c('query', {sql: sql, params: params || []}); },"
+        "execute: function(sql, params){ return __c('execute', {sql: sql, params: params || []}); },"
+        "begin: function(){ __c('begin', {sql: '', params: []}); },"
+        "commit: function(){ __c('commit', {sql: '', params: []}); },"
+        "rollback: function(){ __c('rollback', {sql: '', params: []}); }"
+        "};"
+        # redis: strings in/out; a missing get returns null.
+        "globalThis.redis = {"
+        "get: function(k){ return __c('get', {key: k}).value; },"
+        "set: function(k, v, o){ o = o || {}; return __c('set', {key: k, value: String(v), ttl: o.ttl}).ok; },"
+        "delete: function(k){ return __c('delete', {key: k}).count; },"
+        "increment: function(k){ return __c('increment', {key: k}).value; },"
+        "expire: function(k, s){ return __c('expire', {key: k, seconds: s}).set; }"
+        "};"
+        # amq: batch publish + NATS request-reply.
+        "globalThis.amq = {"
+        "send: function(list){ list = list || []; if (list.length === 2 && typeof list[0] === 'string') list = [list];"
+        "var m = []; for (var i = 0; i < list.length; i++){ m.push({key: list[i][0], payload: list[i][1]}); }"
+        "return __c('send', {messages: m}).published; },"
+        "request: function(subject, payload){ return __c('request', {subject: subject, payload: payload}).reply; }"
+        "};"
+        # auth: request-scoped memo cache over user_info / introspect.
+        "var __ac = {};"
+        "function __am(action, token){ var k = action + ':' + (token || '');"
+        "if (Object.prototype.hasOwnProperty.call(__ac, k)) return __ac[k];"
+        "var r = __c(action, {token: token || ''}); __ac[k] = r; return r; }"
+        "globalThis.auth = {"
+        "user_info: function(t){ return __am('user_info', t); },"
+        "introspect: function(t){ return __am('introspect', t); }"
+        "};"
+        "})();"
+    )
+
 
 def h(body: str, ctx=None, config=None) -> dict:
-    """Build a request body from a handler function body."""
-    req = {"script": f"function handler(ctx) {{ {body} }}"}
+    """Build a request body from a handler function body (injecting driver wrappers when `config.io`
+    names a resource — see `_driver_prelude`)."""
+    req = {"script": f"function handler(ctx) {{ {_driver_prelude(config)}{body} }}"}
     if ctx is not None:
         req["context"] = ctx
     if config is not None:
@@ -434,12 +491,8 @@ PG_CONFIG = {"host": PG_HOST, "port": PG_PORT, "user": "test", "password": "test
 PGB_CONFIG = {"host": PGBOUNCER_HOST, "port": PGBOUNCER_PORT, "user": "test", "password": "test", "database": "testdb"}
 CR_CONFIG = {"host": CR_HOST, "port": CR_PORT, "user": "root", "password": "", "database": "testdb"}
 
-# -- Mongo + NATS endpoints (the `mongo` / `nats` services in docker-compose) ----------
-MONGO_HOST = os.environ.get("MONGO_HOST", "localhost")
-MONGO_PORT = int(os.environ.get("MONGO_PORT", "27017"))
-# Standalone dev node has no auth, so username/password are omitted.
-MONGO_CONFIG = {"host": MONGO_HOST, "port": MONGO_PORT, "database": "testdb"}
-
+# -- NATS endpoint (the `nats` service in docker-compose) ----------
+# (`mongo` was dropped as a shipped capability — byo-capabilities D4.)
 NATS_HOST = os.environ.get("NATS_HOST", "localhost")
 NATS_PORT = int(os.environ.get("NATS_PORT", "4222"))
 NATS_CONFIG = {"backend": "nats", "host": NATS_HOST, "port": NATS_PORT}
@@ -453,25 +506,23 @@ NATS_CONFIG = {"backend": "nats", "host": NATS_HOST, "port": NATS_PORT}
 # (2) starts `fabricd` with it, and (3) sends names, never configs. A down backend just makes its
 # section self-skip (the live probe through the box fails) â€” the resource still exists in the table.
 
-def _io(kind: str, name: str) -> dict:
-    """A request `config.io` selecting one logical resource of `kind` (e.g. `{"io":{"db":["pg"]}}`)."""
-    return {"io": {kind: [name]}}
+def _io(name: str) -> dict:
+    """A request `config.io` selecting one logical resource by name — a **flat allowlist**
+    (byo-capabilities D3, e.g. `{"io":["pg"]}`). The box is kind-blind; `fabricd` resolves the name
+    to a kind/endpoint/creds, so the request carries only the logical name."""
+    return {"io": [name]}
 
 
 def _db_io(name: str) -> dict:
-    return _io("db", name)
-
-
-def _mongo_io(name: str) -> dict:
-    return _io("mongo", name)
+    return _io(name)
 
 
 def _amq_io(name: str) -> dict:
-    return _io("amq", name)
+    return _io(name)
 
 
 def _auth_io(name: str) -> dict:
-    return _io("auth", name)
+    return _io(name)
 
 
 def _db_resources(base: str, cfg: dict) -> dict:
@@ -510,7 +561,6 @@ def build_resources(auth_resources: dict) -> dict:
         "kind": "db", "host": "broken-db.invalid", "port": 1,
         "user": "x", "password": "x", "database": "x",
     }
-    res["mongo"] = {"kind": "mongo", **MONGO_CONFIG}
     res["nats"] = {"kind": "amq", **NATS_CONFIG}
     res["nats-fast"] = {"kind": "amq", **NATS_CONFIG, "request_timeout_ms": 500}
     res.update(auth_resources)
@@ -706,61 +756,6 @@ def test_db_engine(t: Runner, label: str, db: str):
 
 
 # -- Script registry (execute by key) ----------------------------------------
-
-def _mongo_available(name: str) -> bool:
-    """Check if the named `mongo` resource is reachable."""
-    resp = _post(h("mongo.count('t_probe', {}); return json('up', null);", config=_mongo_io(name)))
-    return resp is not None and resp.get("data") == "up"
-
-
-def test_mongo(t: Runner):
-    """Mongo capability â€” string `_id`s sidestep the ObjectId-filter caveat (a hex-string
-    filter is a BSON string, not an ObjectId, so explicit string ids match cleanly)."""
-    t.section("Mongo (document store)")
-    cfg = _mongo_io("mongo")
-
-    t.test("clean collection",
-           h("mongo.delete_many('t_users', {}); return json('ok', null);", config=cfg),
-           data_eq("ok"))
-    t.test("insert_one returns id",
-           h("var r = mongo.insert_one('t_users', {_id:'u1', name:'Alice', active:true}); return json(r.inserted_id, null);", config=cfg),
-           data_eq("u1"))
-    t.test("insert_many returns count",
-           h("var r = mongo.insert_many('t_users', [{_id:'u2',name:'Bob',active:true},{_id:'u3',name:'Cy',active:false}]); return json(r.inserted_count, null);", config=cfg),
-           data_eq(2))
-    t.test("count all",
-           h("return json(mongo.count('t_users', {}), null);", config=cfg),
-           data_eq(3))
-    t.test("find_one by id",
-           h("return json(mongo.find_one('t_users', {_id:'u1'}).name, null);", config=cfg),
-           data_eq("Alice"))
-    t.test("find_one missing is null",
-           h("return json(mongo.find_one('t_users', {_id:'nope'}), null);", config=cfg),
-           data_is_none())
-    t.test("find filter + result shape",
-           h("var r = mongo.find('t_users', {active:true}, {sort:{_id:1}}); return json({n:r.count, trunc:r.truncated, first:r.docs[0]._id}, null);", config=cfg),
-           lambda r: r["data"]["n"] == 2 and r["data"]["trunc"] is False and r["data"]["first"] == "u1")
-    t.test("update_one matched+modified",
-           h("var r = mongo.update_one('t_users', {_id:'u1'}, {$set:{active:false}}); return json([r.matched, r.modified], null);", config=cfg),
-           data_eq([1, 1]))
-    t.test("count after update",
-           h("return json(mongo.count('t_users', {active:true}), null);", config=cfg),
-           data_eq(1))
-    t.test("aggregate group",
-           h("return json(mongo.aggregate('t_users', [{$group:{_id:'$active', n:{$sum:1}}}]).count, null);", config=cfg),
-           data_eq(2))
-    t.test("delete_one",
-           h("return json(mongo.delete_one('t_users', {_id:'u3'}).deleted, null);", config=cfg),
-           data_eq(1))
-    # Duplicate key is a developer write error.
-    t.test("duplicate key -> MONGO_WRITE",
-           h("mongo.insert_one('t_users', {_id:'u1'}); return json('nope', null);", config=cfg),
-           lambda r: r["data"] is None and _err_code(r) == "MONGO_WRITE")
-    # A malformed filter classifies as a developer query error (tolerant of the exact code).
-    t.test("bad filter -> MONGO_ classified error",
-           h("mongo.find('t_users', {$badOp: 1}); return json('nope', null);", config=cfg),
-           lambda r: r["data"] is None and str(_err_code(r) or "").startswith("MONGO_"))
-
 
 def _nats_available(name: str) -> bool:
     """Check if the named `amq` (NATS) resource is reachable (publish to an unsubscribed subject)."""
@@ -1803,6 +1798,129 @@ def _start_trusted_box(port: int = 3010):
     return None, None
 
 
+def _start_echo_server(port: int):
+    """A tiny loopback HTTP service that echoes the JSON body it receives. Stands in for a co-located
+    box-direct capability service (byo-capabilities D8/D9): the box POSTs `{action, payload}` and the
+    service reflects it back, so the calling script can assert the same-envelope round-trip."""
+
+    class _Echo(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 (http.server API)
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)  # reflect the exact {action, payload} envelope
+
+        def log_message(self, *args):  # silence stderr noise
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), _Echo)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def _start_boxdirect_box(port: int, echo_port: int):
+    """Start a `runlet` bound loopback with a box-direct `local_resources` binding to the echo service.
+    Returns `(proc, base_url)` or `(None, None)` on build/start failure (caller self-skips)."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    run_dir = os.path.join(repo, ".test-run", "boxdirect")
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {
+        "server": {"host": "127.0.0.1", "port": port},
+        # A box-direct binding: the logical name `echo` resolves to the co-located loopback service,
+        # with no broker. `debug` stays OFF — the loopback target is reached because it is an
+        # operator-declared box-direct binding (loopback-only, boot-guard validated), not via the
+        # blanket SSRF relax.
+        "local_resources": {"echo": {"url": f"http://127.0.0.1:{echo_port}"}},
+    }
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    try:
+        subprocess.run(["cargo", "build", "-p", "runlet"], cwd=repo, check=True)
+    except Exception:
+        return None, None
+    binpath = os.path.join(repo, "target", "debug", "runlet")
+    proc = subprocess.Popen(
+        [binpath], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    url = f"http://127.0.0.1:{port}/execute"
+    for _ in range(40):
+        st, _r = _post_status(url, h("return json(1, null);"))
+        if st is not None:
+            return proc, url
+        time.sleep(0.5)
+    proc.terminate()
+    return None, None
+
+
+def _boxdirect_boot_rejects_remote(port: int) -> bool:
+    """Boot guard (D8): a box configured with a **remote** box-direct binding must refuse to start.
+    Returns True if the process exits (fails closed) rather than serving."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    run_dir = os.path.join(repo, ".test-run", "boxdirect-remote")
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {
+        "server": {"host": "127.0.0.1", "port": port},
+        "local_resources": {"remote": {"url": "http://93.184.216.34:8080"}},
+    }
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    binpath = os.path.join(repo, "target", "debug", "runlet")
+    if not os.path.exists(binpath):
+        return False
+    proc = subprocess.Popen(
+        [binpath], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        # A valid boot would keep running; the boot guard makes it exit non-zero promptly.
+        return proc.wait(timeout=10) != 0
+    except Exception:
+        proc.kill()
+        return False
+
+
+def test_box_direct_local(t: Runner):
+    """byo-capabilities D8/D9: `io.call(name, ...)` for an operator-declared box-direct binding POSTs
+    the identical `{action, payload}` envelope to a co-located loopback service (no broker), meters it
+    under `meta.io.<name>`, and the loopback-only boot guard refuses a remote binding."""
+    t.section("Box-direct local egress (byo-capabilities)")
+    echo_port = 8123
+    server = _start_echo_server(echo_port)
+    try:
+        proc, url = _start_boxdirect_box(3013, echo_port)
+        if proc is None:
+            print("  \033[33mSKIP\033[0m box-direct box failed to build/start â€” asserts skipped\n")
+            return
+        try:
+            # The script addresses the logical name only; it never sees the endpoint.
+            script = h("var r = io.call('echo', 'ping', {x: 1}); "
+                       "return json({action: r.action, payload: r.payload}, null);",
+                       config={"io": ["echo"]})
+            st, r = _post_status(url, script)
+            t.check("box-direct round-trip returns the same {action, payload} envelope",
+                    st == 200 and r is not None and r.get("data", {}).get("action") == "ping"
+                    and '"x":1' in (r.get("data", {}).get("payload") or ""))
+            t.check("box-direct call is metered under meta.io.echo",
+                    r is not None and isinstance(r.get("meta", {}).get("io", {}).get("echo"), list))
+
+            # An unlisted name is rejected by the allowlist gate before any egress.
+            _st2, r2 = _post_status(url, h("io.call('nope', 'ping', {}); return json('x', null);",
+                                           config={"io": ["echo"]}))
+            t.check("unlisted io name is rejected (RESOURCE_NOT_FOUND)",
+                    r2 is not None and r2.get("data") is None and r2.get("error") is not None)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+
+        t.check("boot guard refuses a remote box-direct binding (fail closed)",
+                _boxdirect_boot_rejects_remote(3014))
+    finally:
+        server.shutdown()
+
+
 def test_trusted_acting_scope(t: Runner):
     """Nexus N5: in trusted-header mode a tenant-scoped request must carry `x-tenant-scope: acting`
     (the edge's acting-org assertion) or it is rejected `403 ACTING_SCOPE_REQUIRED` before any
@@ -2075,12 +2193,7 @@ def main():
     else:
         print("\n  \033[33mSKIP\033[0m CockroachDB tests (not running â€” use: docker compose up -d)\n")
 
-    # Mongo + NATS â€” only if their containers are running
-    if _mongo_available("mongo"):
-        test_mongo(t)
-    else:
-        print("\n  \033[33mSKIP\033[0m Mongo tests (not running â€” use: docker compose up -d mongo)\n")
-
+    # NATS â€” only if its container is running
     if _nats_available("nats"):
         test_nats(t)
     else:
@@ -2098,6 +2211,7 @@ def main():
     # harness owns the local build/run (it spins up a second runlet on a loopback port); skipped when
     # pointed at an already-running / remote server (JSBOX_URL), which we don't reconfigure.
     if procs:
+        test_box_direct_local(t)
         test_trusted_acting_scope(t)
         test_telemetry_tracing(t)
         test_per_tenant_events(t)

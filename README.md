@@ -49,16 +49,19 @@ POST /execute
   "context": { "name": "Alice" },
   "config": {
     "allowed_hosts": ["api.example.com"],
-    "io": { "db": ["orders-db"] }
+    "io": ["orders", "cache"]
   }
 }
 ```
 
-Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) are addressed by
-**logical name** in `config.io`, not by inline connection config. The endpoints and
-credentials are declared once, operator-side, in the **`fabricd` egress sidecar's**
-`resources` table (see [Logical resources](#logical-resources-configio)) — the runlet
-server holds no credentials and the request never carries a host or a password. `http`
+The box ships **three in-engine built-ins** — `http` (script-controlled URL, SSRF-guarded), `s3`
+(pure signing), and `io` (operator-named logical egress). Any other capability (a database, cache,
+queue, mail relay, …) is reached through the one primitive `io.call(name, action, payload)` and is
+**user-composed** — see the guide [Build your own capability](docs/03-capabilities.md). `config.io`
+is a **flat allowlist of logical names** (`["orders","cache"]`); the box is kind-blind and forwards
+only the names. Each name resolves either **box-direct** to an operator-declared co-located loopback
+endpoint (`local_resources` config) or through a **broker** (the reference `fabricd` sidecar) that
+holds the credentials — the runlet server holds no remote endpoint or password. `http`
 (`allowed_hosts`) and `s3` stay script-controlled/in-engine and keep their inline config.
 
 | Field                  | Required | Description                                                              |
@@ -66,8 +69,8 @@ server holds no credentials and the request never carries a host or a password. 
 | `script`               | one of   | JS source defining a `handler(ctx)` function                             |
 | `key`                  | one of   | Registered-script key (see [Registered scripts](#registered-scripts))    |
 | `context`              | no       | JSON object passed as `ctx` to the handler                               |
-| `config.allowed_hosts` | no       | Hosts the script can reach via `http.*` (`["*"]` = any, `[]` = disabled)  |
-| `config.io`            | no       | Logical resource names per capability, e.g. `{"db":["orders-db"]}` — names resolved operator-side, no creds (omit a kind to disable it) |
+| `config.allowed_hosts` | no       | Hosts the script can reach via `http.*` (`["*"]` = any, `[]` = disabled). A `host:port` entry (e.g. `localhost:8000`) lifts the private-IP block for that exact target only — the production-safe way to reach a co-located service |
+| `config.io`            | no       | Flat allowlist of logical resource names, e.g. `["orders","cache"]` — resolved operator-side (box-direct or broker), no creds. A name not listed is rejected `RESOURCE_NOT_FOUND` |
 | `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (in-engine; omit to disable `s3.*`) |
 | `config.sys`           | no       | `$sys.env` / `$sys.secrets` context                                      |
 
@@ -83,20 +86,17 @@ server holds no credentials and the request never carries a host or a password. 
     "context_bytes": 16,
     "total_input_bytes": 98,
     "exec_time_us": 950,
-    "http_requests": [],
-    "db_requests": [],
-    "mongo_requests": [],
-    "mail_requests": [],
-    "s3_requests": [],
-    "redis_requests": [],
-    "amq_requests": [],
-    "auth_requests": []
+    "io": {
+      "http": [{ "method": "GET", "host": "api.example.com", "status": 200, "duration_us": 410 }]
+    }
   }
 }
 ```
 
 Always `{data, error, meta}`. The handler controls `data` and `error` via the `json()`
-bridge. On a **system-generated** failure, `error` is a structured envelope —
+bridge. `meta.io` carries one entry per capability the request actually used — `http`, `s3`,
+or a logical `io.call` nickname — each an array of that capability's per-operation metrics;
+capabilities that made no calls are omitted (so `io` is `{}` for a pure-compute run). On a **system-generated** failure, `error` is a structured envelope —
 `{ type, source, code, message, retryable, owner, details?, debug? }` — that a client can
 branch on without parsing strings; `meta.trace_id` correlates it with server logs. See
 [`docs/99-errors.md`](docs/99-errors.md) for the full contract.
@@ -185,22 +185,31 @@ instead of waiting on the connect timeout; `0` = off, cool-down default 5000 ms)
 
 The runlet server config carries only the sidecar **transport**: `fabricd_socket` (local
 Unix socket, the default deployment) or `fabricd_quic` (remote `fabricd` over QUIC) — see
-[Configuration](#configuration). A request then names the resources it may use, keyed by
-capability kind:
+[Configuration](#configuration). A request then lists, as a **flat allowlist of logical
+names**, the resources it may use, and reaches them with `io.call(name, action, payload)`:
 
 ```json
-{ "config": { "io": { "db": ["orders-db"], "redis": ["cache"] } } }
+{ "config": { "io": ["orders", "cache"] } }
 ```
 
-The name gates the capability (no name → the global is `undefined`) **and** selects which
-operator binding `fabricd` wires. A name the operator never declared (or one bound to a
-different tenant) is rejected with a `400` `RESOURCE_NOT_FOUND`; a name of the wrong kind
-is a `400` `RESOURCE_KIND_MISMATCH`; naming any driver resource when no sidecar transport
-is configured is a `503` `EGRESS_UNAVAILABLE`. This is the trust boundary: a (possibly
-compromised) caller can only reach operator-provisioned resources and never sees an
-endpoint or a credential — credentials live in `fabricd`, never in the box. Interim: one
-binding per kind is wired (the JS wrapper still dispatches by kind, e.g. `db.query(…)`).
-Design: [`docs/design/resource-egress.md`](docs/design/resource-egress.md).
+The name gates egress: `io.call("orders", …)` is allowed only if `"orders"` is in the
+allowlist, else the call is rejected `RESOURCE_NOT_FOUND` before any I/O. A listed name
+resolves either **box-direct** — when the operator bound it to a co-located loopback endpoint
+in the box's global `local_resources` map — or through the **broker** (`fabricd`), which
+resolves the name to a kind/endpoint/credentials. Naming a broker-resolved resource when no
+sidecar transport is configured is a `503` `EGRESS_UNAVAILABLE`. This is the trust boundary: a
+(possibly compromised) caller can only reach operator-provisioned resources and never sees an
+endpoint or a credential. Box-direct bindings are loopback-only (a remote target must go
+through a broker; the boot guard refuses a non-loopback binding):
+
+```json
+{ "local_resources": { "pricing": { "url": "http://localhost:8080" } } }
+```
+
+Both paths carry the identical `{action, payload}` envelope, so a name can move between
+box-direct and broker resolution with no script change. Design + the three extension paths:
+[`docs/03-capabilities.md`](docs/03-capabilities.md),
+[`docs/design/resource-egress.md`](docs/design/resource-egress.md).
 
 ### Registered scripts
 
@@ -395,104 +404,43 @@ add-on. The in-engine guard is the first line; a **network-layer egress control*
 netns / egress proxy) is the recommended independent second line at deploy time (see
 `docs/security-hardening.md`) — defense in depth, not a replacement.
 
-### db.query / db.execute / db.begin / db.commit / db.rollback
+### io.call(name, action, payload) — logical egress
 
-PostgreSQL/CockroachDB client (requires a `config.io.db` resource):
+`io.call` is the **one primitive** for reaching a database, cache, queue, mail relay, or any
+service. `name` is a logical resource nickname the request lists in its `config.io` allowlist;
+`action` and `payload` are opaque to the box and forwarded verbatim. It returns the parsed JSON
+the resource answers, or **throws** a `__runlet`-tagged error (`RESOURCE_NOT_FOUND` for a
+nickname absent from the allowlist; a capability code otherwise — see `docs/99-errors.md`).
 
 ```js
 function handler(ctx) {
-  var users = db.query("SELECT id, name FROM users WHERE active = $1", [true]);
-  // users = { columns: ["id","name"], rows: [{id:"1",name:"Alice"}], row_count: 1, truncated: false }
+  // A database served by the reference broker: the broker maps "orders" to Postgres.
+  var users = io.call("orders", "query", {
+    sql: "SELECT id, name FROM users WHERE active = $1",
+    params: [true],
+  });
+  // users = { columns: [...], rows: [...], row_count: 1, truncated: false }
 
-  var ins = db.execute("INSERT INTO logs (user_id, action) VALUES ($1, $2)", [
-    ctx.user_id,
-    "login",
-  ]);
-  // ins = { rows_affected: 1 }
-
-  // Transactions
-  db.begin();
-  try {
-    db.execute("UPDATE inventory SET stock = stock - $1 WHERE id = $2", [
-      1,
-      ctx.item_id,
-    ]);
-    db.commit();
-  } catch (e) {
-    db.rollback();
-    return json(null, { message: e.message });
-  }
+  // A cache served box-direct from a co-located loopback service.
+  io.call("cache", "set", { key: "u:" + ctx.user_id, value: "1", ttl: 60 });
 
   return json(users.rows, null);
 }
 ```
 
-`db.query` returns `{ columns, rows, row_count, truncated }` (capped at the resource's
-`max_rows`, default 1000); `db.execute` returns `{ rows_affected }`;
-`db.begin`/`commit`/`rollback` return `{ ok: true }`. BIGINT and NUMERIC values are
-always returned as strings (JS number precision safety). The operator defines the `db`
-resource in `fabricd` (`"kind": "db"` — `host`, `port`, `user`, `password`, `database`,
-`ssl`, `statement_timeout_ms`, `max_rows`).
+A nickname resolves one of two ways, both carrying the **identical** `{action, payload}`
+envelope so a service can move between them with no script change:
 
-### mail.send
+- **Box-direct** — bound to a co-located loopback endpoint in the box's global `local_resources`
+  config; the box POSTs the envelope over plain HTTP, no broker. Loopback-only (boot-guard
+  enforced).
+- **Broker** — resolved by the `fabricd` egress sidecar, which holds the driver + credentials
+  (the box holds none). See [Logical resources](#logical-resources-configio).
 
-SMTP client (requires a `config.io.mail` resource):
-
-```js
-function handler(ctx) {
-  var res = mail.send({
-    from: "App <no-reply@example.com>", // optional, falls back to the resource's `from`
-    to: ctx.email, // string or array of strings
-    cc: ["ops@example.com"], // optional
-    bcc: [], // optional
-    reply_to: "support@example.com", // optional
-    subject: "Welcome, " + ctx.name,
-    text: "Plain-text body",
-    html: "<b>HTML body</b>", // text + html => multipart/alternative
-  });
-  // res = { accepted: true, response: "2.0.0 Ok: queued" }
-  return json(res, null);
-}
-```
-
-The operator defines the `mail` resource in `fabricd`'s `resources` table (trusted like
-`db` — the relay host is operator-supplied, so private/internal relays are allowed):
-
-```json
-{
-  "resources": {
-    "smtp-main": {
-      "kind": "mail",
-      "host": "smtp.example.com",
-      "port": 587,
-      "user": "apikey",
-      "password": "secret",
-      "tls": "starttls",
-      "from": "no-reply@example.com",
-      "max_recipients": 50,
-      "timeout_ms": 10000
-    }
-  }
-}
-```
-
-A request enables it with `"io": { "mail": ["smtp-main"] }`.
-
-| Field            | Default      | Description                                                 |
-| ---------------- | ------------ | ----------------------------------------------------------- |
-| `host`           | (required)   | SMTP relay host                                             |
-| `port`           | `587`        | Relay port                                                  |
-| `user`           | `""`         | SMTP auth user (empty = no authentication)                  |
-| `password`       | `""`         | SMTP auth password                                          |
-| `tls`            | `"starttls"` | `"starttls"` (587) · `"wrapper"` (465, implicit) · `"none"` |
-| `from`           | (required)   | Default From address                                        |
-| `max_recipients` | `50`         | Max recipients (to + cc + bcc) per send                     |
-| `allowed_recipient_domains` | `[]` | Recipient-domain allowlist (empty = unrestricted)       |
-| `max_sends`      | `0` (off)    | Per-execution cap on `mail.send` calls                      |
-| `timeout_ms`     | `10000`      | Connect + send timeout                                      |
-
-Addresses, subject, and bodies are assembled with a typed message builder, so caller
-input cannot inject SMTP headers (CRLF injection is rejected at parse time).
+Driver-backed capabilities (Postgres, Redis, RabbitMQ/NATS, SMTP, OIDC/IAM, …) are **not shipped**
+in the box — compose your own `CapabilityDef`, run the reference broker, or reach a local service
+box-direct. The three extension paths + the box-direct shortcut are the whole story in
+[`docs/03-capabilities.md`](docs/03-capabilities.md).
 
 ### s3.upload_url / s3.download_url / s3.upload_form / s3.sign_url
 
@@ -633,104 +581,6 @@ configured, `s3.delete(...)` — and presigning a `DELETE` URL via `s3.sign_url(
 "DELETE" })` — throws unless the operator sets `allow_delete: true`. Counts as one op
 against `max_ops`.
 
-### redis.get / set / del / incr / expire
-
-Key/value access against an operator-supplied Redis (requires a `config.io.redis`
-resource; trusted like `db`/`mail` — no SSRF guard). **Strings in / strings out**: the
-script owns (de)serialization. Synchronous (no `await`).
-
-```js
-function handler(ctx) {
-  redis.set("user:1", JSON.stringify({ id: 1 }), { ttl: 60 }); // ttl seconds, optional
-  var raw = redis.get("user:1"); // string | null (null if missing)
-  var n = redis.increment("visits"); // number (new value)
-  redis.expire("user:1", 120); // bool (true if the key existed)
-  redis.delete("user:1"); // number (keys removed)
-  return json({ user: JSON.parse(raw), visits: n }, null);
-}
-```
-
-The operator defines the resource in `fabricd`:
-`{ "resources": { "cache": { "kind": "redis", "url": "redis://[user:pass@]host:6379[/db]", "timeout_ms": 5000 } } }`;
-a request enables it with `"io": { "redis": ["cache"] }`.
-Use a **`rediss://`** URL for TLS (managed services) — validated against bundled public
-CA roots, reusing the same `aws-lc-rs` provider as the rest of the stack (no extra crypto
-in the binary). A failure to reach Redis surfaces as a retryable
-`capability/redis/REDIS_CONNECTION` (HTTP 200), not a server fault. Each call is one op
-against `max_ops`.
-
-### amq.send / amq.request — messaging producer (RabbitMQ or NATS)
-
-Publishes a **batch** of messages (requires a `config.io.amq` resource; trusted — no SSRF
-guard). **Producer-side only** (no subscribe/consume). The backend is the resource's
-`backend` field: `"rabbitmq"` (default) or `"nats"`. List-always:
-`amq.send([[routingKey, payload], …])`; Rust opens one connection for the whole batch.
-Synchronous.
-
-```js
-function handler(ctx) {
-  var published = amq.send([
-    ["user.created", { id: 1 }],
-    ["user.created", { id: 2 }],
-  ]); // → 2
-  return json({ published: published }, null);
-}
-```
-
-The message **body is the JSON of each `payload`**; `routingKey` is the RabbitMQ queue name for
-the default exchange (override with the resource's `exchange`) or the NATS **subject**. The
-**whole batch is one op** against `max_ops`; a batch over the resource's `max_batch` (default
-100) is rejected with `AMQ_BATCH_TOO_LARGE`. A broker outage → retryable
-`capability/amq/AMQ_CONNECTION` (HTTP 200).
-
-The operator defines the resource in `fabricd`; a request enables it with
-`"io": { "amq": ["events"] }`.
-
-**RabbitMQ resource:** `{ "resources": { "events": { "kind": "amq", "host": "...", "port": 5672,
-"username": "guest", "password": "guest", "vhost": "/", "exchange": "", "max_batch": 100,
-"tls": false, "ca_cert": null } } }`. Set **`"tls": true`** (port usually `5671`) for `amqps://`
-against managed brokers — validated against bundled public CA roots via the shared `aws-lc-rs`
-provider. For a self-hosted broker with a private CA, point `ca_cert` at the CA PEM (mounted
-into the `fabricd` container).
-
-**NATS** (`"backend": "nats"`): port defaults to `4222`; `routingKey` is the subject; `vhost`/
-`exchange` don't apply; auth is optional (`username`+`password` or `token`). Adds
-**request-reply**: `amq.request(subject, payload)` publishes and returns the first reply's
-parsed JSON body, bounded by the resource's `request_timeout_ms` (default 5000) → retryable
-`AMQ_TIMEOUT` on no reply. `amq.request` on the RabbitMQ backend throws non-retryable
-`AMQ_UNSUPPORTED`. NATS resource: `{ "resources": { "events": { "kind": "amq", "backend": "nats",
-"host": "...", "port": 4222, "token": "...", "request_timeout_ms": 5000, "tls": false,
-"ca_cert": null } } }`.
-
-### mongo.find / find_one / count / aggregate / insert* / update* / delete* — document database
-
-MongoDB client (requires a `config.io.mongo` resource, **operator-supplied** — trusted, no SSRF guard, like
-`db`/`mail`). Async under the hood (per-op client-side deadline anchored to the execution
-budget, like `db`). Filters/updates/pipelines are passed as data, never string-interpolated.
-Synchronous from JS.
-
-```js
-function handler(ctx) {
-  var users = mongo.find("users", { active: true }, { limit: 50, sort: { name: 1 } });
-  var one = mongo.find_one("users", { _id: ctx.id });
-  var ins = mongo.insert_one("users", { name: ctx.name, active: true }); // { inserted_id }
-  mongo.update_one("users", { _id: ins.inserted_id }, { $set: { active: false } }); // { matched, modified }
-  mongo.delete_many("logs", { at: { $lt: 2 } }); // { deleted }
-  return json({ users: users.docs, one: one }, null);
-}
-```
-
-`find`/`aggregate` return `{ docs, count, truncated }` capped at `max_docs` (default 1000).
-**Type fidelity** (same rule as `db`): values a JS number can't hold exactly come back as
-strings — `Int64`/`Decimal128` as strings, `ObjectId` as hex, `Date` as RFC 3339, `Binary` as
-base64; `Int32`/`Double` as numbers. Errors: retryable `MONGO_CONNECTION` (unreachable),
-`MONGO_WRITE` (duplicate key / constraint), `MONGO_QUERY` (bad filter/update/pipeline),
-retryable `MONGO_TIMEOUT` (deadline). The operator defines the resource in `fabricd`:
-`{ "resources": { "app-docs": { "kind": "mongo", "host": "...", "port": 27017,
-"username": null, "password": null, "database": "app", "auth_source": "admin",
-"op_timeout_ms": 5000, "max_docs": 1000, "tls": false, "ca_cert": null } } }`; a request
-enables it with `"io": { "mongo": ["app-docs"] }`.
-
 ### $sys — runtime stdlib (crypto, date, env, secrets)
 
 The `$sys` umbrella groups pure, zero-I/O helpers. `$sys.crypto` and `$sys.date` are
@@ -768,37 +618,6 @@ The plaintext never enters JS — it stays Rust-side and is resolved only by the
 sink, so a script can only ever return the `"[secret:NAME]"` placeholder. There is **no**
 output scrubber and **no** reveal escape hatch (both evadable/transmit-to-observable). Use
 high-entropy secrets. See [`docs/09-sys.md`](docs/09-sys.md).
-
-### auth — OIDC/IAM identity
-
-Resolves a caller's bearer token to its claims (requires a `config.io.auth` resource;
-trusted — the issuer is operator-supplied, so no SSRF guard). Validation is **delegated to
-the IAM** (a `userinfo` round-trip), so there is no local JWT/JWKS crypto stack. Endpoints
-are auto-discovered from `{issuer}/.well-known/openid-configuration` unless overridden.
-
-```js
-function handler(ctx) {
-  var u = auth.user_info(ctx.token); // { ok:true, claims:{sub,email,…} } | { ok:false, status, code }
-  if (!u.ok) return json(null, { code: "unauthorized" });
-  // RFC 7662 introspection (needs the resource's client_id/secret) — see token liveness:
-  // var r = auth.introspect(ctx.token); if (!r.claims.active) { ... }
-  return json({ id: u.claims.sub }, null);
-}
-```
-
-**Hybrid error surface:** an invalid/expired/under-scoped token is the _caller's_ business
-flow, so it returns **in-band** (`{ ok:false, status, code:"AUTH_INVALID_TOKEN" }`, never
-thrown — like `http`). Infra failures the handler can't act on (issuer down → retryable
-`AUTH_UNAVAILABLE`; misconfig → `AUTH_REQUEST`) **throw** a tagged capability error (like
-`db`/`mail`). Per-token results are cached within a request (a repeat lookup makes no round
-trip and costs no op). Each call is metered in `meta.auth_requests`.
-
-The operator defines the resource in `fabricd`:
-`{ "resources": { "iam": { "kind": "auth", "issuer": "https://login.example.com",
-"userinfo_url": null, "introspect_url": null, "client_id": "", "client_secret": "",
-"timeout_ms": 10000 } } }`; a request enables it with `"io": { "auth": ["iam"] }`. Only
-`issuer` is required (the rest are discovered / introspection-only). See
-[`docs/10-auth.md`](docs/10-auth.md).
 
 ## Configuration
 
@@ -851,8 +670,9 @@ Optional `config.json` in the working directory. All fields have defaults:
 | `modules_dir`                  | _(unset)_     | Directory of injectable ES modules for handler `import`. Unset = `import` never resolves. See [ES modules](#es-modules-import--export).                                                                                                                                                                                        |
 | `access_token`                 | _(unset)_     | Shared-secret bearer token gating `/execute` (constant-time compared); `/health` and `/metrics` stay open. Required on a non-loopback bind unless `allow_unauthenticated` is set.                                                                                                                                               |
 | `allow_unauthenticated`        | `false`       | Explicit opt-out: allow a non-loopback bind with no `access_token` (auth terminated upstream). Without it, an exposed tokenless bind **refuses to start** (fail-closed).                                                                                                                                                        |
-| `fabricd_socket`               | _(unset)_     | Path to the `fabricd` egress sidecar's Unix socket. **Required for any driver-backed capability** (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`) — `fabricd` holds the `resources` credential table; the box only forwards `config.io` names. Unset + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.                                  |
+| `fabricd_socket`               | _(unset)_     | Path to the `fabricd` egress sidecar's Unix socket. **Required for any broker-resolved `io` resource** — `fabricd` holds the `resources` credential table; the box only forwards `config.io` names. Unset + a broker request ⇒ `503 EGRESS_UNAVAILABLE`.                                  |
 | `fabricd_quic`                 | _(unset)_     | Remote `fabricd` over QUIC (alternative to `fabricd_socket`): `{ replicas, server_name, server_cert_pin, auth_token \| auth_token_file }`. The box pins the daemon cert by SHA-256 fingerprint and presents an auth token. See [`docs/design/network-fabric.md`](docs/design/network-fabric.md).                                |
+| `local_resources`              | _(none)_      | Box-direct `io` bindings: logical name → `{ url }` co-located **loopback** endpoint the box POSTs the `{action, payload}` envelope to directly (no broker). Loopback/private only — the boot guard refuses a remote binding. A listed `config.io` name bound here resolves box-direct; any other forwards to the broker.        |
 | `trusted`                      | _(off)_       | Trusted-identity ("nexus edge") mode: `{ enabled, assert_network_isolation, headers, capability_entitlements, quota }`. Derives tenant/user identity from edge-injected headers; refuses an exposed bind unless isolation is asserted. See [`docs/design/multitenant-trust.md`](docs/design/multitenant-trust.md).              |
 | `telemetry`                    | _(off)_       | Tracing/logging: `{ otlp_endpoint, sample_ratio, service_name }`. No `otlp_endpoint` (default) = structured JSON logs only, no OTLP export.                                                                                                                                                                                     |
 | `events`                       | _(off)_       | Per-tenant usage + audit event emission: `{ enabled, buffer }` (default `false` / `4096`). Non-blocking, drop-on-full.                                                                                                                                                                                                          |
@@ -899,8 +719,8 @@ HTTP request
         -> fresh Context per request
           -> inject json() bridge
           -> inject http.* (if allowed_hosts)
-          -> inject db.*/mongo.*/mail.*/redis.*/amq.*/auth.* (per config.io names,
-             resolved operator-side -> wired Egress port; script-facing global: io.call)
+          -> inject io.call (if config.io names any resource; gated by the allowlist,
+             resolved box-direct or via the broker Egress port)
           -> inject s3.* (if config.s3)
           -> eval user script
           -> remove eval/Proxy

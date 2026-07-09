@@ -18,6 +18,11 @@ use std::error::Error;
 use std::net::SocketAddr;
 
 #[cfg(any(feature = "http", feature = "s3"))]
+use std::collections::HashSet;
+#[cfg(any(feature = "http", feature = "s3"))]
+use std::sync::Arc;
+
+#[cfg(any(feature = "http", feature = "s3"))]
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 #[cfg(any(feature = "http", feature = "s3"))]
 use tokio::task;
@@ -67,6 +72,49 @@ pub(crate) fn is_private_ip(addr: &IpAddr) -> bool {
     match *addr {
         IpAddr::V4(ip) => is_private_v4(ip),
         IpAddr::V6(ip) => is_private_v6(ip),
+    }
+}
+
+/// The **inverse** of [`block_private_ip`] — asserts a target is loopback/private (co-located),
+/// used by the box-direct local-egress boot guard (byo-capabilities D8): a box-direct binding may
+/// only point at a co-located service, so a target that is (or resolves to) any **public** address
+/// is rejected. A literal is classified directly; a hostname must resolve and **every** address it
+/// yields must be private (fail-closed — a mixed or unresolved host is rejected).
+///
+/// # Errors
+///
+/// Returns an error if the host is a public literal, resolves to any public address, or does not
+/// resolve at all.
+#[cfg(feature = "http")]
+pub(crate) fn require_private_target(host: &str, port: u16) -> Result<(), String> {
+    if let Ok(addr) = host.parse::<IpAddr>() {
+        return if is_private_ip(&addr) {
+            Ok(())
+        } else {
+            Err(format!(
+                "box-direct target {addr} is a public address; a remote target must go through a broker"
+            ))
+        };
+    }
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| format!("box-direct target '{host}' did not resolve: {err}"))?;
+    let mut resolved = false;
+    for sock_addr in addrs {
+        resolved = true;
+        if !is_private_ip(&sock_addr.ip()) {
+            return Err(format!(
+                "box-direct target '{host}' resolves to public address {}; a remote target must go through a broker",
+                sock_addr.ip()
+            ));
+        }
+    }
+    if resolved {
+        Ok(())
+    } else {
+        Err(format!(
+            "box-direct target '{host}' did not resolve to any address"
+        ))
     }
 }
 
@@ -180,13 +228,35 @@ const fn is_private_v4(ip: Ipv4Addr) -> bool {
 pub(crate) struct SsrfResolver {
     /// When `true` (server `debug`), private/internal addresses are allowed (local testing).
     allow_private: bool,
+    /// Lowercased host names explicitly allowlisted with a port in `http.allowed_hosts` (the D6
+    /// targeted local bypass): resolving one of these permits its private/internal address even
+    /// when `allow_private` is off, so a co-located service (`localhost:8000`) is reachable in
+    /// production without the blanket `debug` relax. Empty for `s3` (no per-host bypass).
+    bypass_hosts: Arc<HashSet<String>>,
 }
 
 #[cfg(any(feature = "http", feature = "s3"))]
 impl SsrfResolver {
-    /// Builds a resolver honoring the `allow_private` (debug) relaxation.
-    pub(crate) const fn new(allow_private: bool) -> Self {
-        Self { allow_private }
+    /// Builds a resolver honoring the `allow_private` (debug) relaxation, with no per-host bypass.
+    pub(crate) fn new(allow_private: bool) -> Self {
+        Self {
+            allow_private,
+            bypass_hosts: Arc::new(HashSet::new()),
+        }
+    }
+
+    /// Builds a resolver that additionally permits the private addresses of `bypass_hosts` (the D6
+    /// targeted local allowlist) — each entry a lowercased host name explicitly allowlisted with a
+    /// port. Used by the `http` capability; `s3` uses [`Self::new`].
+    #[cfg(feature = "http")]
+    pub(crate) const fn with_bypass(
+        allow_private: bool,
+        bypass_hosts: Arc<HashSet<String>>,
+    ) -> Self {
+        Self {
+            allow_private,
+            bypass_hosts,
+        }
     }
 }
 
@@ -194,7 +264,9 @@ impl SsrfResolver {
 impl Resolve for SsrfResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
-        let allow_private = self.allow_private;
+        // A host explicitly allowlisted with a port bypasses the private-IP filter at connect time
+        // too (D6), else the pre-check would pass while the resolver still dropped the local address.
+        let allow_private = self.allow_private || self.bypass_hosts.contains(&host.to_lowercase());
         // Run the blocking `getaddrinfo` off the reactor (the blocking client is a
         // current-thread runtime) so the request timeout can still fire while DNS is in flight.
         Box::pin(async move {
