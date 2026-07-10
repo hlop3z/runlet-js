@@ -53,6 +53,8 @@ var gross = net.add_pct(8.25); // add 8.25% tax → 108.25 USD
 | `.mul(n)`           | times a **number**                   | `$("19.99","USD").mul(3)` → 59.97             |
 | `.div(n)`           | divided by a **number** → money      | `$("99.00","USD").div(3)` → 33.00             |
 | `.div(m)`           | divided by **money** → a ratio       | `$("115","USD").div($("100","USD"))` → 1.15   |
+| `.neg()`            | flip the sign                        | `$("5","USD").neg()` → -5.00                   |
+| `.abs()`            | drop the sign                        | `$("-5","USD").abs()` → 5.00                   |
 | `.pct(p)`           | `p` percent of it                    | `$("200","USD").pct(8.25)` → 16.50            |
 | `.add_pct(p)`       | add `p` percent (tax, markup)        | `$("100","USD").add_pct(8.25)` → 108.25       |
 | `.sub_pct(p)`       | take off `p` percent (discount)      | `$("50","USD").sub_pct(10)` → 45.00           |
@@ -135,9 +137,10 @@ Decimal("2.03").round_to("0.05").to_string(); // "2.05"  (round to the nearest 5
 Decimal("200").pct(15).to_string(); // "30"   (15% of 200)
 ```
 
-Handy `Decimal` extras: `.clamp(lo, hi)`, `.min(x)`, `.max(x)`, `.pct(p)`, `.round(places, mode)`,
-and `.round_to(step, mode)`. It has the same compares as money (`.eq .lt … .is_zero`), plus
-`.to_number()` and `.to_string()`.
+`Decimal` does the same arithmetic as money — `.add .sub .mul .div`, plus `.neg()` (flip the sign)
+and `.abs()` (drop it). Handy extras: `.clamp(lo, hi)`, `.min(x)`, `.max(x)`, `.pct(p)`,
+`.round(places, mode)`, and `.round_to(step, mode)`. It has the same compares as money
+(`.eq .lt … .is_zero`), plus `.to_number()` and `.to_string()`.
 
 ## A full order example 🛒
 
@@ -192,10 +195,11 @@ function handler(ctx) {
 | `$("19.99").toCents()`     | `$("19.99", "USD").to_minor()`                  |
 | `$("1000").toCents(0)`     | `$("1000", "JPY").to_minor()` (currency sets 0) |
 | `$(1999).fromCents()`      | build money from minor units at construction    |
-| `.isZero()` / `.toNumber()`| `.is_zero()` / `.to_number()` (old names still work for one release) |
+| `.isZero()` / `.toNumber()`| `.is_zero()` / `.to_number()`                   |
 
-The old camelCase names (`isZero`, `isNegative`, `toNumber`) keep working as **deprecated
-aliases** for one release, so existing scripts don't break the day this ships.
+The old camelCase names (`isZero`, `isNegative`, `toNumber`) have been **removed** — use the
+snake_case forms (`is_zero`, `is_negative`, `to_number`). They were deprecated aliases for one
+release and are now gone, so the surface has exactly one name per operation.
 
 **Next:** [`s3` — Signed Upload & Download Links →](06-s3.md)
 

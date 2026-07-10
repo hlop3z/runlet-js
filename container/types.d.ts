@@ -204,12 +204,6 @@ interface Decimal {
   to_number(): number;
   /** Serializes as the exact string value inside {@link json} / `JSON.stringify`. */
   toJSON(): string;
-  /** @deprecated Use {@link is_zero}. */
-  isZero(): boolean;
-  /** @deprecated Use {@link is_negative}. */
-  isNegative(): boolean;
-  /** @deprecated Use {@link to_number}. */
-  toNumber(): number;
 }
 
 /** Creates a {@link Decimal} from a number, string, or another `Decimal`. */
@@ -654,22 +648,22 @@ interface List {
   sort_by(field?: string, direction?: "asc" | "desc"): List;
   /** A new list of one field's value from each record. */
   column(field: string): List;
-  /** Distinct scalars by value (first occurrence wins). */
+  /** Distinct scalars by canonical value — equal money/decimal/datetime/text collapse (money keeps currency distinct). */
   unique(): List;
-  /** Distinct records by a named field's value (first occurrence wins). */
+  /** Distinct records by a named field's canonical value (first occurrence wins). */
   unique_by(field: string): List;
-  /** Group records into a {@link Dict} of lists, keyed by the stringified field value. */
+  /** Group records into a {@link Dict} of lists, keyed by the field's canonical value (money keeps its currency). */
   group_by(field: string): Dict;
 
-  // exact-Decimal aggregates over a named column (blanks/non-numeric skipped)
-  /** Exact sum of a column → {@link Decimal} (empty column → `Decimal(0)`). */
-  sum(field?: string): Decimal;
-  /** Exact average of a column → {@link Decimal}, or `null` when the column is empty. */
-  avg(field?: string): Decimal | null;
-  /** Minimum of a column → {@link Decimal}, or `null` when the column is empty. */
-  min(field?: string): Decimal | null;
-  /** Maximum of a column → {@link Decimal}, or `null` when the column is empty. */
-  max(field?: string): Decimal | null;
+  // exact aggregates over a named column (blanks/non-numeric skipped)
+  /** Exact sum of a column → a {@link Money} (currency-preserving) for a money column, else a {@link Decimal} (empty → `Decimal(0)`). Mixed currencies throw. */
+  sum(field?: string): Decimal | Money;
+  /** Exact average of a column → {@link Money} for a money column, else {@link Decimal}; `null` when empty. Mixed currencies throw. */
+  avg(field?: string): Decimal | Money | null;
+  /** Minimum of a column → {@link Money} for a money column, else {@link Decimal}; `null` when empty. Mixed currencies throw. */
+  min(field?: string): Decimal | Money | null;
+  /** Maximum of a column → {@link Money} for a money column, else {@link Decimal}; `null` when empty. Mixed currencies throw. */
+  max(field?: string): Decimal | Money | null;
   /** Number of elements (a plain count, never money). */
   count(): number;
 
@@ -687,6 +681,8 @@ interface List {
   /** The underlying plain array (a defensive copy). */
   to_array(): unknown[];
   toJSON(): unknown[];
+  toString(): string;
+  valueOf(): unknown[];
   [Symbol.iterator](): Iterator<unknown>;
 }
 
@@ -726,6 +722,8 @@ interface Dict {
   /** The underlying plain object (a defensive copy). */
   to_object(): Record<string, unknown>;
   toJSON(): Record<string, unknown>;
+  toString(): string;
+  valueOf(): Record<string, unknown>;
 }
 
 /** Record value-util factory. `dict(input)` wraps a plain object (non-object → empty). Always available. */

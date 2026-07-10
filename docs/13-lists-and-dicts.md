@@ -45,11 +45,19 @@ list(orders).sort_by("total").column("id").to_array();          // cheapest firs
 list(orders).sort_by("total", "desc").first();                  // the biggest order
 ```
 
+Money, decimals, and dates sort **by their real value**, not alphabetically — so `$100.00` sorts
+after `$19.99` (a plain `"100.00"` string would sort *before* it), and a `datetime` column sorts in
+time order.
+
 ### Grab one column: `column`
 
 ```js
 list(orders).column("region").unique().to_array(); // ["US", "EU"]
 ```
+
+`unique()` removes duplicate scalars; `unique_by("field")` keeps the first row per field value. Both
+compare by real value, so two equal `money` or `datetime` values count as the same (and `$1 USD` vs
+`$1 EUR` stay distinct — the currency is part of the identity).
 
 ### Group rows: `group_by`
 
@@ -64,15 +72,27 @@ byRegion.get("EU").sum("total").toString(); // "12.5"
 ### Add up a money column: `sum`, `avg`, `min`, `max` 💰
 
 These are the important ones for money — and they're **exact**. Adding `0.1 + 0.2` in plain
-JavaScript famously gives `0.30000000000000004`. Here you get a real {@link Decimal} — the same
-exact-money type `$` uses — so cents never drift:
+JavaScript famously gives `0.30000000000000004`. Here you get an exact answer, so cents never drift:
 
 ```js
 list(orders).where({ status: "paid" }).sum("total").toString(); // "32.49"  (exact!)
 ```
 
-- `sum` → a `Decimal` (empty column → `0`)
-- `avg` / `min` / `max` → a `Decimal`, or `null` if there's nothing to measure
+The result type follows the column:
+
+- A column of **plain numbers or number strings** (like `total: "19.99"`) → a real {@link Decimal},
+  the same exact-money type `$` uses.
+- A column of real **`money` values** (built with `$(...)`) → a **`money`** back, with the currency
+  kept. Mixing currencies in one column **throws** (there's no silent conversion) — split by
+  currency first with `group_by` if you need per-currency totals.
+
+```js
+var cart = [{ price: $("0.10", "USD") }, { price: $("0.20", "USD") }];
+list(cart).sum("price").format(); // "$0.30"  — a money value, not a bare number
+```
+
+- `sum` → a `Decimal` or `money` (empty column → `Decimal(0)`)
+- `avg` / `min` / `max` → a `Decimal` or `money`, or `null` if there's nothing to measure
 - `count()` → a plain number (it's a tally, not money)
 
 Blank or non-number values are simply **skipped**, so one missing price won't break the total. Want
@@ -86,7 +106,8 @@ one) — **not** square brackets `[i]`:
 ```js
 list(["a", "b", "c"]).get(0);  // "a"
 list(["a", "b", "c"]).at(-1);  // "c"
-list(orders).first();          // the first order
+list(orders).first();          // the first order (or null if empty)
+list(orders).last();           // the last order  (or null if empty)
 list(orders).len();            // 3
 ```
 

@@ -1642,7 +1642,8 @@ mod money_tests {
         }
     }
 
-    /// `Decimal` is exact and distinct from `$`; snake_case + deprecated camelCase both resolve.
+    /// `Decimal` is exact and distinct from `$`; snake_case resolves and the removed camelCase
+    /// alias is absent (calling it throws a `TypeError`, caught here as `false`).
     #[test]
     fn decimal_is_exact_and_distinct_from_money() {
         let out = run_script(
@@ -1650,14 +1651,14 @@ mod money_tests {
                sum: Decimal('0.1').add('0.2').toString(), \
                distinct: Decimal !== $, \
                snake: Decimal('0').is_zero(), \
-               camel: Decimal('0').isZero() }); }",
+               camel_gone: (typeof Decimal('0').isZero !== 'function') }); }",
             None,
         );
         assert!(out.contains("\"sum\":\"0.3\""), "exact base-10: {out}");
         assert!(out.contains("\"distinct\":true"), "Decimal !== $: {out}");
         assert!(
-            out.contains("\"snake\":true") && out.contains("\"camel\":true"),
-            "{out}"
+            out.contains("\"snake\":true") && out.contains("\"camel_gone\":true"),
+            "snake_case resolves and camelCase alias removed: {out}"
         );
     }
 

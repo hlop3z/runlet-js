@@ -133,18 +133,18 @@
   Money.prototype.round = function (mode) { return fromDec(D(this.a), this.c, mode); };
 
   // ---- allocation (largest-remainder, penny-safe) -----------------------
-  function allocateWeights(self, weights) {
+  function allocate_weights(self, weights) {
     var raw = __decimal("allocate", self.a, String(exponentOf(self.c)), JSON.stringify(weights));
     var res = JSON.parse(raw);
     if (res && res.error) throw new Error(res.error);
     var cur = self.c;
     return res.list.map(function (part) { return new Money(part, cur); });
   }
-  Money.prototype.allocate = function (weights) { return allocateWeights(this, weights); };
+  Money.prototype.allocate = function (weights) { return allocate_weights(this, weights); };
   Money.prototype.allocate_to = function (n) {
     var weights = [];
     for (var i = 0; i < n; i++) weights.push(1);
-    return allocateWeights(this, weights);
+    return allocate_weights(this, weights);
   };
   Money.prototype.split = function (n) { return this.allocate_to(n); };
 
@@ -182,6 +182,14 @@
     return { amount: this.a, currency: this.c, minor_units: this.to_minor() };
   };
 
+  // Internal interop hooks the `list` verbs read (not author-facing, absent from base.d.ts):
+  // __order_key → the amount as an exact Decimal (currency stripped, for numeric ordering only);
+  // __id_key → an identity string that INCLUDES the currency (USD 19.99 ≠ EUR 19.99).
+  Money.prototype.__order_key = function () { return D(this.a); };
+  Money.prototype.__id_key = function () { return this.a + " " + this.c; };
+
+  // Expose the constructor so `list` can brand-check money values (mirrors Decimal._Dec).
+  make._Money = Money;
   globalThis.$ = make;
   globalThis.money = make;
 })();

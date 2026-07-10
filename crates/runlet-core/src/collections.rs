@@ -68,6 +68,19 @@ mod tests {
         })
     }
 
+    /// Like [`run`], but also injects `$`/`money` (after `Decimal`) so the `list` verbs can be
+    /// exercised over real `money` values.
+    fn run_money(expr: &str) -> String {
+        let rt = Runtime::new().expect("runtime");
+        let ctx = Context::full(&rt).expect("context");
+        ctx.with(|qctx| {
+            inject_decimal(&qctx).expect("inject decimal");
+            crate::money::inject_money(&qctx, None).expect("inject money");
+            inject_collections(&qctx).expect("inject collections");
+            qctx.eval::<String, _>(expr).expect("eval")
+        })
+    }
+
     // ---- list: unwrap / interop / access --------------------------------
 
     #[test]
@@ -187,6 +200,79 @@ mod tests {
         assert_eq!(
             run(r#"list([{n:1},{n:"abc"},{n:true},{x:9},{n:null},{n:"2"}]).sum("n").toString()"#),
             "3"
+        );
+    }
+
+    // ---- list: value-util interop (money/decimal wrappers) --------------
+
+    #[test]
+    fn list_sum_money_returns_money_preserving_currency() {
+        // A money column sums to a money value (currency kept), not a bare Decimal, and never 0.
+        assert_eq!(
+            run_money(r#"list([{t:$("0.10","USD")},{t:$("0.20","USD")}]).sum("t").format()"#),
+            "$0.30"
+        );
+        assert_eq!(
+            run_money(r#"list([{t:$("0.10","USD")},{t:$("0.20","USD")}]).sum("t").currency()"#),
+            "USD"
+        );
+    }
+
+    #[test]
+    fn list_sum_mixed_currency_throws() {
+        assert_eq!(
+            run_money(
+                r#"(function(){try{list([{t:$("1","USD")},{t:$("1","EUR")}]).sum("t");return "no-throw";}catch(e){return "threw";}})()"#
+            ),
+            "threw"
+        );
+    }
+
+    #[test]
+    fn list_min_max_money_preserve_currency() {
+        // min/max over a money column return money values (currency kept), not bare decimals.
+        assert_eq!(
+            run_money(
+                r#"var m=list([{t:$("5","USD")},{t:$("2","USD")}]).min("t");m.to_string()+" "+m.currency()"#
+            ),
+            "2 USD"
+        );
+        assert_eq!(
+            run_money(
+                r#"var m=list([{t:$("5","USD")},{t:$("2","USD")}]).max("t");m.to_string()+" "+m.currency()"#
+            ),
+            "5 USD"
+        );
+    }
+
+    #[test]
+    fn list_sort_by_money_is_numeric_not_lexical() {
+        // Lexically "100.00" < "19.99" < "5.00"; numerically the order must be 5, 19.99, 100.
+        assert_eq!(
+            run_money(
+                r#"JSON.stringify(list([{t:$("100.00","USD")},{t:$("19.99","USD")},{t:$("5.00","USD")}]).sort_by("t").column("t").to_array().map(function(m){return m.to_string();}))"#
+            ),
+            r#"["5.00","19.99","100.00"]"#
+        );
+    }
+
+    #[test]
+    fn list_group_by_money_keeps_currency_distinct() {
+        // USD 19.99 and EUR 19.99 must not collide into one group.
+        assert_eq!(
+            run_money(
+                r#"String(list([{p:$("19.99","USD")},{p:$("19.99","EUR")}]).group_by("p").keys().len())"#
+            ),
+            "2"
+        );
+    }
+
+    #[test]
+    fn list_unique_dedupes_equal_money_by_amount_and_currency() {
+        // Two equal USD values collapse; the EUR value differs by currency and survives.
+        assert_eq!(
+            run_money(r#"String(list([$("1","USD"),$("1","USD"),$("1","EUR")]).unique().len())"#),
+            "2"
         );
     }
 
