@@ -1425,8 +1425,13 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
     let context_json = if let Some(shared_json) = shared.as_deref() {
         let Some(merged) = context_with_reserved(&context, &[("shared", shared_json)]) else {
             emit_denied(state, identity, trace_id, "INVALID_CONTEXT", None);
-            let meta =
-                base_error_meta(trace_id, script_bytes, context_bytes, key.as_deref(), partition);
+            let meta = base_error_meta(
+                trace_id,
+                script_bytes,
+                context_bytes,
+                key.as_deref(),
+                partition,
+            );
             let envelope = request_error(
                 "INVALID_CONTEXT",
                 "item context must be a JSON object when the batch supplies a shared context"
@@ -1706,7 +1711,10 @@ fn fallback_item_body(trace_id: &str) -> String {
 fn context_with_reserved(context: &RawValue, reserved: &[(&str, &str)]) -> Option<String> {
     let mut map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(context.get()).ok()?;
     for &(key, value) in reserved {
-        let _prev = map.insert(key.to_owned(), RawValue::from_string(value.to_owned()).ok()?);
+        let _prev = map.insert(
+            key.to_owned(),
+            RawValue::from_string(value.to_owned()).ok()?,
+        );
     }
     serde_json::to_string(&map).ok()
 }
@@ -1855,8 +1863,13 @@ async fn run_lifecycle_phase(ctx: LifecycleCtx<'_>) -> LifecyclePhase {
     .await;
 
     let exec_time_us = start.elapsed().as_micros();
-    let base_meta = Meta::new(trace_id.to_owned(), script_bytes, context_bytes, exec_time_us)
-        .with_partition(partition.map(str::to_owned));
+    let base_meta = Meta::new(
+        trace_id.to_owned(),
+        script_bytes,
+        context_bytes,
+        exec_time_us,
+    )
+    .with_partition(partition.map(str::to_owned));
     lifecycle_outcome(state, identity, result, base_meta)
 }
 
@@ -1886,8 +1899,10 @@ fn lifecycle_outcome(
                                 .unwrap_or_else(|_err| RAW_NULL.clone()),
                         ),
                         Err(parse_err) => LifecyclePhase::Failure(
-                            EngineError::Malformed(format!("malformed handler response: {parse_err}"))
-                                .into_envelope(cfg.error_debug, cfg.timeout_retryable),
+                            EngineError::Malformed(format!(
+                                "malformed handler response: {parse_err}"
+                            ))
+                            .into_envelope(cfg.error_debug, cfg.timeout_retryable),
                         ),
                     }
                 }
@@ -1905,14 +1920,18 @@ fn lifecycle_outcome(
             let outcome = engine_error_outcome(&engine_err);
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
-            LifecyclePhase::Failure(engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable))
+            LifecyclePhase::Failure(
+                engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable),
+            )
         }
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
             let outcome = engine_error_outcome(&engine_err);
             emit_executed(state, identity, &base_meta, outcome);
             metrics.record_engine_error(&engine_err);
-            LifecyclePhase::Failure(engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable))
+            LifecyclePhase::Failure(
+                engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable),
+            )
         }
     }
 }
@@ -3955,7 +3974,10 @@ mod batch_tests {
         let (status, body) = run_full(&app, HeaderMap::new(), items, before, None, after).await;
         assert_eq!(status, StatusCode::OK);
         for index in 0..3 {
-            assert_eq!(body["results"][index]["data"], 10, "item read before's output");
+            assert_eq!(
+                body["results"][index]["data"], 10,
+                "item read before's output"
+            );
         }
         assert_eq!(body["summary"], 30, "after reduced all three item results");
     }
@@ -3984,8 +4006,14 @@ mod batch_tests {
             run_full(&app, HeaderMap::new(), items, before, Some(seed), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["results"][0]["data"]["seed"], 9, "seed value visible");
-        assert_eq!(body["results"][0]["data"]["before"], 1, "before value visible");
-        assert_eq!(body["results"][0]["data"]["k"], 2, "before wins the collision");
+        assert_eq!(
+            body["results"][0]["data"]["before"], 1,
+            "before value visible"
+        );
+        assert_eq!(
+            body["results"][0]["data"]["k"], 2,
+            "before wins the collision"
+        );
         assert_eq!(
             body["results"][2]["data"], 2,
             "a sibling's mutation does not leak into another item"
@@ -4032,7 +4060,10 @@ mod batch_tests {
             "no item runs when before is the barrier"
         );
         assert!(body.get("summary").is_none(), "after never runs");
-        assert!(!body["error"].is_null(), "the barrier carries the before error");
+        assert!(
+            !body["error"].is_null(),
+            "the barrier carries the before error"
+        );
     }
 
     /// 4.6 — `after` reduce: a returning `after` surfaces its value as the top-level `summary`; a
@@ -4050,16 +4081,23 @@ mod batch_tests {
         let after_ok = Some(phase(
             "function handler(ctx){ return { data: { count: ctx.results.length } }; }",
         ));
-        let (status, body) = run_full(&app, HeaderMap::new(), mk_items(), None, None, after_ok).await;
+        let (status, body) =
+            run_full(&app, HeaderMap::new(), mk_items(), None, None, after_ok).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["summary"]["count"], 2, "after's value is the summary");
         assert!(body.get("summary_error").is_none(), "no error on success");
 
         // Failure: a throwing after keeps the 200 + results, reports summary_error.
-        let after_err = Some(phase("function handler(){ throw new Error('reduce failed'); }"));
+        let after_err = Some(phase(
+            "function handler(){ throw new Error('reduce failed'); }",
+        ));
         let (status, body) =
             run_full(&app, HeaderMap::new(), mk_items(), None, None, after_err).await;
-        assert_eq!(status, StatusCode::OK, "a failed after does not fail the batch");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a failed after does not fail the batch"
+        );
         assert_eq!(body["results"][0]["data"], 1, "results stay intact");
         assert_eq!(body["results"][1]["data"], 2);
         assert!(body.get("summary").is_none(), "no summary on failure");
@@ -4084,12 +4122,19 @@ mod batch_tests {
         let items = vec![item("function handler(){ return { data: 1 }; }")];
         let before = Some(phase("function handler(){ return { data: 1 }; }"));
         let (status, body) = run_full(&app, hdrs, items, before, None, None).await;
-        assert_ne!(status, StatusCode::OK, "quota-denied before aborts the batch");
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "quota-denied before aborts the batch"
+        );
         assert_eq!(
             body["error"]["code"], "QUOTA_EXCEEDED",
             "before debits quota like an item"
         );
-        assert!(body.get("results").is_none(), "no item runs past the barrier");
+        assert!(
+            body.get("results").is_none(),
+            "no item runs past the barrier"
+        );
     }
 
     /// 4.7b — Gates: I/O in `before` is gated exactly as for an item — with no sidecar, a `before`
@@ -4108,7 +4153,11 @@ mod batch_tests {
             ..phase("function handler(ctx){ return { data: ctx.io ? 1 : 0 }; }")
         });
         let (status, body) = run_full(&app, HeaderMap::new(), items, before, None, None).await;
-        assert_ne!(status, StatusCode::OK, "no sidecar ⇒ before I/O fails closed");
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "no sidecar ⇒ before I/O fails closed"
+        );
         assert_eq!(body["error"]["code"], "EGRESS_UNAVAILABLE");
         assert!(body.get("results").is_none(), "the barrier runs no items");
     }

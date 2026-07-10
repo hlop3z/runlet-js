@@ -780,7 +780,11 @@ mod tests {
         assert_eq!(cfg.batch.max_items, 25, "default item cap");
         assert_eq!(cfg.batch.max_input_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.batch.max_response_bytes, 8 * 1024 * 1024);
-        assert_eq!(cfg.batch.max_shared_bytes, 4 * 1024 * 1024, "default shared cap");
+        assert_eq!(
+            cfg.batch.max_shared_bytes,
+            4 * 1024 * 1024,
+            "default shared cap"
+        );
 
         let json = r#"{"batch":{"max_items":100,"max_input_bytes":1024,"max_response_bytes":2048,"max_shared_bytes":512}}"#;
         let parsed = serde_json::from_str::<Config>(json);
