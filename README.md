@@ -688,6 +688,40 @@ function handler(ctx) {
 }
 ```
 
+### text — immutable string value-util (Pythonic names, JS semantics)
+
+`text` is an **always-on** value-util (no config, like `$`/`Decimal`/`datetime`): a callable
+factory `text(input)` returning an immutable string value with chainable, snake_case methods. The
+method **names** are Python-flavored renames of native JS string ops; the **semantics** are
+JavaScript's (UTF-16 code units for counting/width; Unicode-default, locale-independent casing).
+Pure and unmetered — injected identically under the deterministic profile (nothing to remove). It
+does human-readable *shaping* (distinct from `$sys.crypto`/codec, which is reversible byte
+encoding/hashing) and stops short of semantic-domain validation (a future `valid` util owns
+`is_email`/`is_phone`; only character-class predicates like `is_digit` live here).
+
+```js
+function handler(ctx) {
+  // rename passthroughs (Python names, JS behavior):
+  text("  Ac-Me  ").strip().lower().value;          // "ac-me"
+  text("SKU-0042").removeprefix("SKU-").value;       // "0042"
+  text("a.b.c").replace(".", "-").value;             // "a-b-c"  (replaces ALL, like Python)
+  text("a,b,c").split(",");                          // ["a","b","c"]  (plain strings)
+  text("0042").is_digit();                           // true  (character-class predicate)
+
+  // padding — width is CAPPED (oversize throws, no unbounded alloc):
+  text("42").zfill(6).value;                         // "000042"  (sign-aware: "-42".zfill(6) → "-00042")
+  text("x").rjust(5).value; text("hi").center(6, "-").value;
+
+  // ERP shaping verbs:
+  text("Café Málaga #2").slugify().value;            // "cafe-malaga-2"  (NFD-folds accents; drops non-latin)
+  text("4111111111111234").mask().value;             // "************1234"  (lossy DISPLAY, not encoding)
+  text("too   many\t spaces").collapse().value;      // "too many spaces"
+  text("a very long description").truncate(10).value; // "a very lo…"
+
+  return json({ ok: true }, null);                   // json()/toString → the plain string
+}
+```
+
 **Secrets are use-not-extract** (the multi-tenant guarantee). With
 `config.sys = { "env": { "REGION": "us-east-1" }, "secrets": { "SIGNING_KEY": "sk_live_…" } }`:
 

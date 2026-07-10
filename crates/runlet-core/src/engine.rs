@@ -39,6 +39,7 @@ use crate::s3::{self, S3Config, S3Metric};
 #[cfg(any(feature = "http", feature = "s3"))]
 use crate::sandbox::{self, Collector};
 use crate::sys::{self, SysConfig};
+use crate::text;
 
 /// The `json()` bridge — loaded from `src/js/bridge.js` at compile time.
 const JSON_BRIDGE: &str = include_str!("js/bridge.js");
@@ -512,6 +513,9 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         // Pure (no I/O), always-on like `money`/`Decimal`; the deterministic profile later removes
         // only its ambient-clock reader `datetime.now` (via `js/determinism.js`).
         datetime::inject_datetime(&qctx).map_err(EngineError::internal)?;
+        // `text` is a pure string value-util (no bridge, no clock/randomness), so it is always-on
+        // under both profiles like `Decimal`/`money`/`datetime` and the sanitizer removes nothing.
+        text::inject_text(&qctx).map_err(EngineError::internal)?;
         inject_emit(&qctx, &effects, params.max_ops, params.max_emit_kind_len)
             .map_err(EngineError::internal)?;
         // `log.*` is injected under both profiles (D8) — logging a deterministic run is allowed;

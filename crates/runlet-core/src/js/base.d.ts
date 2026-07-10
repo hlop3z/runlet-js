@@ -510,6 +510,128 @@ interface DateTimeFactory {
 declare const datetime: DateTimeFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// text — immutable string value-util (Pythonic names, JS semantics). Always on.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Options for {@link Text.mask} / {@link Text.redact}. */
+interface TextMaskOptions {
+  /** Number of trailing characters to leave visible (default 4). */
+  keep?: number;
+  /** Single character to mask with (default `"*"`). */
+  char?: string;
+}
+
+/** Options for {@link Text.truncate}. */
+interface TextTruncateOptions {
+  /** Marker appended when truncation happens; counts toward the limit (default `"…"`). */
+  ellipsis?: string;
+}
+
+/**
+ * An immutable string value with a Python-flavored, snake_case surface. Method NAMES rename native
+ * JS string operations; SEMANTICS are JavaScript's — counting and width are UTF-16 code units, and
+ * casing is Unicode-default (locale-independent, hence deterministic). Content transforms return a
+ * new `Text`; `split`/predicates/`count`/`len` return plain values. Unwrap with `.value`; it also
+ * coerces to a plain string via `String(...)` and serializes as a plain string in `json()`.
+ */
+interface Text {
+  /** The underlying plain string. */
+  readonly value: string;
+
+  // case
+  /** Lowercase (Unicode-default). */
+  lower(): Text;
+  /** Uppercase (Unicode-default). */
+  upper(): Text;
+  /** Uppercase the first character, lowercase the rest. */
+  capitalize(): Text;
+  /** Capitalize the first character of each whitespace-separated word. */
+  title(): Text;
+  /** Swap the case of each ASCII letter. */
+  swap_case(): Text;
+
+  // strip (optional set of characters to strip, else whitespace)
+  /** Strip `chars` (or whitespace) from both ends. */
+  strip(chars?: string): Text;
+  /** Strip `chars` (or whitespace) from the left. */
+  lstrip(chars?: string): Text;
+  /** Strip `chars` (or whitespace) from the right. */
+  rstrip(chars?: string): Text;
+
+  // prefix / suffix
+  /** Whether the string starts with `prefix`. */
+  starts_with(prefix: string | Text): boolean;
+  /** Whether the string ends with `suffix`. */
+  ends_with(suffix: string | Text): boolean;
+  /** Remove `prefix` if present (else unchanged). */
+  removeprefix(prefix: string | Text): Text;
+  /** Remove `suffix` if present (else unchanged). */
+  removesuffix(suffix: string | Text): Text;
+
+  /** Replace ALL occurrences of `old` with `neu` (Python `str.replace` semantics). */
+  replace(old: string | Text, neu: string | Text): Text;
+  /** Count non-overlapping occurrences of `sub` (an empty needle yields `len + 1`). */
+  count(sub: string | Text): number;
+
+  // splitting (returns plain strings)
+  /** Split on `sep`; optional `maxsplit` keeps the remainder in the final piece. */
+  split(sep: string | Text, maxsplit?: number): string[];
+  /** Split on `sep` from the right; optional `maxsplit` keeps the remainder in the first piece. */
+  rsplit(sep: string | Text, maxsplit?: number): string[];
+  /** Split into lines on `\n` / `\r` / `\r\n`. */
+  splitlines(): string[];
+
+  // padding / alignment (width is bounded; an oversize width throws)
+  /** Left-pad with `"0"` to `width`, honoring a leading sign. */
+  zfill(width: number): Text;
+  /** Left-justify to `width`, padding on the right with `fill` (default space). */
+  ljust(width: number, fill?: string): Text;
+  /** Right-justify to `width`, padding on the left with `fill` (default space). */
+  rjust(width: number, fill?: string): Text;
+  /** Center within `width`, padding both sides with `fill` (default space). */
+  center(width: number, fill?: string): Text;
+
+  // character-class predicates (false for the empty string)
+  /** Whether every character is a Unicode decimal digit. */
+  is_digit(): boolean;
+  /** Whether every character is a Unicode letter. */
+  is_alpha(): boolean;
+  /** Whether every character is a Unicode letter or decimal digit. */
+  is_alnum(): boolean;
+  /** Whether every character is whitespace. */
+  is_space(): boolean;
+
+  // ERP shaping verbs
+  /** Fold diacritics and slugify to a lowercase `a-z0-9` kebab string (non-latin scripts dropped). */
+  slugify(): Text;
+  /** Mask all but a kept tail — lossy display, not reversible encoding. */
+  mask(opts?: TextMaskOptions): Text;
+  /** Alias of {@link Text.mask}. */
+  redact(opts?: TextMaskOptions): Text;
+  /** Trim and collapse internal whitespace runs to single spaces. */
+  collapse(): Text;
+  /** Shorten to at most `limit` code units, appending the ellipsis marker when truncated. */
+  truncate(limit: number, opts?: TextTruncateOptions): Text;
+
+  // length + interop
+  /** Length in UTF-16 code units. */
+  len(): number;
+  /** The underlying plain string. */
+  to_string(): string;
+  toString(): string;
+  valueOf(): string;
+  toJSON(): string;
+}
+
+/** String value-util factory. `text(input)` wraps any value as an immutable string. Always available. */
+interface TextFactory {
+  (input: unknown): Text;
+}
+
+/** Immutable string value-util (Pythonic names, JS semantics). Always available. */
+declare const text: TextFactory;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Response `meta` — per-capability op metrics keyed by name (`meta.io.<name>`)
 // ─────────────────────────────────────────────────────────────────────────────
 
