@@ -638,11 +638,12 @@ configured, `s3.delete(...)` — and presigning a `DELETE` URL via `s3.sign_url(
 "DELETE" })` — throws unless the operator sets `allow_delete: true`. Counts as one op
 against `max_ops`.
 
-### $sys — runtime stdlib (crypto, date, env, secrets)
+### $sys — runtime stdlib (crypto, env, secrets)
 
-The `$sys` umbrella groups pure, zero-I/O helpers. `$sys.crypto` and `$sys.date` are
-**always on** (no config, like `$`); `$sys.env` / `$sys.secrets` populate only from
-`config.sys`. Nothing here does network I/O or counts against `max_ops`.
+The `$sys` umbrella groups pure, zero-I/O helpers. `$sys.crypto` is **always on** (no config,
+like `$`); `$sys.env` / `$sys.secrets` populate only from `config.sys`. Nothing here does
+network I/O or counts against `max_ops`. (Date/time moved to the always-on top-level
+[`datetime`](#datetime--immutable-utc-instants--timezone-aware-views) value-util.)
 
 ```js
 function handler(ctx) {
@@ -652,12 +653,38 @@ function handler(ctx) {
   $sys.crypto.uuid(); // v7 (time-ordered)
   $sys.crypto.base64.encode("hi"); // also .base64url / .hex / .url, each .encode/.decode
 
-  // date: parse (ISO/RFC3339, YYYY-MM-DD, epoch ms → UTC), timedelta math, diff
-  var due = $sys.date.parse(ctx.when).add({ days: 3, hours: 12 });
-  due.iso(); // RFC 3339 "Z"  ·  due.unix() // epoch seconds  ·  json() serializes as ISO
-  $sys.date.parse(b).diff($sys.date.parse(a)); // { total_ms, total_seconds, days, hours, ... }
+  return json({ ok: true }, null);
+}
+```
 
-  return json({ due: due }, null);
+### datetime — immutable UTC instants + timezone-aware views
+
+`datetime` is an **always-on** value-util (no config, like `$`/`Decimal`): a callable factory
+(`datetime(input)` ≡ `datetime.parse`) plus `datetime.now()` / `datetime.parse(x)` /
+`datetime.from(parts, zone?)`. A value is an immutable **canonical UTC instant** with chainable,
+snake_case methods; a zoned *view* (`in_zone`) re-interprets components/boundaries/formatting in
+an IANA timezone without moving the instant. Pure, unmetered. `datetime.now()` is *removed* (not
+stubbed) under the deterministic profile.
+
+```js
+function handler(ctx) {
+  // parse (ISO/RFC3339, YYYY-MM-DD, epoch ms, or a datetime → UTC); locale strings are NOT guessed
+  var d = datetime.parse(ctx.when);
+
+  // components (year/month/day/hour/… weekday ISO 1=Mon, quarter, iso_week, days_in_month)
+  d.year(); d.weekday(); d.quarter(); d.iso_week(); // { week, week_year }
+
+  // calendar arithmetic (months/years clamp end-of-month: Jan 31 + 1mo → Feb 28/29)
+  var due = d.add({ months: 1 }).end_of("month");   // period boundaries: start_of/end_of
+  d.add_business_days(3);                            // weekend-aware (no holiday calendar)
+  d.diff(due);                                       // { total_ms, total_seconds, days, hours, ... }
+
+  // timezone-correct: "end of month in the customer's timezone"
+  var local = due.in_zone("America/New_York");
+  local.end_of("month").iso();                       // computed + rendered in that zone
+  d.format("YYYY-MM-DD HH:mm", "Asia/Tokyo");         // locale-neutral numeric tokens
+
+  return json({ due: due }, null);                   // json() serializes as RFC 3339 UTC (Z)
 }
 ```
 

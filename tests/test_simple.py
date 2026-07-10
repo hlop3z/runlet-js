@@ -295,6 +295,33 @@ def test_money(t: Runner):
            lambda r: r["data"] == {"caught": True})
 
 
+def test_datetime(t: Runner):
+    t.section("datetime value-util")
+    # Parsing + components, resolved in UTC by default.
+    t.test("parse + components",
+           h("var d = datetime.parse('2026-07-10T13:30:00Z'); return json({y:d.year(), mo:d.month(), da:d.day(), wd:d.weekday(), q:d.quarter()}, null);"),
+           lambda r: r["data"] == {"y": 2026, "mo": 7, "da": 10, "wd": 5, "q": 3})
+    # Immutability — add() returns a new value; the receiver is unchanged.
+    t.test("immutable add",
+           h("var d = datetime.parse('2026-07-10T00:00:00Z'); var n = d.add({days:1}); return json({before:d.day(), after:n.day()}, null);"),
+           lambda r: r["data"] == {"before": 10, "after": 11})
+    # ISO serialization — a value renders as its RFC 3339 UTC (Z) string in json(...).
+    t.test("serializes RFC 3339 UTC",
+           h("return json({d: datetime.parse('2026-07-10T13:30:00Z')}, null);"),
+           lambda r: r["data"]["d"] == "2026-07-10T13:30:00Z")
+    # Calendar month clamping — Jan 31 + 1 month -> Feb 28 (2026 non-leap).
+    t.test("month add clamps end-of-month",
+           h("var d = datetime.from({year:2026,month:1,day:31}).add({months:1}); return json({mo:d.month(), da:d.day()}, null);"),
+           lambda r: r["data"] == {"mo": 2, "da": 28})
+    # Timezone view — the boundary is computed in Tokyo; the canonical instant is preserved.
+    t.test("timezone boundary in zone",
+           h("var d = datetime.parse('2026-07-15T12:00:00Z'); var tk = d.in_zone('Asia/Tokyo'); return json({preserved: tk.epoch_ms()===d.epoch_ms(), hour: tk.hour(), start: tk.start_of('month').iso()}, null);"),
+           lambda r: r["data"]["preserved"] is True and r["data"]["hour"] == 21 and r["data"]["start"] == "2026-07-01T00:00:00+09:00")
+    t.test("unknown zone throws",
+           h("try { datetime.parse('2026-07-10T00:00:00Z').in_zone('Mars/Phobos'); return json(null,'no throw'); } catch(e){ return json({caught:true}, null); }"),
+           lambda r: r["data"] == {"caught": True})
+
+
 def test_user_errors(t: Runner):
     t.section("User-defined errors")
     t.test("push error messages",
@@ -1507,6 +1534,7 @@ def main():
     t = Runner()
     test_functionality(t)
     test_money(t)
+    test_datetime(t)
     test_user_errors(t)
     test_exceptions(t)
     test_sandbox(t)

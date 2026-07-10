@@ -81,6 +81,12 @@ base64 = "0.22"
 # directly so a `--no-default-features` core build (no driver crates) still has them, rather
 # than relying on a driver to enable them transitively.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# IANA timezone database for the `datetime` value-util's zoned views (the distroless image has no
+# `/usr/share/zoneinfo`, so tzdata must be compiled in). Full (unfiltered) db — Tier 5's whole point
+# is correctness for an open-ended set of tenant/customer zones. Chrono-native, MIT/Apache-2.0. See
+# the ADR in `openspec/changes/datetime-value-util/design.md`. `default-features = false` matches
+# chrono's discipline; `filter-by-regex` stays a later config-only tightening if size ever bites.
+chrono-tz = { version = "0.10", default-features = false }
 # S3 SigV4 presigning — pure crypto, no network. Reuses crates already in the
 # tree (sha2/hmac/percent-encoding pulled transitively); `hex` is a tiny addition.
 hex = "0.4"

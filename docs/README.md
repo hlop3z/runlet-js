@@ -32,11 +32,13 @@ Read these in order. Each one is short.
    "USD")` (tax, penny-safe splits) plus `Decimal` for exact non-money math. Always on. 💵
 5. **[`s3` — signed upload/download links](06-s3.md)** — let a browser upload files
    straight to your bucket (S3, R2, MinIO…). 🔗
-6. **[`$sys` — the built-in toolbox](09-sys.md)** — hashing, signing, dates, and
-   use-but-never-see secrets. Always on (no setup) for `crypto` + `date`. 🧰
-7. **[Hasura — GraphQL the easy way](11-hasura.md)** — the `hasura/client` module:
+6. **[`$sys` — the built-in toolbox](09-sys.md)** — hashing, signing, and
+   use-but-never-see secrets. Always on (no setup) for `crypto`. 🧰
+7. **[`datetime` — dates & times done right](10-datetime.md)** — parse, calendar math,
+   period boundaries, and **timezone-correct** answers. Always on. 📅
+8. **[Hasura — GraphQL the easy way](11-hasura.md)** — the `hasura/client` module:
    query Hasura with one line and never miss a hidden GraphQL error. 🚀
-8. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+9. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
    something fails, and how to read it. 🚦
 
 ## The super-powers 🦸
@@ -61,9 +63,9 @@ local service** bound in the box's config, or one held by a little key-keeper he
 live there, never in your request and never in the robot's box. See
 **[Build your own capability](03-capabilities.md)**.
 
-(`$` / `money` — currency-safe money — `Decimal` — exact numbers — and **`$sys.crypto` /
-`$sys.date`** are the exceptions: they're **always on**, no config. Only `$sys.env` /
-`$sys.secrets` need `config.sys`.)
+(`$` / `money` — currency-safe money — `Decimal` — exact numbers — `datetime` — dates &
+times — and **`$sys.crypto`** are the exceptions: they're **always on**, no config. Only
+`$sys.env` / `$sys.secrets` need `config.sys`.)
 
 If you don't turn a super-power on, the robot simply doesn't have it. (For example, with no
 `allowed_hosts`, `http` is `undefined` — it isn't there at all.)

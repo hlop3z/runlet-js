@@ -1,9 +1,13 @@
 //! `$sys` — the always-on runtime standard library for the sandbox.
 //!
 //! One `$`-prefixed global grouping pure, zero-I/O helpers: `$sys.crypto`
-//! (hashing, HMAC, UUID, encoding) and `$sys.date` (parse, `timedelta` math,
-//! diff, formatting). Pure like `$`/Decimal — always injected, no config, no
-//! per-op metering.
+//! (hashing, HMAC, UUID, encoding). Pure like `$`/Decimal — always injected, no
+//! config, no per-op metering.
+//!
+//! Date/time is **not** here: it lives in the first-class top-level `datetime`
+//! value-util (`js/datetime.js`), whose calendar/timezone math is served by the
+//! `datetime` domain in this same `__sys` bridge (see the `-- datetime` section
+//! below). `$sys` keeps only the crypto surface.
 //!
 //! FFI: every op crosses the boundary as `__sys(domain, op, payload_json)` and
 //! returns `{"v": <result>}` on success or `{"error": <message>}` on failure
@@ -42,7 +46,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use chrono::{
+    DateTime, Datelike, Days, Months, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike,
+    Utc,
+};
+use chrono_tz::Tz;
 use hmac::{Hmac, KeyInit, Mac};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use rquickjs::{Ctx, Function, Object, Value as JsValue};
@@ -104,7 +112,7 @@ const SECONDS_PER_HOUR: u64 = 3600;
 /// Seconds in one day.
 const SECONDS_PER_DAY: u64 = 86_400;
 
-/// Injects the `$sys` global. The pure helpers (`crypto`/`date`) are always on; the
+/// Injects the `$sys` global. The pure helper (`crypto`) is always on; the
 /// `env`/`secrets` context is populated only when `sys_config` is present (opt-in).
 ///
 /// # Errors
@@ -166,7 +174,7 @@ fn dispatch(domain: &str, op: &str, payload: &str, secrets: &SecretStore) -> Res
         serde_json::from_str(payload).map_err(|err| format!("invalid payload: {err}"))?;
     match domain {
         "crypto" => crypto_dispatch(op, &parsed, secrets),
-        "date" => date_dispatch(op, &parsed),
+        "datetime" => datetime_dispatch(op, &parsed),
         other => Err(format!("unknown sys domain: '{other}'")),
     }
 }
@@ -330,22 +338,33 @@ fn url_decode(data: &str) -> Result<Value, String> {
         .map_err(|err| format!("invalid percent-encoding: {err}"))
 }
 
-// -- date -------------------------------------------------------------------
+// -- datetime ---------------------------------------------------------------
+//
+// Serves the top-level `datetime` value-util (`js/datetime.js`). The JS side holds the immutable
+// value (a UTC epoch-millis instant + an optional IANA zone for a *view*); this domain does the
+// chrono/chrono-tz calendar math. Ops take `ms` (the canonical instant) and, where the answer is
+// zone-dependent (components, boundaries, formatting), an optional IANA `zone` (UTC when absent).
+// The canonical instant is never changed by a zone — only the interpretation is.
 
-/// Routes a `$sys.date` op.
-fn date_dispatch(op: &str, payload: &Value) -> Result<Value, String> {
+/// Routes a `datetime` op.
+fn datetime_dispatch(op: &str, payload: &Value) -> Result<Value, String> {
     match op {
         "now" => Ok(Value::from(now_millis()?)),
-        "parse" => date_parse(payload),
-        "add" => date_add(payload),
-        "diff" => date_diff(payload),
-        "iso" => date_iso(payload),
-        "unix" => date_unix(payload),
-        other => Err(format!("unknown date op: '{other}'")),
+        "parse" => datetime_parse(payload),
+        "from" => datetime_from(payload),
+        "add" => datetime_add(payload),
+        "parts" => datetime_parts(payload),
+        "start_of" => datetime_boundary(payload, false),
+        "end_of" => datetime_boundary(payload, true),
+        "iso" => datetime_iso(payload),
+        "format" => datetime_format(payload),
+        "diff" => datetime_diff(payload),
+        other => Err(format!("unknown datetime op: '{other}'")),
     }
 }
 
-/// Current wall-clock instant as epoch milliseconds.
+/// Current wall-clock instant as epoch milliseconds. The **only** ambient-clock reader in this
+/// domain — removed (not stubbed) under `Profile::Deterministic` by deleting `datetime.now` in JS.
 fn now_millis() -> Result<i64, String> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -354,7 +373,7 @@ fn now_millis() -> Result<i64, String> {
 }
 
 /// Parses the `input` field (ISO string, date-only, or epoch millis) → epoch millis.
-fn date_parse(payload: &Value) -> Result<Value, String> {
+fn datetime_parse(payload: &Value) -> Result<Value, String> {
     let input = payload
         .get("input")
         .ok_or_else(|| "missing 'input'".to_owned())?;
@@ -369,12 +388,13 @@ fn parse_input(input: &Value) -> Result<i64, String> {
             .ok_or_else(|| "epoch millis must be an integer".to_owned()),
         Value::String(text) => parse_date_str(text),
         Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => {
-            Err("date input must be an ISO string or epoch millis".to_owned())
+            Err("datetime input must be an ISO string or epoch millis".to_owned())
         }
     }
 }
 
 /// Parses an RFC 3339 timestamp or a date-only `YYYY-MM-DD` → epoch milliseconds (UTC).
+/// Locale-formatted strings (e.g. `07/10/2026`) are deliberately **not** guessed — they fail here.
 fn parse_date_str(text: &str) -> Result<i64, String> {
     let trimmed = text.trim();
     if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
@@ -389,42 +409,261 @@ fn parse_date_str(text: &str) -> Result<i64, String> {
     Err(format!("cannot parse date: '{text}'"))
 }
 
-/// Adds a `delta_ms` offset to a `ms` instant (checked).
-fn date_add(payload: &Value) -> Result<Value, String> {
-    let base = field_i64(payload, "ms")?;
-    let delta = field_i64(payload, "delta_ms")?;
-    let out = base
-        .checked_add(delta)
-        .ok_or_else(|| "date arithmetic overflow".to_owned())?;
+/// Builds an instant from `{parts:{year,month,day,hour?,minute?,second?,millisecond?}, zone?}`,
+/// interpreting the parts in `zone` (UTC when absent) → epoch milliseconds.
+fn datetime_from(payload: &Value) -> Result<Value, String> {
+    let parts = payload
+        .get("parts")
+        .ok_or_else(|| "missing 'parts'".to_owned())?;
+    let year = i32::try_from(part_i64(parts, "year", 0)?)
+        .map_err(|_err| "year out of range".to_owned())?;
+    let month = part_u32(parts, "month", 1)?;
+    let day = part_u32(parts, "day", 1)?;
+    let hour = part_u32(parts, "hour", 0)?;
+    let minute = part_u32(parts, "minute", 0)?;
+    let second = part_u32(parts, "second", 0)?;
+    let milli = part_u32(parts, "millisecond", 0)?;
+    let naive = NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|date| date.and_hms_milli_opt(hour, minute, second, milli))
+        .ok_or_else(|| "date parts are out of range".to_owned())?;
+    let tz = resolve_zone(payload)?;
+    Ok(Value::from(from_local(tz, naive)?))
+}
+
+/// Reads an optional integer `key` from a parts object, defaulting when absent.
+fn part_i64(parts: &Value, key: &str, default: i64) -> Result<i64, String> {
+    parts.get(key).map_or(Ok(default), |val| {
+        val.as_i64()
+            .ok_or_else(|| format!("'{key}' must be an integer"))
+    })
+}
+
+/// Reads an optional non-negative integer `key` as a `u32`, defaulting when absent.
+fn part_u32(parts: &Value, key: &str, default: u32) -> Result<u32, String> {
+    parts.get(key).map_or(Ok(default), |val| {
+        val.as_i64()
+            .and_then(|num| u32::try_from(num).ok())
+            .ok_or_else(|| format!("'{key}' must be a non-negative integer"))
+    })
+}
+
+/// Shifts a `ms` instant by `months` (calendar months, end-of-month-clamped) then `fixed_ms`
+/// (fixed-length units the JS side already summed and signed). Overflow → error.
+///
+/// `months` carries years too (`years*12 + months`, signed); calendar shift runs first (larger
+/// units), then the fixed offset — matching Luxon/Temporal ordering. Chrono's `Months` addition
+/// clamps to the last valid day (Jan 31 + 1 month → Feb 28/29).
+fn datetime_add(payload: &Value) -> Result<Value, String> {
+    let base = instant(field_i64(payload, "ms")?)?;
+    let months = field_i64(payload, "months")?;
+    let fixed_ms = field_i64(payload, "fixed_ms")?;
+    let count = u32::try_from(months.unsigned_abs())
+        .map_err(|_err| "month arithmetic overflow".to_owned())?;
+    let shifted = if months < 0 {
+        base.checked_sub_months(Months::new(count))
+    } else {
+        base.checked_add_months(Months::new(count))
+    }
+    .ok_or_else(|| "datetime arithmetic overflow".to_owned())?;
+    let out = shifted
+        .timestamp_millis()
+        .checked_add(fixed_ms)
+        .ok_or_else(|| "datetime arithmetic overflow".to_owned())?;
+    // Confirm the result stays representable so downstream formatting can't fail.
+    instant(out).map(|_dt| ())?;
     Ok(Value::from(out))
 }
 
-/// Formats a `ms` instant as an RFC 3339 string (`Z`, auto sub-second precision).
-fn date_iso(payload: &Value) -> Result<Value, String> {
-    let millis = field_i64(payload, "ms")?;
-    let parsed = DateTime::<Utc>::from_timestamp_millis(millis)
-        .ok_or_else(|| "timestamp out of range".to_owned())?;
-    Ok(Value::String(
-        parsed.to_rfc3339_opts(SecondsFormat::AutoSi, true),
-    ))
+/// Returns the full calendar-component bundle for a `ms` instant, resolved in the optional `zone`
+/// (UTC when absent): components, ISO weekday/week, quarter, day-of-year, days-in-month.
+fn datetime_parts(payload: &Value) -> Result<Value, String> {
+    let tz = resolve_zone(payload)?;
+    let zoned = instant(field_i64(payload, "ms")?)?.with_timezone(&tz);
+    let (year, month) = (zoned.year(), zoned.month());
+    let iso = zoned.iso_week();
+    let quarter = month
+        .checked_sub(1)
+        .and_then(|zero_based| zero_based.checked_div(3))
+        .and_then(|qtr| qtr.checked_add(1))
+        .ok_or_else(|| "quarter computation overflow".to_owned())?;
+    Ok(serde_json::json!({
+        "year": year,
+        "month": month,
+        "day": zoned.day(),
+        "hour": zoned.hour(),
+        "minute": zoned.minute(),
+        "second": zoned.second(),
+        "millisecond": zoned.timestamp_subsec_millis(),
+        "weekday": zoned.weekday().number_from_monday(),
+        "quarter": quarter,
+        "day_of_year": zoned.ordinal(),
+        "iso_week": { "week": iso.week(), "week_year": iso.year() },
+        "days_in_month": days_in_month(year, month)?,
+    }))
 }
 
-/// Converts a `ms` instant to epoch seconds.
-fn date_unix(payload: &Value) -> Result<Value, String> {
-    let millis = field_i64(payload, "ms")?;
-    let secs = millis
-        .checked_div(MILLIS_PER_SECOND)
-        .ok_or_else(|| "timestamp overflow".to_owned())?;
-    Ok(Value::from(secs))
+/// Returns the period boundary (`start`/`end`) for `{ms, unit, zone?}` as epoch millis, computed
+/// in the optional `zone` (UTC when absent). `unit` ∈ `day|week|month|quarter|year`.
+fn datetime_boundary(payload: &Value, end: bool) -> Result<Value, String> {
+    let unit = field_str(payload, "unit")?;
+    let tz = resolve_zone(payload)?;
+    let local = instant(field_i64(payload, "ms")?)?
+        .with_timezone(&tz)
+        .naive_local()
+        .date();
+    let target = boundary_date(local, unit, end)?;
+    let naive = if end {
+        target.and_hms_milli_opt(23, 59, 59, 999)
+    } else {
+        target.and_hms_milli_opt(0, 0, 0, 0)
+    }
+    .ok_or_else(|| "invalid boundary time".to_owned())?;
+    Ok(Value::from(from_local(tz, naive)?))
+}
+
+/// The boundary calendar date for `unit` (start, or end when `end`), given the local date.
+fn boundary_date(date: NaiveDate, unit: &str, end: bool) -> Result<NaiveDate, String> {
+    match unit {
+        "day" => Ok(date),
+        "week" => week_boundary(date, end),
+        "month" => month_boundary(date, end),
+        "quarter" => quarter_boundary(date, end),
+        "year" => year_boundary(date, end),
+        other => Err(format!("unknown boundary unit: '{other}'")),
+    }
+}
+
+/// Monday of `date`'s ISO week, or the following Sunday when `end`.
+fn week_boundary(date: NaiveDate, end: bool) -> Result<NaiveDate, String> {
+    let back = u64::from(date.weekday().num_days_from_monday());
+    let monday = date
+        .checked_sub_days(Days::new(back))
+        .ok_or_else(|| "week boundary out of range".to_owned())?;
+    if end {
+        monday
+            .checked_add_days(Days::new(6))
+            .ok_or_else(|| "week boundary out of range".to_owned())
+    } else {
+        Ok(monday)
+    }
+}
+
+/// The first (or last, when `end`) day of `date`'s month.
+fn month_boundary(date: NaiveDate, end: bool) -> Result<NaiveDate, String> {
+    let day = if end {
+        days_in_month(date.year(), date.month())?
+    } else {
+        1
+    };
+    date.with_day(day)
+        .ok_or_else(|| "month boundary out of range".to_owned())
+}
+
+/// The first (or last, when `end`) day of `date`'s calendar quarter.
+fn quarter_boundary(date: NaiveDate, end: bool) -> Result<NaiveDate, String> {
+    let zero_based = date
+        .month()
+        .checked_sub(1)
+        .ok_or_else(|| "quarter boundary out of range".to_owned())?;
+    let first_of_quarter = zero_based
+        .checked_div(3)
+        .and_then(|qtr| qtr.checked_mul(3))
+        .and_then(|mon| mon.checked_add(1))
+        .ok_or_else(|| "quarter boundary out of range".to_owned())?;
+    let month = if end {
+        first_of_quarter
+            .checked_add(2)
+            .ok_or_else(|| "quarter boundary out of range".to_owned())?
+    } else {
+        first_of_quarter
+    };
+    let anchored = date
+        .with_day(1)
+        .and_then(|first| first.with_month(month))
+        .ok_or_else(|| "quarter boundary out of range".to_owned())?;
+    if end {
+        month_boundary(anchored, true)
+    } else {
+        Ok(anchored)
+    }
+}
+
+/// January 1 (or December 31, when `end`) of `date`'s year.
+fn year_boundary(date: NaiveDate, end: bool) -> Result<NaiveDate, String> {
+    let (month, day) = if end { (12, 31) } else { (1, 1) };
+    date.with_month(month)
+        .and_then(|anchored| anchored.with_day(day))
+        .ok_or_else(|| "year boundary out of range".to_owned())
+}
+
+/// Formats a `ms` instant as an RFC 3339 string — `Z` in UTC (no `zone`), else the zone's offset.
+fn datetime_iso(payload: &Value) -> Result<Value, String> {
+    let instant = instant(field_i64(payload, "ms")?)?;
+    match payload.get("zone").and_then(Value::as_str) {
+        None => Ok(Value::String(
+            instant.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        )),
+        Some(name) => {
+            let tz = parse_zone(name)?;
+            Ok(Value::String(
+                instant
+                    .with_timezone(&tz)
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, false),
+            ))
+        }
+    }
+}
+
+/// Formats `{ms, pattern, zone?}` with a locale-neutral numeric token dialect (`YYYY MM DD HH mm ss
+/// SSS YY`). Any other character is a literal — no locale-language month/day names are produced.
+fn datetime_format(payload: &Value) -> Result<Value, String> {
+    let tz = resolve_zone(payload)?;
+    let zoned = instant(field_i64(payload, "ms")?)?.with_timezone(&tz);
+    let pattern = field_str(payload, "pattern")?;
+    Ok(Value::String(render_pattern(pattern, &zoned)))
+}
+
+/// Substitutes the numeric field tokens in `pattern` with zero-padded values from `zoned`,
+/// greedily matching the longest token first; unmatched characters pass through verbatim.
+fn render_pattern<T: TimeZone>(pattern: &str, zoned: &DateTime<T>) -> String {
+    let year = zoned.year();
+    let two_digit_year = year.rem_euclid(100);
+    let tokens: [(&str, String); 8] = [
+        ("YYYY", format!("{year:04}")),
+        ("SSS", format!("{:03}", zoned.timestamp_subsec_millis())),
+        ("YY", format!("{two_digit_year:02}")),
+        ("MM", format!("{:02}", zoned.month())),
+        ("DD", format!("{:02}", zoned.day())),
+        ("HH", format!("{:02}", zoned.hour())),
+        ("mm", format!("{:02}", zoned.minute())),
+        ("ss", format!("{:02}", zoned.second())),
+    ];
+    let mut out = String::with_capacity(pattern.len());
+    let mut rest = pattern;
+    'scan: while !rest.is_empty() {
+        for (token, value) in &tokens {
+            if let Some(tail) = rest.strip_prefix(token) {
+                out.push_str(value);
+                rest = tail;
+                continue 'scan;
+            }
+        }
+        let mut chars = rest.chars();
+        if let Some(ch) = chars.next() {
+            out.push(ch);
+            rest = chars.as_str();
+        }
+    }
+    out
 }
 
 /// Computes `a - b` and breaks the gap into days/hours/minutes/seconds.
-fn date_diff(payload: &Value) -> Result<Value, String> {
+fn datetime_diff(payload: &Value) -> Result<Value, String> {
     let first = field_i64(payload, "a")?;
     let second = field_i64(payload, "b")?;
     let total_ms = first
         .checked_sub(second)
-        .ok_or_else(|| "date diff overflow".to_owned())?;
+        .ok_or_else(|| "datetime diff overflow".to_owned())?;
     let total_seconds = total_ms
         .checked_div(MILLIS_PER_SECOND)
         .ok_or_else(|| "timestamp overflow".to_owned())?;
@@ -437,6 +676,58 @@ fn date_diff(payload: &Value) -> Result<Value, String> {
         "minutes": minutes,
         "seconds": seconds,
     }))
+}
+
+/// Reconstructs a `DateTime<Utc>` from epoch millis, erroring if out of range.
+fn instant(ms: i64) -> Result<DateTime<Utc>, String> {
+    DateTime::<Utc>::from_timestamp_millis(ms).ok_or_else(|| "timestamp out of range".to_owned())
+}
+
+/// Resolves the optional IANA `zone` field to a timezone (UTC when absent). Unknown name → error.
+fn resolve_zone(payload: &Value) -> Result<Tz, String> {
+    payload
+        .get("zone")
+        .and_then(Value::as_str)
+        .map_or(Ok(Tz::UTC), parse_zone)
+}
+
+/// Parses an IANA timezone name; an unrecognized name is a developer error.
+fn parse_zone(name: &str) -> Result<Tz, String> {
+    name.parse::<Tz>()
+        .map_err(|_err| format!("unknown timezone: '{name}'"))
+}
+
+/// Localizes a naive datetime into `tz` and returns its epoch millis, taking the earliest instant
+/// for a fold (DST fall-back) and erroring on a gap (a local time that does not exist).
+fn from_local(tz: Tz, naive: NaiveDateTime) -> Result<i64, String> {
+    tz.from_local_datetime(&naive)
+        .earliest()
+        .map(|dt| dt.timestamp_millis())
+        .ok_or_else(|| "local time does not exist in the given zone".to_owned())
+}
+
+/// The number of days in the given calendar month (handles leap Februaries).
+fn days_in_month(year: i32, month: u32) -> Result<u32, String> {
+    let (next_year, next_month) = if month >= 12 {
+        (
+            year.checked_add(1)
+                .ok_or_else(|| "year out of range".to_owned())?,
+            1,
+        )
+    } else {
+        (
+            year,
+            month
+                .checked_add(1)
+                .ok_or_else(|| "month out of range".to_owned())?,
+        )
+    };
+    let first_of_next = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+        .ok_or_else(|| "invalid date".to_owned())?;
+    Ok(first_of_next
+        .pred_opt()
+        .ok_or_else(|| "date out of range".to_owned())?
+        .day())
 }
 
 /// Breaks an absolute second count into (days, hours, minutes, seconds).

@@ -79,49 +79,11 @@
     url: codec("url_encode", "url_decode"),
   };
 
-  // ---- $sys.date ---------------------------------------------------------
-  function d(op, payload) { return call("date", op, payload); }
-
-  // Sum a {weeks,days,hours,minutes,seconds,ms} duration into milliseconds.
-  function durationMs(delta) {
-    var x = delta || {};
-    var weeks = x.weeks || 0;
-    var days = x.days || 0;
-    var hours = x.hours || 0;
-    var minutes = x.minutes || 0;
-    var seconds = x.seconds || 0;
-    var ms = x.ms || 0;
-    return ((((weeks * 7 + days) * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000 + ms;
-  }
-
-  function DateObj(ms) { this.ms = ms; }
-  DateObj.prototype.add = function (delta) {
-    return new DateObj(d("add", { ms: this.ms, delta_ms: durationMs(delta) }));
-  };
-  DateObj.prototype.sub = function (delta) {
-    return new DateObj(d("add", { ms: this.ms, delta_ms: -durationMs(delta) }));
-  };
-  DateObj.prototype.diff = function (other) {
-    return d("diff", { a: this.ms, b: other instanceof DateObj ? other.ms : Number(other) });
-  };
-  DateObj.prototype.iso = function () { return d("iso", { ms: this.ms }); };
-  DateObj.prototype.unix = function () { return d("unix", { ms: this.ms }); };
-  DateObj.prototype.epochMs = function () { return this.ms; };
-  // json()/JSON.stringify serialize a date as its ISO string.
-  DateObj.prototype.toJSON = function () { return this.iso(); };
-  DateObj.prototype.toString = function () { return this.iso(); };
-
-  var date = {
-    now: function () { return new DateObj(d("now", {})); },
-    parse: function (input) {
-      if (input instanceof DateObj) return input;
-      return new DateObj(d("parse", { input: input }));
-    },
-  };
+  // NOTE: date/time is no longer under `$sys`. It is the first-class top-level `datetime`
+  // value-util (see `js/datetime.js`), which rides the same `__sys("datetime", …)` bridge.
 
   globalThis.$sys = globalThis.$sys || {};
   $sys.crypto = crypto;
-  $sys.date = date;
   // env/secrets default to empty; Rust overwrites them when config.sys is sent.
   // env holds plain returnable values; secrets become opaque handles (plaintext
   // stays in Rust) — returning one yields "[secret:NAME]", never the value.
