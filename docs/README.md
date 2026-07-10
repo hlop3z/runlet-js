@@ -38,7 +38,9 @@ Read these in order. Each one is short.
    period boundaries, and **timezone-correct** answers. Always on. 📅
 8. **[Hasura — GraphQL the easy way](11-hasura.md)** — the `hasura/client` module:
    query Hasura with one line and never miss a hidden GraphQL error. 🚀
-9. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+9. **[`text` — tidy strings the easy way](12-text.md)** — clean, pad, slug, and mask
+   strings with Python-style names (`lower`, `strip`, `zfill`, `slugify`). Always on. ✂️
+10. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
    something fails, and how to read it. 🚦
 
 ## The super-powers 🦸

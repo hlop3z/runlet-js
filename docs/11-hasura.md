@@ -91,4 +91,4 @@ them from config, which your script could read anyway). That makes it a perfect
 **helper module** rather than a Rust super-power. See [Authoring modules](modules.md)
 to write your own.
 
-**Next:** [When things go wrong (Errors) →](99-errors.md)
+**Next:** [`text` — tidy strings the easy way →](12-text.md)
