@@ -33,4 +33,4 @@
 - [x] 5.1 Update the `/batch` section of `docs/` and `README.md` with the `before`/`shared`/`after` lifecycle and the AI-era use cases (eval harness, best-of-N, structured-output validation, agentic fan-out). (README.md "Lifecycle" subsection + a friendly pointer in docs/README.md.)
 - [x] 5.2 Add a `docs/design/` note (or link design.md) capturing the deferred Model X store and the rejected blocking `once()` primitive, so the seam is discoverable. (`docs/design/batch-lifecycle.md`.)
 - [x] 5.3 Run `task clippy` (until clean) and the box-only Python harness; extend `tests/test_simple.py` with a lifecycle section if an end-to-end assertion is warranted. (Clippy clean; `tests/test_simple.py` gained a lifecycle subsection; the four behaviors were also verified live against a loopback box over HTTP.)
-- [ ] 5.4 `/opsx:sync` the `batch-execution` delta into the main spec, then `/opsx:archive`.
+- [x] 5.4 `/opsx:sync` the `batch-execution` delta into the main spec, then `/opsx:archive`.
