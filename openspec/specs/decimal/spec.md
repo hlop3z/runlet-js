@@ -163,23 +163,23 @@ The system SHALL provide comparison helpers (`cmp`, `eq`, `lt`, `lte`, `gt`, `gt
 - **WHEN** a handler evaluates `Decimal("0").is_zero()`
 - **THEN** the result is `true`
 
-### Requirement: snake_case naming with deprecated aliases
+### Requirement: snake_case naming (no aliases)
 
-Every author-facing method on `Decimal` SHALL be named in snake_case. The methods that were
-previously camelCase (`isZero`, `isNegative`, `toNumber`) SHALL be renamed to their snake_case forms
-(`is_zero`, `is_negative`, `to_number`) and the old camelCase spellings SHALL remain available as
-**deprecated aliases** for one release. The JS-runtime protocol hooks the engine invokes by fixed
-name (`toString`, `toJSON`, `valueOf`) SHALL keep their JS spelling.
+Every author-facing method on `Decimal` SHALL be named in snake_case (`is_zero`, `is_negative`,
+`to_number`, etc.). The former camelCase spellings `isZero`, `isNegative`, and `toNumber` SHALL NOT
+be available — they are removed, not retained as aliases, so the surface has exactly one canonical
+name per operation. The JS-runtime protocol hooks the engine invokes by fixed name (`toString`,
+`toJSON`, `valueOf`) SHALL keep their JS spelling.
 
 #### Scenario: snake_case is canonical
 
 - **WHEN** a handler calls `Decimal("5").is_zero()` and `Decimal("5").to_number()`
-- **THEN** both resolve to the snake_case methods
+- **THEN** both resolve to the snake_case methods and return the expected results
 
-#### Scenario: camelCase alias still works (deprecated)
+#### Scenario: Removed camelCase alias is absent
 
 - **WHEN** a handler calls the legacy `Decimal("5").isZero()`
-- **THEN** it returns the same result as `is_zero()` (retained as a deprecated alias)
+- **THEN** it throws a `TypeError` (the camelCase alias no longer exists); the handler uses `is_zero()` instead
 
 #### Scenario: Protocol hooks keep JS spelling
 

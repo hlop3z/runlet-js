@@ -428,8 +428,8 @@ compares, `to_string()` / `to_number()`. `Decimal("0.1").add("0.2")` is exactly 
 
 Holds ~28–29 significant digits. Divide-by-zero, currency mismatch, unknown currency, and
 overflow throw. **`$` is no longer a bare decimal** — that's `Decimal` now; `.toCents()` →
-money `.to_minor()`. Old camelCase names (`isZero`/`toNumber`) remain as deprecated aliases for
-one release. See [`docs/05-decimal.md`](docs/05-decimal.md).
+money `.to_minor()`. The old camelCase names (`isZero`/`isNegative`/`toNumber`) have been
+**removed** — use `is_zero`/`is_negative`/`to_number`. See [`docs/05-decimal.md`](docs/05-decimal.md).
 
 ### http.get / post / put / patch / delete
 
@@ -730,9 +730,13 @@ immutable, chainable collections. The surface is **field-name-first with no call
 takes a field-name string or a match-by-example object — using the SQL / Shopify-Liquid vocabulary
 (`where`/`sort_by`/`group_by`/`column`/`unique`/`sum`, `get`/`pick`/`omit`/`merge`). Pure and
 unmetered — injected identically under the deterministic profile (nothing to remove; no random-order
-verb exists). Column aggregates (`sum`/`avg`/`min`/`max`) return an exact `Decimal`, so a currency
-column is never float-summed. `group_by` returns a `dict`; `dict.entries`/`keys`/`values` return a
-`list`. The engine removes `Proxy`, so items are read with `.get(i)`/`.at(i)`, not `[i]`.
+verb exists). The verbs are **value-util-aware**: `sort_by` orders `money`/`decimal` numerically and
+`datetime` chronologically (never lexically), and `group_by`/`unique`/`unique_by`/`where` key/match
+on a canonical value (`money` by amount **and** currency). Column aggregates (`sum`/`avg`/`min`/`max`)
+return an exact `Decimal` for a numeric column and a **currency-preserving `money`** for a `money`
+column (mixing currencies throws), so a currency column is never float-summed or silently dropped.
+`group_by` returns a `dict`; `dict.entries`/`keys`/`values` return a `list`. The engine removes
+`Proxy`, so items are read with `.get(i)`/`.at(i)`, not `[i]`.
 
 ```js
 function handler(ctx) {

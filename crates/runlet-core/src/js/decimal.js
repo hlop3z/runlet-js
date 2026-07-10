@@ -53,10 +53,11 @@
   // Lets json()/JSON.stringify serialize a decimal as its exact string value.
   Dec.prototype.toJSON = function () { return this.v; };
 
-  // Deprecated camelCase aliases (removed one release later) — delegate to snake_case.
-  Dec.prototype.isZero = function () { return this.is_zero(); };
-  Dec.prototype.isNegative = function () { return this.is_negative(); };
-  Dec.prototype.toNumber = function () { return this.to_number(); };
+  // Internal interop hooks the `list` verbs read (not author-facing, absent from base.d.ts):
+  // __order_key → an exact ordering value (the Decimal itself); __id_key → a canonical identity
+  // string for grouping/dedup/equality.
+  Dec.prototype.__order_key = function () { return this; };
+  Dec.prototype.__id_key = function () { return this.v; };
 
   function make(value) {
     if (value instanceof Dec) return value;

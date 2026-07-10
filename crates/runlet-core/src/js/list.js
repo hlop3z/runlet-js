@@ -52,6 +52,48 @@
     return null;
   }
 
+  // ---- value-util interop protocol --------------------------------------
+  // The shaping/aggregate verbs treat value-util wrappers (money/decimal/datetime/text) by their
+  // CANONICAL value, never by JS reference identity or default string coercion. Each wrapper exposes
+  // two internal hooks (__order_key / __id_key); these resolvers prefer them and fall back to the
+  // raw value for plain scalars. Kept here so no verb branches on wrapper type directly.
+
+  // A money value (branded via money._Money, mirroring Decimal._Dec), or null.
+  function money_of(v) {
+    var M = globalThis.money;
+    var Ctor = M && M._Money;
+    return Ctor && v instanceof Ctor ? v : null;
+  }
+
+  // An ordering key: a wrapper's __order_key (exact Decimal / epoch ms / string) or the raw scalar.
+  function order_of(v) {
+    return v !== null && v !== undefined && typeof v.__order_key === "function"
+      ? v.__order_key()
+      : v;
+  }
+  // Compare two ordering keys; Decimal keys compare exactly, everything else natively.
+  function cmp_order(a, b) {
+    var oa = order_of(a), ob = order_of(b);
+    var Decimal = globalThis.Decimal;
+    if (Decimal && Decimal._Dec && oa instanceof Decimal._Dec && ob instanceof Decimal._Dec) {
+      return oa.cmp(ob);
+    }
+    return oa < ob ? -1 : oa > ob ? 1 : 0;
+  }
+
+  // An identity key for grouping/dedup/equality: a wrapper's __id_key (a distinguishing string,
+  // currency-inclusive for money) or the raw scalar.
+  function id_of(v) {
+    return v !== null && v !== undefined && typeof v.__id_key === "function" ? v.__id_key() : v;
+  }
+  function id_eq(a, b) { return id_of(a) === id_of(b); }
+
+  // An aggregatable value for a column: a money value, else a Decimal, else null (skip).
+  function agg_of(v) {
+    var m = money_of(v);
+    return m !== null ? m : num_of(v);
+  }
+
   // ---- unwrap / interop -------------------------------------------------
   // A defensive copy so a caller cannot mutate our backing array.
   Lst.prototype.to_array = function () { return this.arr.slice(); };
@@ -76,7 +118,8 @@
   };
 
   // ---- field-name-first shaping (no callbacks) --------------------------
-  // Keep records where every field:value pair in `match` strictly equals the record's field.
+  // Keep records where every field:value pair in `match` equals the record's field by CANONICAL
+  // value (so a money/decimal/datetime/text field matches an equal wrapper, not just the same ref).
   Lst.prototype.where = function (match) {
     var m = match || {};
     var keys = Object.keys(m);
@@ -85,7 +128,7 @@
       var rec = this.arr[i];
       var ok = true;
       for (var k = 0; k < keys.length; k++) {
-        if (field_of(rec, keys[k]) !== m[keys[k]]) { ok = false; break; }
+        if (!id_eq(field_of(rec, keys[k]), m[keys[k]])) { ok = false; break; }
       }
       if (ok) out.push(rec);
     }
@@ -93,16 +136,13 @@
   };
 
   // Stable sort by a named field (ascending; "desc" for descending). No field → sort the elements
-  // themselves. Operates on a copy so the receiver is never mutated.
+  // themselves. Wrapper fields order by their canonical value (decimal/money numerically, datetime
+  // chronologically), never lexically. Operates on a copy so the receiver is never mutated.
   Lst.prototype.sort_by = function (field, direction) {
     var dir = direction === "desc" ? -1 : 1;
     var copy = this.arr.slice();
     copy.sort(function (a, b) {
-      var av = field_of(a, field);
-      var bv = field_of(b, field);
-      if (av < bv) return -1 * dir;
-      if (av > bv) return 1 * dir;
-      return 0; // ties keep input order (stable sort)
+      return cmp_order(field_of(a, field), field_of(b, field)) * dir; // 0 ⇒ stable (input order)
     });
     return wrap(copy);
   };
@@ -114,35 +154,38 @@
     return wrap(out);
   };
 
-  // Distinct scalars by value (first occurrence wins).
+  // Distinct scalars by canonical value (first occurrence wins). Equal wrapper values (money by
+  // amount+currency, decimal/datetime/text by value) collapse; distinct currencies stay distinct.
   Lst.prototype.unique = function () {
     var seen = new Set();
     var out = [];
     for (var i = 0; i < this.arr.length; i++) {
       var v = this.arr[i];
-      if (!seen.has(v)) { seen.add(v); out.push(v); }
+      var key = id_of(v);
+      if (!seen.has(key)) { seen.add(key); out.push(v); }
     }
     return wrap(out);
   };
 
-  // Distinct records by a named field's value (first occurrence wins).
+  // Distinct records by a named field's canonical value (first occurrence wins).
   Lst.prototype.unique_by = function (field) {
     var seen = new Set();
     var out = [];
     for (var i = 0; i < this.arr.length; i++) {
-      var key = field_of(this.arr[i], field);
+      var key = id_of(field_of(this.arr[i], field));
       if (!seen.has(key)) { seen.add(key); out.push(this.arr[i]); }
     }
     return wrap(out);
   };
 
   // ---- list → dict bridge -----------------------------------------------
-  // Group records into a dict of lists, keyed by the stringified field value, input order kept.
+  // Group records into a dict of lists, keyed by the field's CANONICAL value (money keeps its
+  // currency in the key, so USD 19.99 ≠ EUR 19.99), input order kept within each group.
   Lst.prototype.group_by = function (field) {
     var groups = {};
     var order = [];
     for (var i = 0; i < this.arr.length; i++) {
-      var key = String(field_of(this.arr[i], field));
+      var key = String(id_of(field_of(this.arr[i], field)));
       if (!Object.prototype.hasOwnProperty.call(groups, key)) {
         groups[key] = [];
         order.push(key);
@@ -154,39 +197,54 @@
     return globalThis.dict(out);
   };
 
-  // ---- exact-Decimal aggregates over a named column ---------------------
+  // ---- exact aggregates over a named column -----------------------------
+  // Over a number/numeric-string/Decimal column these fold to an exact Decimal; over a `money`
+  // column they return a `money` PRESERVING the currency and THROW on mixed currencies (reusing
+  // money's same-currency guard). A column is treated as money once any money value is seen; other
+  // values are then skipped. Non-aggregatable values (blanks/non-numeric) are always skipped.
   Lst.prototype.sum = function (field) {
-    var total = globalThis.Decimal(0);
+    var money_total = null;
+    var dec_total = globalThis.Decimal(0);
     for (var i = 0; i < this.arr.length; i++) {
-      var d = num_of(field_of(this.arr[i], field));
-      if (d !== null) total = total.add(d);
+      var v = field_of(this.arr[i], field);
+      var m = money_of(v);
+      if (m !== null) { money_total = money_total === null ? m : money_total.add(m); continue; }
+      if (money_total !== null) continue; // numeric stray in a money column
+      var d = num_of(v);
+      if (d !== null) dec_total = dec_total.add(d);
     }
-    return total;
+    return money_total !== null ? money_total : dec_total;
   };
   Lst.prototype.avg = function (field) {
-    var total = globalThis.Decimal(0);
-    var n = 0;
+    var money_total = null, money_n = 0;
+    var dec_total = globalThis.Decimal(0), dec_n = 0;
     for (var i = 0; i < this.arr.length; i++) {
-      var d = num_of(field_of(this.arr[i], field));
-      if (d !== null) { total = total.add(d); n++; }
+      var v = field_of(this.arr[i], field);
+      var m = money_of(v);
+      if (m !== null) { money_total = money_total === null ? m : money_total.add(m); money_n++; continue; }
+      if (money_total !== null) continue;
+      var d = num_of(v);
+      if (d !== null) { dec_total = dec_total.add(d); dec_n++; }
     }
-    return n === 0 ? null : total.div(n);
+    if (money_total !== null) return money_total.div(money_n);
+    return dec_n === 0 ? null : dec_total.div(dec_n);
   };
-  Lst.prototype.min = function (field) {
+  // min/max over an aggregatable column; money columns compare same-currency (throw on mismatch)
+  // and return money, Decimal columns return Decimal.
+  function extremum(arr, field, keep_left) {
     var best = null;
-    for (var i = 0; i < this.arr.length; i++) {
-      var d = num_of(field_of(this.arr[i], field));
-      if (d !== null && (best === null || d.lt(best))) best = d;
+    for (var i = 0; i < arr.length; i++) {
+      var val = agg_of(field_of(arr[i], field));
+      if (val === null) continue;
+      if (best === null || keep_left(val.cmp(best))) best = val;
     }
     return best;
+  }
+  Lst.prototype.min = function (field) {
+    return extremum(this.arr, field, function (c) { return c < 0; });
   };
   Lst.prototype.max = function (field) {
-    var best = null;
-    for (var i = 0; i < this.arr.length; i++) {
-      var d = num_of(field_of(this.arr[i], field));
-      if (d !== null && (best === null || d.gt(best))) best = d;
-    }
-    return best;
+    return extremum(this.arr, field, function (c) { return c > 0; });
   };
   Lst.prototype.count = function () { return this.arr.length; };
 

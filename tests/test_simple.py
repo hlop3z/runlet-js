@@ -260,7 +260,7 @@ def test_money(t: Runner):
     t.test("Decimal round half_even",  h("return json(Decimal('2.5').round(0, 'half_even').toString(), null);"), data_eq("2"))
     t.test("Decimal round_to cash",    h("return json(Decimal('2.03').round_to('0.05').toString(), null);"), data_eq("2.05"))
     t.test("Decimal clamp",            h("return json(Decimal('120').clamp(0, 100).toString(), null);"), data_eq("100"))
-    t.test("deprecated isZero alias",  h("return json(Decimal('0').isZero(), null);"), data_eq(True))
+    t.test("removed isZero alias gone", h("return json(typeof Decimal('0').isZero !== 'function', null);"), data_eq(True))
     # Money — an invoice with tax, end to end through /execute.
     t.test("invoice with tax",
            h("var gross = $('100.00','USD').add_pct(8.25); return json({total: gross.to_string(), cents: gross.to_minor(), fmt: gross.format()}, null);"),
@@ -320,6 +320,38 @@ def test_datetime(t: Runner):
     t.test("unknown zone throws",
            h("try { datetime.parse('2026-07-10T00:00:00Z').in_zone('Mars/Phobos'); return json(null,'no throw'); } catch(e){ return json({caught:true}, null); }"),
            lambda r: r["data"] == {"caught": True})
+
+
+def test_list_interop(t: Runner):
+    t.section("list value-util interop (money / datetime wrappers)")
+    # A money column sums to a money value (currency preserved), not a bare Decimal, and never 0.
+    t.test("sum of a money column returns money",
+           h("var rows=[{price:$('0.10','USD')},{price:$('0.20','USD')}]; var s=list(rows).sum('price'); return json({fmt:s.format(), cur:s.currency()}, null);"),
+           lambda r: r["data"] == {"fmt": "$0.30", "cur": "USD"})
+    # Mixing currencies in a summed column throws (no silent conversion).
+    t.test("mixed-currency sum throws",
+           h("try { list([{p:$('1','USD')},{p:$('1','EUR')}]).sum('p'); return json(null,'no throw'); } catch(e){ return json({caught:true}, null); }"),
+           lambda r: r["data"] == {"caught": True})
+    # sort_by orders money numerically, not lexically ("100.00" would sort before "19.99" as a string).
+    t.test("sort_by money is numeric not lexical",
+           h("var rows=[{t:$('100.00','USD')},{t:$('19.99','USD')},{t:$('5.00','USD')}]; return json(list(rows).sort_by('t').column('t').to_array().map(function(m){return m.to_string();}), null);"),
+           lambda r: r["data"] == ["5.00", "19.99", "100.00"])
+    # group_by keeps currency distinct — USD 19.99 and EUR 19.99 are separate groups.
+    t.test("group_by keeps currency distinct",
+           h("return json(list([{p:$('19.99','USD')},{p:$('19.99','EUR')}]).group_by('p').keys().len(), null);"),
+           data_eq(2))
+    # unique dedupes equal money by amount+currency; a differing currency survives.
+    t.test("unique dedupes equal money",
+           h("return json(list([$('1','USD'),$('1','USD'),$('1','EUR')]).unique().len(), null);"),
+           data_eq(2))
+    # min/max over a money column return money values (currency kept).
+    t.test("min/max over money return money",
+           h("var rows=[{t:$('5','USD')},{t:$('2','USD')}]; var mn=list(rows).min('t'); var mx=list(rows).max('t'); return json({mn:mn.to_string()+' '+mn.currency(), mx:mx.to_string()+' '+mx.currency()}, null);"),
+           lambda r: r["data"] == {"mn": "2 USD", "mx": "5 USD"})
+    # datetime columns sort chronologically, not by string.
+    t.test("sort_by datetime is chronological",
+           h("var rows=[{d:datetime.parse('2026-03-01T00:00:00Z')},{d:datetime.parse('2026-01-15T00:00:00Z')},{d:datetime.parse('2026-02-20T00:00:00Z')}]; return json(list(rows).sort_by('d').column('d').to_array().map(function(x){return x.month();}), null);"),
+           lambda r: r["data"] == [1, 2, 3])
 
 
 def test_user_errors(t: Runner):
@@ -1535,6 +1567,7 @@ def main():
     test_functionality(t)
     test_money(t)
     test_datetime(t)
+    test_list_interop(t)
     test_user_errors(t)
     test_exceptions(t)
     test_sandbox(t)

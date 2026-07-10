@@ -217,6 +217,11 @@
   // json()/JSON.stringify serialize the plain string, never a wrapper object.
   Text.prototype.toJSON = function () { return this.value; };
 
+  // Internal interop hooks the `list` verbs read (not author-facing, absent from base.d.ts):
+  // __order_key → the string (lexical ordering); __id_key → the string (grouping/dedup/equality).
+  Text.prototype.__order_key = function () { return this.value; };
+  Text.prototype.__id_key = function () { return this.value; };
+
   // ---- factory ----------------------------------------------------------
   // text(input) wraps a value as a string; an existing text value is returned as-is.
   function make(input) {

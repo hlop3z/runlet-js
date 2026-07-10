@@ -158,6 +158,12 @@
   DateTime.prototype.toJSON = function () { return call("iso", { ms: this.ms }); };
   DateTime.prototype.toString = function () { return call("iso", { ms: this.ms }); };
 
+  // Internal interop hooks the `list` verbs read (not author-facing, absent from base.d.ts):
+  // __order_key → the canonical instant (epoch ms) for chronological ordering; __id_key → the
+  // canonical UTC ISO string (never the view zone) for grouping/dedup/equality.
+  DateTime.prototype.__order_key = function () { return this.ms; };
+  DateTime.prototype.__id_key = function () { return call("iso", { ms: this.ms }); };
+
   // ---- factory ----------------------------------------------------------
   function parse(input) {
     if (isDateTime(input)) return new DateTime(input.ms); // canonicalize: drop any view zone
