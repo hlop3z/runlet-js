@@ -6,7 +6,11 @@ The `/batch` endpoint runs multiple client-supplied executions in one request, r
 order-preserving `results` array where each entry is the same `{data, error, meta}` envelope a
 single `/execute` produces. Items execute independently (no atomicity), each passing the full
 per-request admission/limits/accounting machinery, under batch-level and per-batch resource
-caps so a batch is never a cheaper or unbounded unit of work than N single requests.
+caps so a batch is never a cheaper or unbounded unit of work than N single requests. An optional
+`before`/`shared`/`after` lifecycle adds a one-time setup phase whose output is an immutable
+shared context every item reads, and a one-time reduce phase over the results — coordination by
+phasing (the phases run alone) rather than locking, so items stay pure and no new concurrency
+failure mode is introduced.
 
 ## Requirements
 
@@ -117,3 +121,107 @@ request-category error before any item is admitted or executed.
 
 - **WHEN** a batch within the caps contains one item with both `script` and `key`
 - **THEN** that item's entry carries error code `SCRIPT_XOR_KEY` and the remaining items execute normally
+
+### Requirement: Optional phased lifecycle
+
+The `/batch` request SHALL accept three optional fields in addition to `items`:
+`before` and `after` — each an invocation with the single-execute shape (`script` XOR `key`,
+optional `context`, optional `config`) — and `shared`, a JSON object of read-only seed data.
+When none are present, the batch SHALL behave exactly as it does today (backward compatible) and
+its response SHALL carry no `summary`/`summary_error`. When present, execution SHALL proceed in
+three ordered phases: **`before`**, then the existing concurrent **items** fan-out, then
+**`after`**.
+
+#### Scenario: Batch without lifecycle fields is unchanged
+
+- **WHEN** a batch body contains only `items` (no `before`, `after`, or `shared`)
+- **THEN** it executes and responds identically to the pre-lifecycle behavior, with no `summary` and no `summary_error`
+
+#### Scenario: Phase ordering
+
+- **WHEN** a batch supplies `before`, `items`, and `after`
+- **THEN** `before` completes before any item begins, every item completes before `after` begins, and the items still fan out concurrently among themselves
+
+### Requirement: Immutable shared context
+
+When `before` and/or `shared` are supplied, the system SHALL construct a shared context from the
+`shared` seed object merged with `before`'s returned `data` (with `before`'s data taking precedence
+on key collisions), and SHALL expose it **read-only** to every item and to `after`. Items SHALL NOT
+be able to mutate the shared context or observe writes from sibling items through it; the context is
+fixed once `before` completes and is identical for every item. The serialized shared context SHALL be
+bounded by a configurable cap (`max_shared_bytes`); exceeding it aborts the batch as a `before`-phase
+barrier failure.
+
+#### Scenario: Items read the shared context
+
+- **WHEN** `before` returns data and each item reads the shared context
+- **THEN** every item observes the same shared context value produced by `before` plus the `shared` seed
+
+#### Scenario: Shared context is not a cross-item channel
+
+- **WHEN** one item attempts to write to the shared context and another item reads it
+- **THEN** the reader observes only the immutable value fixed at the end of `before` (no sibling write is visible), preserving item isolation
+
+#### Scenario: One-time shared fetch is not duplicated
+
+- **WHEN** `before` performs a single egress fetch and seeds its result into the shared context for a batch of N items
+- **THEN** the fetch executes exactly once for the whole batch, not once per item
+
+### Requirement: `before` is a barrier
+
+The `before` phase SHALL act as a barrier: if `before` fails (throws, times out, or is rejected
+by any per-invocation gate), the system SHALL abort the whole batch with a non-200 batch-level
+error and SHALL NOT execute any item or `after`.
+
+#### Scenario: before failure aborts the batch
+
+- **WHEN** a batch's `before` throws or times out
+- **THEN** the response is a non-200 batch-level error, no item executes, and `after` does not run
+
+### Requirement: `after` reduces results into a summary
+
+When `after` is supplied, it SHALL run once after all items complete and SHALL receive the
+order-preserving `results` array — the full per-item `{data, error, meta}` envelopes — as input. On
+success, `after`'s returned `data` SHALL be surfaced as a **top-level** batch `summary` (peer to
+`results`). If `after` fails, the batch SHALL still respond HTTP 200 with the per-item `results`
+intact and SHALL surface the failure as a **top-level** `summary_error` rather than failing the batch
+envelope. Both `summary` and `summary_error` SHALL be omitted when `after` is absent.
+
+#### Scenario: after produces the batch summary
+
+- **WHEN** `after` runs and returns a reduced value over the `results`
+- **THEN** the batch response carries that value as a top-level `summary` alongside the per-item `results`
+
+#### Scenario: after reads full per-item envelopes
+
+- **WHEN** `after` reduces a batch containing both succeeded and failed items
+- **THEN** it can read each item's `data`, `error`, and `meta` (not just `data`), so it can compute ok/failed breakdowns and inspect per-item errors
+
+#### Scenario: after failure does not fail successful items
+
+- **WHEN** every item succeeds but `after` throws
+- **THEN** the response is HTTP 200 with all per-item `results` present and a top-level `summary_error`, and no per-item result is altered
+
+### Requirement: Lifecycle invocations pass the per-invocation gates
+
+`before` and `after` SHALL each be treated as full invocations subject to the same per-invocation
+machinery as an item (input/size validation, identity, per-tenant quota debit, capability
+authorization, and — when events are enabled — usage/audit events); a lifecycle phase SHALL NOT be
+a cheaper unit of admission, quota, or billing than an item. I/O in `before`/`after` SHALL be gated
+by the execution profile exactly as it is for an item. Lifecycle phases SHALL NOT count against the
+`max_batch_items` cap — that cap governs only the fan-out width.
+
+#### Scenario: Lifecycle phases debit quota
+
+- **WHEN** a batch runs `before` and `after` in addition to its items
+- **THEN** quota is debited for the `before` and `after` invocations as well as each item, so a batch with lifecycle phases is never cheaper than the equivalent count of single requests
+
+#### Scenario: Lifecycle phases do not consume item slots
+
+- **WHEN** a batch supplies exactly `max_batch_items` items plus a `before` and an `after`
+- **THEN** the batch is still admitted — the lifecycle phases are fixed per-batch overhead, not counted against `max_batch_items`
+
+#### Scenario: I/O in a lifecycle phase is gated like an item
+
+- **WHEN** a batch's `before` names an egress resource that would be denied to an item (e.g. no egress is available, or the execution profile forbids I/O)
+- **THEN** the I/O is denied exactly as it would be for an item, and (being a `before` failure) it aborts the batch as a barrier
