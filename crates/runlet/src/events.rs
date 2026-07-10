@@ -2,24 +2,37 @@
 //!
 //! One unified, versioned envelope is emitted per request — a `usage` event for every executed
 //! request (billing/quota-tuning record) and an `audit` event for every request (allowed, or
-//! denied-with-reason at a gate; the compliance trail). Emission is **non-blocking and fail-open**:
-//! events are handed to a bounded channel via `try_send` and drained by a writer task that writes
-//! one JSON line per event to stdout (a dedicated event stream a collector routes on the envelope).
-//! On a full channel the event is dropped and a counter bumped — the request path never blocks.
+//! denied-with-reason at a gate; the compliance trail). Both ride a **precious** bounded channel,
+//! isolated from a **separate** lossy channel carrying diagnostic `log` events (D4), each drained by
+//! a writer task that writes one JSON line per event to stdout (a dedicated event stream a collector
+//! routes on the envelope).
+//!
+//! The precious usage/audit path is **bounded block-with-timeout** (billing-grade-event-hop / D1):
+//! [`Sink::record`] awaits [`mpsc::Sender::send_timeout`] up to a small, configurable window and
+//! only drops-and-counts if the channel is *still* saturated when the timeout expires — a
+//! momentarily full channel no longer silently drops a billing/audit event. Any drop is a genuine
+//! revenue/compliance leak, counted into `runlet_events_dropped_total` as an **SLO/alert** signal
+//! (D4), not a routine occurrence. The diagnostic `log` path ([`Sink::record_log`]) stays
+//! sync fire-and-forget `try_send` (best-effort, lossy). The request path is never blocked
+//! unboundedly — waiting is capped by the timeout.
 //!
 //! The [`Sink`] port + the per-event `event_id` (dedup key) are the seam a durable, billing-grade
-//! outbox drops into later without changing the emission sites (design D1/D3). Identity lives here
-//! in `runlet`, never in `runlet-core` (D6); tenant is an event dimension, never a metric label.
+//! outbox (the deferred redb `DurableSink`, D3) drops into later without changing the emission
+//! sites. Identity lives here in `runlet`, never in `runlet-core` (D6); tenant is an event
+//! dimension, never a metric label.
 
 use core::fmt;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 /// Schema version of the event envelope. Bump on any breaking envelope/body change so a durable
@@ -168,14 +181,19 @@ fn now_unix_millis() -> u128 {
         .map_or(0, |delta| delta.as_millis())
 }
 
-/// A non-blocking event sink. `record`/`record_log` must never block or fail the request path.
+/// An event sink. `record`/`record_log` must never fail the request path or block it *unboundedly*.
 /// `Debug` is required so `AppState` (which holds an `Arc<dyn Sink>`) can derive it.
 pub(crate) trait Sink: Send + Sync + fmt::Debug {
-    /// Hands a **precious** `usage`/`audit` event to the sink. Implementations drop (never await)
-    /// under backpressure.
-    fn record(&self, event: Event);
+    /// Hands a **precious** `usage`/`audit` event to the sink via bounded block-with-timeout (D1):
+    /// the returned future awaits capacity up to the sink's configured window and only
+    /// drops-and-counts if the channel is still saturated when the window expires. Returns a boxed
+    /// future so the trait stays `dyn`/`Debug` object-safe with **no new dependency** (no
+    /// `async_trait`); the caller `.await`s it from the async request handler (emission runs after
+    /// the `spawn_blocking` execution returns, never on a blocking thread).
+    fn record(&self, event: Event) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// Hands a **diagnostic** `log` event to the sink's **separate** channel (D4), so a chatty
-    /// script's logs can never starve `usage`/`audit`. Drops (never awaits) under backpressure.
+    /// script's logs can never starve `usage`/`audit`. Sync fire-and-forget: drops (never awaits)
+    /// under backpressure — diagnostics stay best-effort/lossy.
     fn record_log(&self, event: Event);
 }
 
@@ -185,21 +203,36 @@ pub(crate) trait Sink: Send + Sync + fmt::Debug {
 /// dropped counter, so log volume degrades only logs, never billing/audit.
 #[derive(Debug)]
 struct LogSink {
-    /// Bounded sender for `usage`/`audit` events.
+    /// Bounded sender for the **precious** `usage`/`audit` events.
     tx: mpsc::Sender<Event>,
-    /// Count of `usage`/`audit` events dropped (full/closed channel).
+    /// Count of `usage`/`audit` events dropped (channel still saturated at timeout / closed) — an
+    /// SLO/alert signal (D4), a genuine revenue/compliance leak, not a routine occurrence.
     dropped: Arc<AtomicU64>,
-    /// Bounded sender for diagnostic `log` events (the isolated channel).
+    /// Block-with-timeout window for the precious enqueue (D1/D5): how long `record` waits for
+    /// capacity before dropping-and-counting. Kept small (single-digit ms) so a stuck writer adds
+    /// at most this to a request's tail.
+    block_timeout: Duration,
+    /// Bounded sender for diagnostic `log` events (the isolated, lossy channel).
     log_tx: mpsc::Sender<Event>,
-    /// Count of `log` events dropped (full/closed channel).
+    /// Count of `log` events dropped (full/closed channel) — a routine best-effort gauge, unchanged.
     log_dropped: Arc<AtomicU64>,
 }
 
 impl Sink for LogSink {
-    fn record(&self, event: Event) {
-        if self.tx.try_send(event).is_err() {
-            let _ = self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
+    fn record(&self, event: Event) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            // Wait for capacity up to `block_timeout`; drop-and-count only on timeout (still
+            // saturated) or a closed channel. `send_timeout` returns the event inside the error,
+            // which we discard — the `event_id` dedup key means a downstream consumer never sees it.
+            if self
+                .tx
+                .send_timeout(event, self.block_timeout)
+                .await
+                .is_err()
+            {
+                let _ = self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        })
     }
 
     fn record_log(&self, event: Event) {
@@ -224,9 +257,15 @@ pub(crate) struct EventPipeline {
 
 impl EventPipeline {
     /// Spawns both writer tasks and returns the pipeline plus the [`Sink`] to place in `AppState`.
-    /// `bound` is the `usage`/`audit` channel capacity, `log_bound` the isolated log channel's;
-    /// beyond either, events on that channel are dropped (fail-open).
-    pub(crate) fn spawn(bound: usize, log_bound: usize) -> (Self, Arc<dyn Sink>) {
+    /// `bound` is the **precious** `usage`/`audit` channel capacity, `log_bound` the isolated log
+    /// channel's, and `block_timeout` the precious enqueue's block-with-timeout window (D1/D5):
+    /// the log channel drops immediately on backpressure, while the precious channel drops only if
+    /// still saturated when `block_timeout` expires.
+    pub(crate) fn spawn(
+        bound: usize,
+        log_bound: usize,
+        block_timeout: Duration,
+    ) -> (Self, Arc<dyn Sink>) {
         let (tx, rx) = mpsc::channel(bound.max(1));
         let (log_tx, log_rx) = mpsc::channel(log_bound.max(1));
         let dropped = Arc::new(AtomicU64::new(0));
@@ -234,6 +273,7 @@ impl EventPipeline {
         let sink: Arc<dyn Sink> = Arc::new(LogSink {
             tx,
             dropped: Arc::clone(&dropped),
+            block_timeout,
             log_tx,
             log_dropped: Arc::clone(&log_dropped),
         });
@@ -262,16 +302,31 @@ impl EventPipeline {
         Arc::clone(&self.log_dropped)
     }
 
-    /// Best-effort flush: the caller drops the last [`Sink`] (closing both channels) before calling
-    /// this, so each writer drains its remainder and exits, which this awaits.
+    /// Flushes the precious usage/audit channel (D1) then the log channel on shutdown: the caller
+    /// drops the last [`Sink`] (closing both channels) before calling this, so each writer drains
+    /// its remainder and exits, which this awaits. **Bounded** by [`Self::FLUSH_BUDGET`] so a stuck
+    /// writer can never hang process exit — on timeout we log and proceed (at-most a small buffered
+    /// window is lost, the same window the collector re-reads from stdout).
     pub(crate) async fn shutdown(self) {
-        if let Err(err) = self.writer.await {
-            tracing::warn!("event writer task join error: {err}");
+        match timeout(Self::FLUSH_BUDGET, self.writer).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!("event writer task join error: {err}"),
+            Err(_elapsed) => {
+                tracing::warn!("usage/audit event flush exceeded shutdown budget; proceeding");
+            }
         }
-        if let Err(err) = self.log_writer.await {
-            tracing::warn!("log event writer task join error: {err}");
+        match timeout(Self::FLUSH_BUDGET, self.log_writer).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!("log event writer task join error: {err}"),
+            Err(_elapsed) => {
+                tracing::warn!("log event flush exceeded shutdown budget; proceeding");
+            }
         }
     }
+
+    /// Upper bound on how long shutdown waits for each writer to drain its channel, so graceful
+    /// shutdown flushes the precious channel (D1) but can never hang on a stuck stdout writer.
+    const FLUSH_BUDGET: Duration = Duration::from_secs(5);
 }
 
 /// Drains events and writes one JSON line each to stdout until all senders drop.
@@ -295,10 +350,11 @@ mod tests {
     //! Envelope serialization + the non-blocking drop-on-full contract.
 
     use super::{
-        AtomicU64, AuditBody, CapabilityOps, Event, EventBody, LogBody, LogSink, Ordering, Sink,
-        UsageBody, Value, mpsc,
+        AtomicU64, AuditBody, CapabilityOps, Duration, Event, EventBody, EventPipeline, LogBody,
+        LogSink, Ordering, Sink, UsageBody, Value, mpsc,
     };
     use std::sync::Arc;
+    use std::time::Instant;
 
     /// A representative `usage` event.
     fn usage_event() -> Event {
@@ -376,11 +432,11 @@ mod tests {
         assert!(json.contains("\"reason\":\"QUOTA_EXCEEDED\""));
     }
 
-    /// `record` never blocks: once the bounded channel is full, further events are dropped and
-    /// counted rather than awaited.
-    #[test]
-    fn full_channel_drops_and_counts() {
-        // Capacity 1, receiver held but never drained.
+    /// `record` never blocks *unboundedly*: once the bounded channel is saturated past the
+    /// block-with-timeout window, further events are dropped-and-counted rather than awaited forever.
+    #[tokio::test]
+    async fn full_channel_drops_and_counts() {
+        // Capacity 1, receiver held but never drained → sustained saturation.
         let (tx, _rx) = mpsc::channel(1);
         let (log_tx, _log_rx) = mpsc::channel(1);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -388,24 +444,94 @@ mod tests {
         let sink = LogSink {
             tx,
             dropped: Arc::clone(&dropped),
+            block_timeout: Duration::from_millis(5),
             log_tx,
             log_dropped: Arc::clone(&log_dropped),
         };
-        sink.record(usage_event()); // fills the single slot
-        sink.record(usage_event()); // full → dropped
-        sink.record(usage_event()); // full → dropped
+        sink.record(usage_event()).await; // fills the single slot
+        sink.record(usage_event()).await; // still full at timeout → dropped
+        sink.record(usage_event()).await; // still full at timeout → dropped
         assert_eq!(
             dropped.load(Ordering::Relaxed),
             2,
-            "events beyond the bound are dropped, not blocked"
+            "events beyond the bound are dropped after the timeout, not blocked forever"
+        );
+    }
+
+    /// 6.1 — a *momentarily* full precious channel that drains within the block-with-timeout window
+    /// enqueues the event (never dropped). A slot frees mid-flight (concurrently with the blocked
+    /// `record`), so the awaited enqueue completes before the timeout.
+    #[tokio::test]
+    async fn momentarily_full_precious_channel_enqueues_when_slot_frees() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (log_tx, _log_rx) = mpsc::channel(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let log_dropped = Arc::new(AtomicU64::new(0));
+        let sink = LogSink {
+            tx,
+            dropped: Arc::clone(&dropped),
+            // Generous window so the mid-flight drain lands well inside it.
+            block_timeout: Duration::from_secs(5),
+            log_tx,
+            log_dropped: Arc::clone(&log_dropped),
+        };
+        sink.record(usage_event()).await; // fills the single slot
+        // Concurrently: the second enqueue blocks on a full channel while a drainer frees a slot
+        // after a short delay. `join!` runs both on one task — the blocked send observes the freed
+        // capacity and completes.
+        let enqueue = async { sink.record(usage_event()).await };
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            rx.recv().await
+        };
+        let (_enqueued, drained) = tokio::join!(enqueue, drain);
+        assert!(drained.is_some(), "the first event was in the channel");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "a momentarily full channel that drains in-window drops nothing"
+        );
+        assert!(
+            rx.recv().await.is_some(),
+            "the second event was enqueued once capacity freed"
+        );
+    }
+
+    /// 6.2 — sustained saturation past the timeout drops-and-counts exactly once, and the
+    /// request-side await returns promptly (~timeout), never blocking unboundedly.
+    #[tokio::test]
+    async fn sustained_saturation_drops_once_and_returns_within_timeout() {
+        let (tx, _rx) = mpsc::channel(1); // never drained
+        let (log_tx, _log_rx) = mpsc::channel(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let log_dropped = Arc::new(AtomicU64::new(0));
+        let sink = LogSink {
+            tx,
+            dropped: Arc::clone(&dropped),
+            block_timeout: Duration::from_millis(30),
+            log_tx,
+            log_dropped: Arc::clone(&log_dropped),
+        };
+        sink.record(usage_event()).await; // fills the single slot
+        let started = Instant::now();
+        sink.record(usage_event()).await; // blocks ~30ms then drops-and-counts
+        let waited = started.elapsed();
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "sustained saturation drops exactly one event"
+        );
+        assert!(
+            waited < Duration::from_secs(1),
+            "the await returned within ~timeout ({waited:?}), not unbounded"
         );
     }
 
     /// 4.7 — a saturated log channel drops **log** events (advancing the log counter) while
     /// `usage`/`audit` events on their separate channel are still delivered (D4 isolation). The log
     /// channel has capacity 1 and is never drained; the usage channel has room.
-    #[test]
-    fn saturated_log_channel_never_drops_usage() {
+    #[tokio::test]
+    async fn saturated_log_channel_never_drops_usage() {
         let (tx, mut rx) = mpsc::channel(8);
         let (log_tx, _log_rx) = mpsc::channel(1); // never drained → saturates immediately
         let dropped = Arc::new(AtomicU64::new(0));
@@ -413,6 +539,7 @@ mod tests {
         let sink = LogSink {
             tx,
             dropped: Arc::clone(&dropped),
+            block_timeout: Duration::from_millis(5),
             log_tx,
             log_dropped: Arc::clone(&log_dropped),
         };
@@ -420,9 +547,10 @@ mod tests {
         sink.record_log(log_event()); // fills the single slot
         sink.record_log(log_event()); // dropped
         sink.record_log(log_event()); // dropped
-        // Usage on the separate channel is unaffected.
-        sink.record(usage_event());
-        sink.record(usage_event());
+        // Usage on the separate channel (room to spare) is unaffected — enqueues without hitting
+        // the block-with-timeout window.
+        sink.record(usage_event()).await;
+        sink.record(usage_event()).await;
         assert_eq!(
             log_dropped.load(Ordering::Relaxed),
             2,
@@ -435,5 +563,25 @@ mod tests {
         );
         assert!(rx.try_recv().is_ok(), "the usage events were delivered");
         assert!(rx.try_recv().is_ok(), "both usage events were delivered");
+    }
+
+    /// 6.4 — graceful shutdown flushes buffered precious events: after the last `Sink` is dropped
+    /// (closing the precious channel), the writer drains its remaining buffered events and exits,
+    /// which `shutdown` awaits — and it returns well within the flush budget (not the timeout path).
+    #[tokio::test]
+    async fn shutdown_flushes_buffered_precious_events() {
+        let (pipeline, sink) = EventPipeline::spawn(64, 64, Duration::from_millis(5));
+        // Buffer several precious events on the channel.
+        for _ in 0..8_u32 {
+            sink.record(usage_event()).await;
+        }
+        // Drop the last Sink so both channels close; each writer drains its remainder and exits.
+        drop(sink);
+        let started = Instant::now();
+        pipeline.shutdown().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the writer drained buffered events and exited promptly (not the timeout fallback)"
+        );
     }
 }

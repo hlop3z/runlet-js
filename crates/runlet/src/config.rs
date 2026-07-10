@@ -13,6 +13,7 @@ use std::error::Error;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use runlet_core::config::EngineConfig;
 use serde::Deserialize;
@@ -229,20 +230,41 @@ pub(crate) struct EventsConfig {
     /// Turn on usage + audit event emission. `false` (default) ⇒ no events, no writer task. Also
     /// gates the diagnostic-log stream sink (logs ride the same pipeline on their own channel).
     pub(crate) enabled: bool,
-    /// Bounded `usage`/`audit` channel capacity; beyond it those events are dropped (fail-open) and
-    /// `runlet_events_dropped_total` increments. Default `4096`.
+    /// Bounded **precious** `usage`/`audit` channel capacity. This is the billing/compliance record,
+    /// so the channel is sized **generously** (default `4096`) and uses block-with-timeout, not
+    /// drop-on-full: an event is dropped (incrementing `runlet_events_dropped_total`) only if the
+    /// channel is *still* full after [`Self::block_timeout_ms`]. Kept independent of `log_buffer`.
     pub(crate) buffer: usize,
+    /// Block-with-timeout window in **milliseconds** for the precious usage/audit enqueue
+    /// (billing-grade-event-hop / D1). On a momentarily full channel the emitter waits up to this
+    /// long for capacity before dropping-and-counting. Kept single-digit-ms (default `5`) so a
+    /// stuck writer adds at most this to a request's tail, while the generous `buffer` makes the
+    /// wait effectively unreachable under normal burst load. Milliseconds (matching the engine's
+    /// `timeout_ms`) rather than a duration string, so no parsing dependency is added.
+    pub(crate) block_timeout_ms: u64,
     /// Bounded **diagnostic-log** channel capacity — a separate, higher-volume channel isolated from
-    /// `usage`/`audit` (D4), so log volume can never drop a billing/audit event. Beyond it, log
-    /// events are dropped and `runlet_log_events_dropped_total` increments. Default `8192`.
+    /// `usage`/`audit` (D4), so log volume can never drop a billing/audit event. Stays best-effort
+    /// drop-on-full: beyond it, log events are dropped and `runlet_log_events_dropped_total`
+    /// increments. Default `8192`.
     pub(crate) log_buffer: usize,
+}
+
+impl EventsConfig {
+    /// The precious block-with-timeout window ([`Self::block_timeout_ms`]) as a [`Duration`].
+    pub(crate) const fn block_timeout(&self) -> Duration {
+        Duration::from_millis(self.block_timeout_ms)
+    }
 }
 
 impl Default for EventsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            // Generous precious bound + a single-digit-ms timeout so the drop path is effectively
+            // unreachable under normal load (D5): a normal burst drains well within 4096 slots and
+            // never reaches the 5 ms wait.
             buffer: 4096,
+            block_timeout_ms: 5,
             log_buffer: 8192,
         }
     }

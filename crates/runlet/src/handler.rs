@@ -624,7 +624,7 @@ async fn run_execute(
     // Trusted-identity ingress (trusted-header mode only): derive identity solely from the
     // configured trusted headers and reject anonymous / suspended / tenant-less callers *before*
     // any body work — no execution or egress session begins for them.
-    let identity = match resolve_identity(&state, &headers, &trace_id) {
+    let identity = match resolve_identity(&state, &headers, &trace_id).await {
         Ok(identity) => identity,
         Err(rejected) => {
             state.metrics.record_rejection();
@@ -648,7 +648,8 @@ async fn run_execute(
                 &trace_id,
                 "MALFORMED_REQUEST",
                 None,
-            );
+            )
+            .await;
             return malformed_request_response(&state, &rejection);
         }
     };
@@ -668,7 +669,9 @@ async fn run_execute(
 
     // Coarse member-capability authz (trusted mode): reject a member lacking the entitlement a
     // requested capability requires, before any session or execution.
-    if let Some(rejected) = enforce_member_authz(&state, identity.as_ref(), &config, &trace_id) {
+    if let Some(rejected) =
+        enforce_member_authz(&state, identity.as_ref(), &config, &trace_id).await
+    {
         state.metrics.record_rejection();
         return *rejected;
     }
@@ -687,7 +690,8 @@ async fn run_execute(
                 &trace_id,
                 "SCRIPT_NOT_FOUND",
                 None,
-            );
+            )
+            .await;
             let (_status, envelope) = *rejection;
             let meta = Meta::new(trace_id, 0, context_bytes, 0)
                 .with_key(key)
@@ -713,7 +717,8 @@ async fn run_execute(
             &trace_id,
             "INPUT_TOO_LARGE",
             None,
-        );
+        )
+        .await;
         let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
             .with_key(key)
             .with_partition(partition);
@@ -735,7 +740,9 @@ async fn run_execute(
             key.as_deref(),
             partition.as_deref(),
         )
-    }) {
+    })
+    .await
+    {
         Ok(guard) => guard,
         Err(rejected) => {
             state.metrics.record_rejection();
@@ -764,7 +771,8 @@ async fn run_execute(
                     &trace_id,
                     "EGRESS_UNAVAILABLE",
                     None,
-                );
+                )
+                .await;
                 let meta = Meta::new(trace_id, script_bytes, context_bytes, 0)
                     .with_key(key)
                     .with_partition(partition);
@@ -786,7 +794,7 @@ async fn run_execute(
     let (partition_permit, permit) = match admit(&state, partition.as_deref(), busy_meta) {
         Ok(permits) => permits,
         Err(shed) => {
-            emit_denied(&state, identity.as_ref(), &trace_id, "OVERLOADED", None);
+            emit_denied(&state, identity.as_ref(), &trace_id, "OVERLOADED", None).await;
             return *shed;
         }
     };
@@ -822,7 +830,7 @@ async fn run_execute(
     let base_meta = Meta::new(trace_id, script_bytes, context_bytes, exec_time_us)
         .with_key(key)
         .with_partition(partition);
-    build_response(result, base_meta, cfg, &state, identity.as_ref())
+    build_response(result, base_meta, cfg, &state, identity.as_ref()).await
 }
 
 /// Inputs for the shared blocking-execution core (grouped so the call sites and the
@@ -1090,7 +1098,7 @@ async fn run_batch(
     }
     let trace_id = current_trace_id();
     // Trusted-identity ingress applies to the whole batch: every item shares this request's tenant.
-    let identity = match resolve_identity(&state, &headers, &trace_id) {
+    let identity = match resolve_identity(&state, &headers, &trace_id).await {
         Ok(identity) => identity,
         Err(rejected) => {
             state.metrics.record_rejection();
@@ -1109,7 +1117,8 @@ async fn run_batch(
                 &trace_id,
                 "MALFORMED_REQUEST",
                 None,
-            );
+            )
+            .await;
             return malformed_batch_response(&state, &rejection);
         }
     };
@@ -1122,7 +1131,7 @@ async fn run_batch(
 
     // Batch-level caps (D3), before any item is admitted or executed. The `before`/`after` lifecycle
     // phases do NOT count against `max_items` (RQ3) — only the fan-out width is capped here.
-    if let Err(rejected) = validate_batch(&state, &items, identity.as_ref(), &trace_id) {
+    if let Err(rejected) = validate_batch(&state, &items, identity.as_ref(), &trace_id).await {
         state.metrics.record_rejection();
         return *rejected;
     }
@@ -1261,14 +1270,14 @@ fn batch_ceiling(state: &AppState) -> usize {
 /// Batch-level caps enforced before any admission (D3): non-empty, within `max_items`, and combined
 /// input bytes within `max_input_bytes`. Returns the ready `400` response on violation, emitting the
 /// denied audit at each gate.
-fn validate_batch(
+async fn validate_batch(
     state: &AppState,
     items: &[BatchItem],
     identity: Option<&TrustedIdentity>,
     trace_id: &str,
 ) -> Result<(), Box<AxumResponse>> {
     if items.is_empty() {
-        emit_denied(state, identity, trace_id, "EMPTY_BATCH", None);
+        emit_denied(state, identity, trace_id, "EMPTY_BATCH", None).await;
         return Err(Box::new(batch_level_error(
             "EMPTY_BATCH",
             "batch must contain at least one item".to_owned(),
@@ -1276,7 +1285,7 @@ fn validate_batch(
         )));
     }
     if items.len() > state.batch.max_items {
-        emit_denied(state, identity, trace_id, "BATCH_TOO_LARGE", None);
+        emit_denied(state, identity, trace_id, "BATCH_TOO_LARGE", None).await;
         return Err(Box::new(batch_level_error(
             "BATCH_TOO_LARGE",
             format!(
@@ -1292,7 +1301,7 @@ fn validate_batch(
         .map(batch_item_input_bytes)
         .fold(0_usize, usize::saturating_add);
     if combined > state.batch.max_input_bytes {
-        emit_denied(state, identity, trace_id, "BATCH_INPUT_TOO_LARGE", None);
+        emit_denied(state, identity, trace_id, "BATCH_INPUT_TOO_LARGE", None).await;
         return Err(Box::new(batch_level_error(
             "BATCH_INPUT_TOO_LARGE",
             format!(
@@ -1393,7 +1402,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         Ok(source) => source,
         Err(boxed) => {
             let (_status, envelope) = *boxed;
-            emit_denied(state, identity, trace_id, "SCRIPT_NOT_FOUND", None);
+            emit_denied(state, identity, trace_id, "SCRIPT_NOT_FOUND", None).await;
             let meta = base_error_meta(trace_id, 0, context_bytes, key.as_deref(), partition);
             return render_error_item(&envelope, &meta, id_ref);
         }
@@ -1407,7 +1416,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         state.engine_cfg.max_script_size,
         state.engine_cfg.max_context_size,
     ) {
-        emit_denied(state, identity, trace_id, "INPUT_TOO_LARGE", None);
+        emit_denied(state, identity, trace_id, "INPUT_TOO_LARGE", None).await;
         let meta = base_error_meta(
             trace_id,
             script_bytes,
@@ -1424,7 +1433,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
     // is a per-item caller error. No shared context ⇒ the item's context passes through verbatim.
     let context_json = if let Some(shared_json) = shared.as_deref() {
         let Some(merged) = context_with_reserved(&context, &[("shared", shared_json)]) else {
-            emit_denied(state, identity, trace_id, "INVALID_CONTEXT", None);
+            emit_denied(state, identity, trace_id, "INVALID_CONTEXT", None).await;
             let meta = base_error_meta(
                 trace_id,
                 script_bytes,
@@ -1446,7 +1455,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
 
     // Per-item member-capability authz (trusted mode, D5) — evaluated for EVERY item, never once for
     // the batch (the GraphQL-batch-attack guard).
-    if let Some(envelope) = batch_item_authz(state, identity, &config, trace_id) {
+    if let Some(envelope) = batch_item_authz(state, identity, &config, trace_id).await {
         let meta = base_error_meta(
             trace_id,
             script_bytes,
@@ -1458,7 +1467,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
     }
 
     // Per-item quota debit (trusted mode) — held across this item's execution (D5: counts N, not 1).
-    let _item_quota = match batch_item_quota(state, identity, trace_id) {
+    let _item_quota = match batch_item_quota(state, identity, trace_id).await {
         Ok(guard) => guard,
         Err(envelope) => {
             let meta = base_error_meta(
@@ -1482,7 +1491,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         match connect_session(&state.transport, &init).await {
             Ok(conn) => Some(conn),
             Err(err) => {
-                emit_denied(state, identity, trace_id, "EGRESS_UNAVAILABLE", None);
+                emit_denied(state, identity, trace_id, "EGRESS_UNAVAILABLE", None).await;
                 let envelope = session_error_envelope(err);
                 let meta = base_error_meta(
                     trace_id,
@@ -1528,12 +1537,12 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
     )
     .with_key(key)
     .with_partition(partition.map(str::to_owned));
-    render_executed_item(state, identity, result, base_meta, id_ref)
+    render_executed_item(state, identity, result, base_meta, id_ref).await
 }
 
 /// Per-item member-capability authz (trusted mode, D5). `None` = permitted (or not gated); `Some`
 /// carries the `ENTITLEMENT_REQUIRED` envelope. Emits the denied audit on rejection.
-fn batch_item_authz(
+async fn batch_item_authz(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
     config: &RequestConfig,
@@ -1552,7 +1561,8 @@ fn batch_item_authz(
                 trace_id,
                 "ENTITLEMENT_REQUIRED",
                 Some(json!({ "capability": denied.capability, "required": denied.required })),
-            );
+            )
+            .await;
             let message = format!(
                 "capability `{}` requires entitlement `{}`",
                 denied.capability, denied.required
@@ -1565,7 +1575,7 @@ fn batch_item_authz(
 /// Per-item quota debit (trusted mode). Returns the in-flight guard (held across the item's
 /// execution) or the `QUOTA_EXCEEDED` envelope. Emits the denied audit on rejection. This is what
 /// makes a batch cost N quota units, not 1 (D5).
-fn batch_item_quota(
+async fn batch_item_quota(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
     trace_id: &str,
@@ -1592,7 +1602,8 @@ fn batch_item_quota(
                     "limit": exceeded.limit,
                     "usage": exceeded.usage,
                 })),
-            );
+            )
+            .await;
             Err(Box::new(quota_exceeded_envelope(&exceeded)))
         }
     }
@@ -1600,7 +1611,7 @@ fn batch_item_quota(
 
 /// Renders one item's execution outcome (mirrors [`build_response`]): emits the per-item usage/audit
 /// events + records per-item metrics, then serializes the `{data, error, meta, id?}` envelope.
-fn render_executed_item(
+async fn render_executed_item(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
     result: Result<(Result<Outcome, EngineError>, EgressMetrics), task::JoinError>,
@@ -1615,13 +1626,13 @@ fn render_executed_item(
             let meta = base_meta.with_metrics(exec.metrics, egress);
             match exec.result {
                 ExecOutcome::Success(js_json) => {
-                    emit_executed(state, identity, &meta, "success");
+                    emit_executed(state, identity, &meta, "success").await;
                     metrics.record_success();
                     render_success_item(&js_json, &meta, id, state.resp_cfg())
                 }
                 ExecOutcome::Error(engine_err) => {
                     let outcome = engine_error_outcome(&engine_err);
-                    emit_executed(state, identity, &meta, outcome);
+                    emit_executed(state, identity, &meta, outcome).await;
                     metrics.record_engine_error(&engine_err);
                     render_engine_error_item(engine_err, &meta, id, state.resp_cfg())
                 }
@@ -1629,14 +1640,14 @@ fn render_executed_item(
         }
         Ok((Err(engine_err), _backend)) => {
             let outcome = engine_error_outcome(&engine_err);
-            emit_executed(state, identity, &base_meta, outcome);
+            emit_executed(state, identity, &base_meta, outcome).await;
             metrics.record_engine_error(&engine_err);
             render_engine_error_item(engine_err, &base_meta, id, state.resp_cfg())
         }
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
             let outcome = engine_error_outcome(&engine_err);
-            emit_executed(state, identity, &base_meta, outcome);
+            emit_executed(state, identity, &base_meta, outcome).await;
             metrics.record_engine_error(&engine_err);
             render_engine_error_item(engine_err, &base_meta, id, state.resp_cfg())
         }
@@ -1799,7 +1810,7 @@ async fn run_lifecycle_phase(ctx: LifecycleCtx<'_>) -> LifecyclePhase {
         Ok(source) => source,
         Err(boxed) => {
             let (_status, envelope) = *boxed;
-            emit_denied(state, identity, trace_id, "SCRIPT_NOT_FOUND", None);
+            emit_denied(state, identity, trace_id, "SCRIPT_NOT_FOUND", None).await;
             return LifecyclePhase::Failure(envelope);
         }
     };
@@ -1811,17 +1822,17 @@ async fn run_lifecycle_phase(ctx: LifecycleCtx<'_>) -> LifecyclePhase {
         state.engine_cfg.max_script_size,
         state.engine_cfg.max_context_size,
     ) {
-        emit_denied(state, identity, trace_id, "INPUT_TOO_LARGE", None);
+        emit_denied(state, identity, trace_id, "INPUT_TOO_LARGE", None).await;
         return LifecyclePhase::Failure(request_error(code, message));
     }
 
     // Same per-invocation member-capability authz + quota debit an item gets (RQ3): a lifecycle phase
     // counts against quota, so a batch with a `before`/`after` is never cheaper than the equivalent
     // single requests. The quota guard is held across this phase's execution.
-    if let Some(envelope) = batch_item_authz(state, identity, &config, trace_id) {
+    if let Some(envelope) = batch_item_authz(state, identity, &config, trace_id).await {
         return LifecyclePhase::Failure(envelope);
     }
-    let _quota = match batch_item_quota(state, identity, trace_id) {
+    let _quota = match batch_item_quota(state, identity, trace_id).await {
         Ok(guard) => guard,
         Err(envelope) => return LifecyclePhase::Failure(*envelope),
     };
@@ -1835,7 +1846,7 @@ async fn run_lifecycle_phase(ctx: LifecycleCtx<'_>) -> LifecyclePhase {
         match connect_session(&state.transport, &init).await {
             Ok(conn) => Some(conn),
             Err(err) => {
-                emit_denied(state, identity, trace_id, "EGRESS_UNAVAILABLE", None);
+                emit_denied(state, identity, trace_id, "EGRESS_UNAVAILABLE", None).await;
                 return LifecyclePhase::Failure(session_error_envelope(err));
             }
         }
@@ -1870,13 +1881,13 @@ async fn run_lifecycle_phase(ctx: LifecycleCtx<'_>) -> LifecyclePhase {
         exec_time_us,
     )
     .with_partition(partition.map(str::to_owned));
-    lifecycle_outcome(state, identity, result, base_meta)
+    lifecycle_outcome(state, identity, result, base_meta).await
 }
 
 /// Classifies a lifecycle phase's execution outcome (mirrors [`render_executed_item`] but extracts the
 /// handler `data` instead of rendering an envelope): emits the per-invocation usage/audit events +
 /// records metrics on every path, then yields `Success(data)` or `Failure(envelope)`.
-fn lifecycle_outcome(
+async fn lifecycle_outcome(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
     result: Result<(Result<Outcome, EngineError>, EgressMetrics), task::JoinError>,
@@ -1891,7 +1902,7 @@ fn lifecycle_outcome(
             let meta = base_meta.with_metrics(exec.metrics, egress);
             match exec.result {
                 ExecOutcome::Success(js_json) => {
-                    emit_executed(state, identity, &meta, "success");
+                    emit_executed(state, identity, &meta, "success").await;
                     metrics.record_success();
                     match serde_json::from_str::<Envelope<'_>>(&js_json) {
                         Ok(env) => LifecyclePhase::Success(
@@ -1908,7 +1919,7 @@ fn lifecycle_outcome(
                 }
                 ExecOutcome::Error(engine_err) => {
                     let outcome = engine_error_outcome(&engine_err);
-                    emit_executed(state, identity, &meta, outcome);
+                    emit_executed(state, identity, &meta, outcome).await;
                     metrics.record_engine_error(&engine_err);
                     LifecyclePhase::Failure(
                         engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable),
@@ -1918,7 +1929,7 @@ fn lifecycle_outcome(
         }
         Ok((Err(engine_err), _egress)) => {
             let outcome = engine_error_outcome(&engine_err);
-            emit_executed(state, identity, &base_meta, outcome);
+            emit_executed(state, identity, &base_meta, outcome).await;
             metrics.record_engine_error(&engine_err);
             LifecyclePhase::Failure(
                 engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable),
@@ -1927,7 +1938,7 @@ fn lifecycle_outcome(
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
             let outcome = engine_error_outcome(&engine_err);
-            emit_executed(state, identity, &base_meta, outcome);
+            emit_executed(state, identity, &base_meta, outcome).await;
             metrics.record_engine_error(&engine_err);
             LifecyclePhase::Failure(
                 engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable),
@@ -1978,7 +1989,8 @@ async fn run_before_phase(
             env.trace_id,
             "SHARED_CONTEXT_TOO_LARGE",
             None,
-        );
+        )
+        .await;
         let envelope = request_error(
             "SHARED_CONTEXT_TOO_LARGE",
             format!(
@@ -2115,12 +2127,15 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
     let mut body = state
         .metrics
         .render(available, state.bulkhead_capacity, trips, cache);
-    // Event-pipeline backpressure gauge (Change C): appended here since the counter lives in
-    // `runlet` (the event sink), not the `runlet-core` metrics registry. Absent series ⇒ 0.
+    // Usage/audit drop counter — an SLO/alert signal, not a routine backpressure gauge
+    // (billing-grade-event-hop / D4): the precious channel uses bounded block-with-timeout, so any
+    // increment means a usage/audit event was dropped after waiting for capacity — a genuine
+    // revenue/compliance leak. Alert on `increase(runlet_events_dropped_total[…]) > 0`. Lives in
+    // `runlet` (the event sink), not the `runlet-core` registry. Absent series ⇒ 0.
     if let Some(counter) = state.event_dropped.as_ref() {
         let dropped = counter.load(Ordering::Relaxed);
         body = format!(
-            "{body}# HELP runlet_events_dropped_total Usage/audit events dropped due to a full buffer.\n\
+            "{body}# HELP runlet_events_dropped_total SLO signal: usage/audit events dropped after the block-with-timeout window (a revenue/compliance leak; alert if > 0).\n\
              # TYPE runlet_events_dropped_total counter\n\
              runlet_events_dropped_total {dropped}\n"
         );
@@ -2154,7 +2169,12 @@ fn identity_fields(
 
 /// Emits a `usage` event plus an `allowed` audit event for an executed request (Change C). A no-op
 /// when event emission is disabled. Every request that reaches execution produces exactly these two.
-fn emit_executed(state: &AppState, identity: Option<&TrustedIdentity>, meta: &Meta, outcome: &str) {
+async fn emit_executed(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    meta: &Meta,
+    outcome: &str,
+) {
     let Some(sink) = state.events.as_deref() else {
         return;
     };
@@ -2181,18 +2201,21 @@ fn emit_executed(state: &AppState, identity: Option<&TrustedIdentity>, meta: &Me
         plan.clone(),
         meta.trace_id.clone(),
         usage,
-    ));
+    ))
+    .await;
     let audit = EventBody::Audit(AuditBody {
         decision: "allowed",
         reason: None,
         detail: None,
     });
-    sink.record(Event::new(tenant, user, plan, meta.trace_id.clone(), audit));
+    sink.record(Event::new(tenant, user, plan, meta.trace_id.clone(), audit))
+        .await;
 }
 
 /// Emits a `denied` audit event carrying the reject reason code (and optional detail) at a gate.
-/// A no-op when event emission is disabled.
-fn emit_denied(
+/// A no-op when event emission is disabled. Async: the precious enqueue is bounded block-with-timeout
+/// (D1), awaited here in the async handler (never on a `spawn_blocking` thread).
+async fn emit_denied(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
     trace_id: &str,
@@ -2208,7 +2231,8 @@ fn emit_denied(
         reason: Some(reason.to_owned()),
         detail,
     });
-    sink.record(Event::new(tenant, user, plan, trace_id.to_owned(), audit));
+    sink.record(Event::new(tenant, user, plan, trace_id.to_owned(), audit))
+        .await;
 }
 
 /// The gateway-asserted diagnostic-log routing policy for a request (§3): whether to mirror the
@@ -2246,7 +2270,7 @@ impl LogPolicy {
 /// `allowed` audit events (the single executed-request event site, Change C), streams the captured
 /// diagnostic logs to the tenant (live mode, §2), and mirrors them on the response when the trusted
 /// gateway requested capture (§3, both success and error paths).
-fn build_response(
+async fn build_response(
     result: Result<(Result<Outcome, EngineError>, EgressMetrics), task::JoinError>,
     base_meta: Meta,
     cfg: RespCfg,
@@ -2275,14 +2299,14 @@ fn build_response(
             let mirror = policy.capture.then_some(logs.as_slice());
             match exec_result {
                 ExecOutcome::Success(js_json) => {
-                    emit_executed(state, identity, &meta, "success");
+                    emit_executed(state, identity, &meta, "success").await;
                     metrics.record_success();
                     record_span_outcome("success");
                     success_response(&js_json, meta, &effects, mirror, cfg)
                 }
                 ExecOutcome::Error(engine_err) => {
                     let outcome = engine_error_outcome(&engine_err);
-                    emit_executed(state, identity, &meta, outcome);
+                    emit_executed(state, identity, &meta, outcome).await;
                     metrics.record_engine_error(&engine_err);
                     record_span_outcome(outcome);
                     engine_error_response(engine_err, meta, &effects, mirror, cfg)
@@ -2291,7 +2315,7 @@ fn build_response(
         }
         Ok((Err(engine_err), _backend)) => {
             let outcome = engine_error_outcome(&engine_err);
-            emit_executed(state, identity, &base_meta, outcome);
+            emit_executed(state, identity, &base_meta, outcome).await;
             metrics.record_engine_error(&engine_err);
             record_span_outcome(outcome);
             // No Outcome ⇒ no captured logs; when capture was requested, present an empty list.
@@ -2301,7 +2325,7 @@ fn build_response(
         Err(join_err) => {
             let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
             let outcome = engine_error_outcome(&engine_err);
-            emit_executed(state, identity, &base_meta, outcome);
+            emit_executed(state, identity, &base_meta, outcome).await;
             metrics.record_engine_error(&engine_err);
             record_span_outcome(outcome);
             let mirror = policy.capture.then_some::<&[LogEntry]>(&[]);
@@ -2561,7 +2585,7 @@ fn header_partition(headers: &HeaderMap) -> Option<String> {
 /// any body work: an anonymous caller, a suspended principal, or (for tenant-scoped work) a missing
 /// tenant id is refused with a `403`. Returns `Ok(None)` in single-tenant mode (no trusted headers
 /// consulted), `Ok(Some(identity))` when accepted, or `Err(response)` to reject.
-fn resolve_identity(
+async fn resolve_identity(
     state: &AppState,
     headers: &HeaderMap,
     trace_id: &str,
@@ -2577,7 +2601,8 @@ fn resolve_identity(
             trace_id,
             "ANONYMOUS_FORBIDDEN",
             None,
-        );
+        )
+        .await;
         return Err(Box::new(identity_rejected(
             trace_id,
             "ANONYMOUS_FORBIDDEN",
@@ -2591,7 +2616,8 @@ fn resolve_identity(
             trace_id,
             "SUSPENDED_FORBIDDEN",
             None,
-        );
+        )
+        .await;
         return Err(Box::new(identity_rejected(
             trace_id,
             "SUSPENDED_FORBIDDEN",
@@ -2599,7 +2625,7 @@ fn resolve_identity(
         )));
     }
     if identity.tenant.is_none() {
-        emit_denied(state, Some(&identity), trace_id, "TENANT_REQUIRED", None);
+        emit_denied(state, Some(&identity), trace_id, "TENANT_REQUIRED", None).await;
         return Err(Box::new(identity_rejected(
             trace_id,
             "TENANT_REQUIRED",
@@ -2618,7 +2644,8 @@ fn resolve_identity(
             trace_id,
             "ACTING_SCOPE_REQUIRED",
             None,
-        );
+        )
+        .await;
         return Err(Box::new(identity_rejected(
             trace_id,
             "ACTING_SCOPE_REQUIRED",
@@ -2668,7 +2695,7 @@ fn requested_capabilities(config: &RequestConfig) -> Vec<&str> {
 
 /// Coarse member-capability authz (trusted mode): reject a member lacking the entitlement a
 /// requested capability requires. `None` = permitted (or not in trusted mode / no gate configured).
-fn enforce_member_authz(
+async fn enforce_member_authz(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
     config: &RequestConfig,
@@ -2691,7 +2718,8 @@ fn enforce_member_authz(
                 trace_id,
                 "ENTITLEMENT_REQUIRED",
                 Some(json!({ "capability": denied.capability, "required": denied.required })),
-            );
+            )
+            .await;
             let meta = Meta::new(trace_id.to_owned(), 0, 0, 0);
             Some(Box::new(system_error_response(
                 request_error("ENTITLEMENT_REQUIRED", message),
@@ -2705,7 +2733,7 @@ fn enforce_member_authz(
 /// Per-tenant quota admission (trusted mode). On success returns the in-flight guard to hold across
 /// the execution (or `None` when quota is disabled / not in trusted mode); on over-limit returns the
 /// `429 QUOTA_EXCEEDED` response. `meta` is built lazily, only on the reject path.
-fn enforce_quota<F: FnOnce() -> Meta>(
+async fn enforce_quota<F: FnOnce() -> Meta>(
     state: &AppState,
     identity: Option<&TrustedIdentity>,
     trace_id: &str,
@@ -2733,7 +2761,8 @@ fn enforce_quota<F: FnOnce() -> Meta>(
                     "limit": exceeded.limit,
                     "usage": exceeded.usage,
                 })),
-            );
+            )
+            .await;
             Err(Box::new(quota_exceeded_response(
                 &exceeded,
                 meta(),
@@ -3392,19 +3421,26 @@ mod trusted_pipeline_tests {
         lines: Mutex<Vec<String>>,
     }
 
-    impl Sink for CapturingSink {
-        fn record(&self, event: Event) {
-            let Ok(json) = serde_json::to_string(&event) else {
+    impl CapturingSink {
+        /// Serialize + capture one event's JSON line (shared by the precious and log paths).
+        fn capture(&self, event: &Event) {
+            let Ok(json) = serde_json::to_string(event) else {
                 return;
             };
             if let Ok(mut lines) = self.lines.lock() {
                 lines.push(json);
             }
         }
+    }
+
+    impl Sink for CapturingSink {
+        fn record(&self, event: Event) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move { self.capture(&event) })
+        }
 
         fn record_log(&self, event: Event) {
             // Diagnostic log events land in the same capture list (uniform for assertions).
-            self.record(event);
+            self.capture(&event);
         }
     }
 

@@ -362,7 +362,7 @@ cardinality rule: identity would explode Prometheus series at multi-tenant scale
 `events` block:
 
 ```json
-"events": { "enabled": true, "buffer": 4096 }
+"events": { "enabled": true, "buffer": 4096, "block_timeout_ms": 5, "log_buffer": 8192 }
 ```
 
 - One **unified, versioned event** per request to a dedicated **stdout JSON stream** (distinct from
@@ -372,13 +372,34 @@ cardinality rule: identity would explode Prometheus series at multi-tenant scale
   suspended / tenant-less / acting-scope / entitlement / quota / oversized / egress / overload).
 - Identity (tenant/user/plan) rides **events**, never metric labels (cardinality). Events are
   **unsampled** (every request) — unlike traces.
-- Emission is **non-blocking + fail-open**: events go to a bounded channel (`buffer`) drained by a
-  writer task; a full buffer **drops** events (the request never blocks) and increments
-  `runlet_events_dropped_total` (the backpressure gauge on `/metrics` — watch it and raise `buffer`
-  or scale if it climbs). Off by default; fully inert when disabled.
-- **`event_id`** is a per-event dedup key: today the stream is observability-grade (lossy under
-  pressure); the schema + key are designed so a **durable, billing-grade outbox** can be added later
-  (a new sink impl) without changing what the box emits.
+- **The durable at-least-once outbox is the box's stdout, not on-box storage.** In the target
+  control-plane deployment the container runtime persists the box's stdout to a node-local log file,
+  and a **checkpointing collector** tails that file into the control plane's billing ingest,
+  deduplicating on **`event_id`**. That file + collector *is* the durable outbox — the box stays
+  stateless (no volume, no disk-full mode, no rotation on the box). **This is a deployment
+  requirement:** if you enable `events` for billing/compliance, you must run a checkpointing
+  stdout collector that survives box restarts, or you lose the durability guarantee.
+- **Usage/audit emission is bounded block-with-timeout, not drop-on-full** (billing-grade-event-hop /
+  D1). The precious usage/audit channel (`buffer`, sized generously — default `4096`) briefly waits
+  up to `block_timeout_ms` (default `5`) for capacity and only drops-and-counts if the channel is
+  *still* saturated when that window expires. A momentarily full channel never silently drops a
+  billing/audit event; the request path is never blocked beyond the small timeout. Diagnostic `log`
+  events ride a **separate** channel (`log_buffer`) that stays best-effort drop-on-full (D4), so log
+  volume can never drop a usage/audit event.
+- **`runlet_events_dropped_total` is an SLO / alert signal, not a routine gauge.** With
+  block-with-timeout + a generous buffer it stays at zero under normal load, so **any** increment
+  means a usage/audit event was actually dropped after waiting for capacity — a genuine
+  revenue/compliance leak. **Alert on `increase(runlet_events_dropped_total[…]) > 0`** and treat a
+  trip as an incident (raise `buffer`, shorten the writer's tail, or scale). The separate
+  `runlet_log_events_dropped_total` (diagnostic logs) remains a routine best-effort gauge.
+- **Graceful shutdown flushes the precious channel:** on SIGTERM the box drains buffered usage/audit
+  events to stdout before exit (bounded so it can never hang), minimizing the crash-window loss.
+- **Deferred: an on-box durable `DurableSink`** (redb-backed, behind the same `Sink` port, keyed on
+  `event_id`) is documented as **adopt-later** (design D3), triggered when a **no-collector,
+  standalone box must itself be billing-grade** (own end-to-end durability across restarts without a
+  node-side log tail). It adds no dependency today — the control-plane model above already provides
+  the durable outbox, and the `Sink` port + `event_id` make it a drop-in impl swap, not an
+  emission-site rewrite.
 
 ## 11. Supply chain
 
