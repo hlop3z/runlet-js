@@ -14,6 +14,9 @@ computer), and hands you back an **answer**. That's it!
 
 You talk to the robot by sending a message to `POST /execute`. To send **many jobs at
 once** — each answered on its own, one bad job never spoils the others — use `POST /batch`.
+A batch can also do one **setup** step first (`before` — e.g. fetch a rubric everyone shares)
+and one **wrap-up** step at the end (`after` — e.g. add up all the scores into one `summary`).
+See the [Batch execution](../README.md#batch-execution) reference for the details.
 
 ## Start here 👇
 

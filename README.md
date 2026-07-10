@@ -153,6 +153,50 @@ contract:
   truncated to a `BATCH_RESPONSE_TRUNCATED` error envelope rather than buffered. A single
   batch can occupy at most its partition's fair share of the runtime pool; the rest queue.
 
+#### Lifecycle: `before` / `shared` / `after`
+
+Two AI-era shapes need work *around* the fan-out, not inside it: a **shared expensive fetch**
+every item needs (an LLM/embedding/rerank call, a rubric, a schema) and a **cross-item reduce**
+(an eval accuracy report, a best-of-N vote, a structured-output validation summary). Three
+optional fields add a one-time setup phase and a reduce phase — coordination by *phasing*, not
+locking, so items stay pure and nothing waits on anything:
+
+```json
+{
+  "before": { "script": "function handler(){ return json({ rubric: fetchRubric() }, null); }" },
+  "shared": { "model": "grader-v2" },
+  "items":  [ { "script": "...", "context": { "answer": "..." } } ],
+  "after":  { "script": "function handler(ctx){ return json(scoreAll(ctx.results), null); }" }
+}
+```
+
+```json
+{
+  "results": [ { "data": "...", "error": null, "meta": {}, "id": null } ],
+  "summary": { "accuracy": 0.92 },
+  "meta": { "items": 1, "ok": 1, "failed": 0, "duration_ms": 7, "trace_id": "..." }
+}
+```
+
+- **`before` runs once, alone, before any item.** Its returned `data`, merged over the `shared`
+  seed object (with `before` winning key collisions), becomes an **immutable shared context**.
+- **Items read it read-only as `ctx.shared`.** Each item parses its own copy, so a write by one
+  item is never visible to another — the fetch happens once, the value is shared N times.
+- **`after` runs once, alone, after all items complete.** It receives the full per-item
+  envelopes as `ctx.results` (so a reducer can read each item's `data`/`error`); its returned
+  `data` becomes the top-level **`summary`**.
+- **`before` is a barrier; `after` is best-effort.** A `before` failure aborts the whole batch
+  non-200 with no item run. An `after` failure keeps the **HTTP 200** with `results` intact and
+  reports the classified error as a top-level **`summary_error`** — a failed reducer never
+  discards the successfully-mapped rows.
+- **`before`/`after` are full invocations.** They pass the same per-invocation gates an item
+  does (size, authz, per-tenant quota, capability profile) and are billed as their own
+  invocations, but they do **not** count against `batch.max_items`. The shared context is bounded
+  by `batch.max_shared_bytes` (default `4mb`); an over-cap shared context aborts as a `before`
+  barrier.
+- **Fully backward compatible.** A batch body with no `before`/`shared`/`after` behaves exactly
+  as before and its response carries no `summary`/`summary_error`.
+
 ### Logical resources (`config.io`)
 
 Driver-backed capabilities are addressed by **logical name**, not inline connection

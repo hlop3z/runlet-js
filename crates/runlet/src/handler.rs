@@ -936,13 +936,30 @@ async fn execute_blocking(
 
 // ===== POST /batch — independent per-item fan-out over the single-execute machinery =====
 
-/// A `/batch` request body: an ordered list of independent items. No atomicity, no cross-item
-/// ordering guarantee during execution — only the results array preserves request order.
+/// A `/batch` request body: an ordered list of independent items plus an optional
+/// `before`/`shared`/`after` lifecycle. No atomicity, no cross-item ordering guarantee during
+/// execution — only the results array preserves request order.
 #[derive(Debug, Deserialize)]
 pub(crate) struct BatchRequest {
     /// The items to execute (validated for count/size before any admission).
     #[serde(default)]
     items: Vec<BatchItem>,
+    /// Optional one-time setup phase run **alone before any item** (design D1/D2). Its returned
+    /// `data`, merged over the `shared` seed, becomes the immutable shared context every item reads.
+    /// A `before` failure is a barrier: the whole batch aborts non-200 and no item runs (RQ1/D3).
+    #[serde(default)]
+    before: Option<BatchItem>,
+    /// Optional read-only seed object merged into the shared context (constants that need no fetch).
+    /// Absent ⇒ the shared context is `before`'s output alone; both absent ⇒ no shared context is
+    /// injected and the batch behaves exactly as today.
+    #[serde(default)]
+    shared: Option<Box<RawValue>>,
+    /// Optional reduce phase run **alone after all items complete** (design D1/D2). It receives the
+    /// order-preserving `results` (full per-item envelopes, RQ2); its returned `data` becomes the
+    /// batch-level `summary`. An `after` failure is best-effort: HTTP 200 with `results` intact and a
+    /// `meta.summary_error` (RQ1/D3).
+    #[serde(default)]
+    after: Option<BatchItem>,
 }
 
 /// One `/batch` item — the single-execute body shape plus an optional client `id` echoed back on its
@@ -968,10 +985,21 @@ struct BatchItem {
 }
 
 /// The `/batch` response: order-preserving per-item envelopes + a batch-level summary.
+///
+/// `summary`/`summary_error` sit at the **top level**, peer to `results` (design RQ1) — the reduced
+/// value is a primary product of the batch, not metadata about it. Both are omitted when absent, so
+/// an unadorned batch response (no `after` phase) is byte-identical to the pre-lifecycle format.
 #[derive(Debug, Serialize)]
 struct BatchResponse {
     /// One rendered `{data, error, meta, id?}` envelope per item, in request order.
     results: Vec<Box<RawValue>>,
+    /// The `after` phase's reduced value over `results` (design RQ1); omitted when no `after` ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<Box<RawValue>>,
+    /// The classified error of a **failed** `after` phase (design RQ1/D3); the batch still responds
+    /// `200` with `results` intact. Omitted when `after` was absent or succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_error: Option<ErrorEnvelope>,
     /// Batch-level summary.
     meta: BatchMeta,
 }
@@ -1047,8 +1075,10 @@ pub(crate) async fn batch(
     run_batch(state, headers, payload).instrument(span).await
 }
 
-/// The `/batch` request pipeline: batch-level gates (auth → identity → parse → caps), then a bounded
-/// concurrent fan-out over the items, then order-preserving assembly with the D6 response-size cap.
+/// The `/batch` request pipeline: batch-level gates (auth → identity → parse → caps), then the
+/// optional three-phase lifecycle — **`before`** (barrier) → the bounded concurrent **items**
+/// fan-out (each reading the immutable shared context) → **`after`** (reduce to `summary`) — closed
+/// by order-preserving assembly with the D6 response-size cap.
 async fn run_batch(
     state: AppState,
     headers: HeaderMap,
@@ -1083,31 +1113,113 @@ async fn run_batch(
             return malformed_batch_response(&state, &rejection);
         }
     };
-    let items = req.items;
+    let BatchRequest {
+        items,
+        before,
+        shared,
+        after,
+    } = req;
 
-    // Batch-level caps (D3), before any item is admitted or executed.
+    // Batch-level caps (D3), before any item is admitted or executed. The `before`/`after` lifecycle
+    // phases do NOT count against `max_items` (RQ3) — only the fan-out width is capped here.
     if let Err(rejected) = validate_batch(&state, &items, identity.as_ref(), &trace_id) {
         state.metrics.record_rejection();
         return *rejected;
     }
 
     // Shared fairness/partition key (request-level): the trusted tenant in trusted mode, else the
-    // caller-asserted header. Every item keys off this — a batch cannot split its fairness bucket.
+    // caller-asserted header. Every item (and `before`/`after`) keys off this — a batch cannot split
+    // its fairness bucket.
     let partition = resolve_partition(identity.as_ref(), header_partition(&headers));
-
+    let env = BatchEnv {
+        state: &state,
+        identity: identity.as_ref(),
+        partition: partition.as_deref(),
+        trace_id: &trace_id,
+        cfg: state.resp_cfg(),
+    };
     let start = Instant::now();
     let count = items.len();
-    // Bound this batch's concurrency to its fair share so it cannot monopolize the pool (D2): the
-    // per-partition ceiling when fairness is on, else the global bulkhead capacity. Items beyond the
-    // ceiling queue on this gate rather than fast-failing (unlike single `/execute`).
-    let gate = Arc::new(Semaphore::new(batch_ceiling(&state)));
+
+    // ── Phase 1: `before` (barrier) ── run alone, build the immutable shared context, or abort the
+    // whole batch non-200 on failure (RQ1/D3). Absent `before` + absent `shared` ⇒ `None` (no
+    // injection, byte-identical to the pre-lifecycle path).
+    let shared_ctx = match run_before_phase(&env, before, shared.as_deref()).await {
+        Ok(built) => built,
+        Err(barrier) => {
+            state.metrics.record_rejection();
+            return barrier;
+        }
+    };
+
+    // ── Phase 2: items fan-out (unchanged) ── each item reads the immutable shared context.
+    let slots = fan_out_items(&env, items, shared_ctx.clone()).await;
+
+    // Render the order-preserving results (enforcing the D6 response-size cap) once — the same array
+    // is both the client's `results` and the `after` reducer's input (RQ2).
+    let (results, ok, failed) = render_slots(slots, &trace_id, state.batch.max_response_bytes);
+
+    // ── Phase 3: `after` (best-effort reduce) ── runs alone over the full per-item envelopes; its
+    // output is the batch `summary`, a failure surfaces as `summary_error` on a 200 (RQ1/D3).
+    let (summary, summary_error) =
+        run_after_phase(&env, after, &results, shared_ctx.as_deref()).await;
+
+    let duration_ms = start.elapsed().as_millis();
+    let meta = BatchMeta {
+        items: count,
+        ok,
+        failed,
+        duration_ms,
+        trace_id,
+    };
+    (
+        StatusCode::OK,
+        Json(BatchResponse {
+            results,
+            summary,
+            summary_error,
+            meta,
+        }),
+    )
+        .into_response()
+}
+
+/// The shared, borrowed context for the batch lifecycle phases — the request-level state every phase
+/// keys off (grouped so the `before`/`after` signatures stay within the argument-count lint).
+struct BatchEnv<'a> {
+    /// Shared application state.
+    state: &'a AppState,
+    /// The request's trusted identity (shared across every phase), if any.
+    identity: Option<&'a TrustedIdentity>,
+    /// The request's fairness/cache key (shared across every phase).
+    partition: Option<&'a str>,
+    /// The batch correlation id.
+    trace_id: &'a str,
+    /// Response-shaping policy (drives the `before` barrier's projected status).
+    cfg: RespCfg,
+}
+
+/// Phase 2 — the bounded concurrent item fan-out (unchanged behavior). Bounds this batch's
+/// concurrency to its fair share so it cannot monopolize the pool (D2): the per-partition ceiling
+/// when fairness is on, else the global bulkhead capacity. Items beyond the ceiling queue on this
+/// gate rather than fast-failing (unlike single `/execute`). Each item reads the immutable shared
+/// context. Returns positional slots so the results array preserves request order regardless of
+/// completion order (a slot left empty by a panicked task is filled defensively downstream).
+async fn fan_out_items(
+    env: &BatchEnv<'_>,
+    items: Vec<BatchItem>,
+    shared_ctx: Option<Arc<str>>,
+) -> Vec<Option<RenderedItem>> {
+    let count = items.len();
+    let gate = Arc::new(Semaphore::new(batch_ceiling(env.state)));
     let mut set: JoinSet<(usize, RenderedItem)> = JoinSet::new();
     for (index, item) in items.into_iter().enumerate() {
-        let task_state = state.clone();
+        let task_state = env.state.clone();
         let task_gate = Arc::clone(&gate);
-        let task_identity = identity.clone();
-        let task_partition = partition.clone();
-        let task_trace = trace_id.clone();
+        let task_identity = env.identity.cloned();
+        let task_partition = env.partition.map(str::to_owned);
+        let task_trace = env.trace_id.to_owned();
+        let task_shared = shared_ctx.clone();
         let _abort = set.spawn(async move {
             let rendered = run_batch_item(BatchItemCtx {
                 state: &task_state,
@@ -1116,14 +1228,13 @@ async fn run_batch(
                 partition: task_partition.as_deref(),
                 trace_id: &task_trace,
                 item,
+                shared: task_shared,
             })
             .await;
             (index, rendered)
         });
     }
 
-    // Collect into positional slots so the results array preserves request order regardless of
-    // completion order. A slot left empty (a task that somehow panicked) is filled defensively.
     let mut slots: Vec<Option<RenderedItem>> = (0..count).map(|_idx| None).collect();
     while let Some(joined) = set.join_next().await {
         if let Ok((index, rendered)) = joined
@@ -1132,9 +1243,7 @@ async fn run_batch(
             *slot = Some(rendered);
         }
     }
-
-    let duration_ms = start.elapsed().as_millis();
-    assemble_batch(slots, trace_id, duration_ms, state.batch.max_response_bytes)
+    slots
 }
 
 /// This batch's concurrency ceiling: the per-partition fair share when fairness is enabled, else the
@@ -1245,6 +1354,10 @@ struct BatchItemCtx<'a> {
     trace_id: &'a str,
     /// The item to run.
     item: BatchItem,
+    /// The immutable shared context built by the `before` phase (serialized JSON), or `None` when the
+    /// batch has no lifecycle. When present it is injected read-only into the item's context object
+    /// under the reserved `shared` key (design D4/RQ3); the `Arc` is shared, never cloned per item.
+    shared: Option<Arc<str>>,
 }
 
 /// Runs one batch item through the same per-request machinery as `/execute`, rendering a per-item
@@ -1263,6 +1376,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         partition,
         trace_id,
         item,
+        shared,
     } = ctx;
     let BatchItem {
         script,
@@ -1303,6 +1417,27 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         );
         return render_error_item(&request_error(code, message), &meta, id_ref);
     }
+
+    // Inject the immutable shared context (when the batch has a `before`/`shared` lifecycle) into the
+    // item's context object under the reserved `shared` key (design D4/RQ3). Requires an object
+    // context (the default and near-universal shape); a non-object context alongside a shared context
+    // is a per-item caller error. No shared context ⇒ the item's context passes through verbatim.
+    let context_json = if let Some(shared_json) = shared.as_deref() {
+        let Some(merged) = context_with_reserved(&context, &[("shared", shared_json)]) else {
+            emit_denied(state, identity, trace_id, "INVALID_CONTEXT", None);
+            let meta =
+                base_error_meta(trace_id, script_bytes, context_bytes, key.as_deref(), partition);
+            let envelope = request_error(
+                "INVALID_CONTEXT",
+                "item context must be a JSON object when the batch supplies a shared context"
+                    .to_owned(),
+            );
+            return render_error_item(&envelope, &meta, id_ref);
+        };
+        merged
+    } else {
+        context.get().to_owned()
+    };
 
     // Per-item member-capability authz (trusted mode, D5) — evaluated for EVERY item, never once for
     // the batch (the GraphQL-batch-attack guard).
@@ -1370,7 +1505,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         local_resources: Arc::clone(&state.local_resources),
         local_client: state.local_client.clone(),
         source,
-        context_json: context.get().to_owned(),
+        context_json,
         config,
         cache_ns: partition.map(str::to_owned),
         // Batch items neither mirror nor stream logs (out of scope for §3); use the host's floor.
@@ -1562,25 +1697,348 @@ fn fallback_item_body(trace_id: &str) -> String {
     )
 }
 
-/// Assembles the final `/batch` response in request order, enforcing the total-response-bytes cap
-/// (D6): an item whose bytes would push the running total past the cap is truncated to a classified
-/// size-limit error envelope rather than buffered. Counts ok/failed for the batch summary.
-fn assemble_batch(
+// ===== Batch lifecycle: before → items → after (design D1/D2, RQ1–RQ3) =====
+
+/// Merges framework-supplied read-only `reserved` keys into a JSON **object** `context`, returning the
+/// serialized result. Values are kept as `RawValue` so number fidelity survives the round-trip; a
+/// reserved key overwrites a same-named field the caller declared (the framework value wins). Returns
+/// `None` when `context` is not a JSON object (the caller decides how to surface that).
+fn context_with_reserved(context: &RawValue, reserved: &[(&str, &str)]) -> Option<String> {
+    let mut map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(context.get()).ok()?;
+    for &(key, value) in reserved {
+        let _prev = map.insert(key.to_owned(), RawValue::from_string(value.to_owned()).ok()?);
+    }
+    serde_json::to_string(&map).ok()
+}
+
+/// Builds the immutable shared context from the `shared` seed and `before`'s returned `data` (design
+/// D4/RQ3). `None` ⇒ neither was supplied (no injection, byte-identical to the pre-lifecycle path).
+/// When both are JSON objects they shallow-merge with `before`'s data winning; otherwise `before`'s
+/// data (when present) is the shared context verbatim and the seed is ignored.
+fn build_shared_context(seed: Option<&RawValue>, before_data: Option<&RawValue>) -> Option<String> {
+    match (seed, before_data) {
+        (None, None) => None,
+        (Some(seed_only), None) => Some(seed_only.get().to_owned()),
+        (None, Some(data)) => Some(data.get().to_owned()),
+        (Some(seed_obj), Some(data)) => Some(
+            match (
+                serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(seed_obj.get()),
+                serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(data.get()),
+            ) {
+                (Ok(mut merged), Ok(over)) => {
+                    merged.extend(over);
+                    serde_json::to_string(&merged).unwrap_or_else(|_err| data.get().to_owned())
+                }
+                _ => data.get().to_owned(),
+            },
+        ),
+    }
+}
+
+/// The outcome of a `before`/`after` lifecycle invocation: the extracted handler `data` on success
+/// (used to build the shared context / the `summary`), or a classified error (a gate rejection or an
+/// engine error) that becomes the `before` barrier response or the `after` `summary_error`.
+enum LifecyclePhase {
+    /// Handler succeeded; carries its returned `data` (the reproducible product, RQ2).
+    Success(Box<RawValue>),
+    /// A gate rejection or engine error, already classified into a wire envelope.
+    Failure(ErrorEnvelope),
+}
+
+/// Inputs for one lifecycle invocation (grouped to stay within the argument-count lint). Mirrors
+/// [`BatchItemCtx`] but carries the already-merged `context_json` (the phase's own context for
+/// `before`; the `results`/`shared` reserved keys merged in for `after`) and returns a
+/// [`LifecyclePhase`] rather than a rendered envelope.
+struct LifecycleCtx<'a> {
+    /// Shared application state.
+    state: &'a AppState,
+    /// The request's trusted identity (shared with the items), if any.
+    identity: Option<&'a TrustedIdentity>,
+    /// The request's fairness/cache key (shared with the items).
+    partition: Option<&'a str>,
+    /// The batch correlation id.
+    trace_id: &'a str,
+    /// The phase invocation (script/key/config; its `context` field is superseded by `context_json`).
+    item: BatchItem,
+    /// The fully-merged context handed to the handler.
+    context_json: String,
+}
+
+/// Runs one `before`/`after` phase through the **same per-invocation gates an item gets** (resolve →
+/// size → authz → quota debit → session → admit → execute), returning the structured outcome (design
+/// D2). A lifecycle phase is never a cheaper unit of admission/quota/billing than an item; it runs
+/// alone (sequentially, outside the fan-out) so it needs no fair-share slot, only the global bulkhead
+/// permit that protects the blocking threads.
+async fn run_lifecycle_phase(ctx: LifecycleCtx<'_>) -> LifecyclePhase {
+    let LifecycleCtx {
+        state,
+        identity,
+        partition,
+        trace_id,
+        item,
+        context_json,
+    } = ctx;
+    let BatchItem {
+        script,
+        key,
+        context: _superseded,
+        config,
+        id: _unused,
+    } = item;
+    let context_bytes = context_json.len();
+
+    let source = match resolve_script(script, key.as_deref(), &state.registry) {
+        Ok(source) => source,
+        Err(boxed) => {
+            let (_status, envelope) = *boxed;
+            emit_denied(state, identity, trace_id, "SCRIPT_NOT_FOUND", None);
+            return LifecyclePhase::Failure(envelope);
+        }
+    };
+    let script_bytes = source.as_str().len();
+
+    if let Err((code, message)) = sandbox::validate_input_sizes(
+        script_bytes,
+        context_bytes,
+        state.engine_cfg.max_script_size,
+        state.engine_cfg.max_context_size,
+    ) {
+        emit_denied(state, identity, trace_id, "INPUT_TOO_LARGE", None);
+        return LifecyclePhase::Failure(request_error(code, message));
+    }
+
+    // Same per-invocation member-capability authz + quota debit an item gets (RQ3): a lifecycle phase
+    // counts against quota, so a batch with a `before`/`after` is never cheaper than the equivalent
+    // single requests. The quota guard is held across this phase's execution.
+    if let Some(envelope) = batch_item_authz(state, identity, &config, trace_id) {
+        return LifecyclePhase::Failure(envelope);
+    }
+    let _quota = match batch_item_quota(state, identity, trace_id) {
+        Ok(guard) => guard,
+        Err(envelope) => return LifecyclePhase::Failure(*envelope),
+    };
+
+    let broker_names = config.io.broker_names(&state.local_resources);
+    let session = if broker_names.is_empty() {
+        None
+    } else {
+        let tenant = identity.and_then(|trusted| trusted.tenant.as_deref());
+        let init = wire_init(broker_names, state.engine_cfg.timeout(), tenant);
+        match connect_session(&state.transport, &init).await {
+            Ok(conn) => Some(conn),
+            Err(err) => {
+                emit_denied(state, identity, trace_id, "EGRESS_UNAVAILABLE", None);
+                return LifecyclePhase::Failure(session_error_envelope(err));
+            }
+        }
+    };
+
+    // A lifecycle phase runs alone; acquire only the global bulkhead permit (protects blocking
+    // threads), not the batch's fair-share gate.
+    let _global = Arc::clone(&state.limiter).acquire_owned().await.ok();
+
+    let start = Instant::now();
+    let result = execute_blocking(ExecuteBlocking {
+        host: state.host.clone(),
+        handle: Handle::current(),
+        timeout: state.engine_cfg.timeout(),
+        session,
+        local_resources: Arc::clone(&state.local_resources),
+        local_client: state.local_client.clone(),
+        source,
+        context_json,
+        config,
+        cache_ns: partition.map(str::to_owned),
+        log_floor: None,
+        default_currency: state.default_currency.clone(),
+    })
+    .await;
+
+    let exec_time_us = start.elapsed().as_micros();
+    let base_meta = Meta::new(trace_id.to_owned(), script_bytes, context_bytes, exec_time_us)
+        .with_partition(partition.map(str::to_owned));
+    lifecycle_outcome(state, identity, result, base_meta)
+}
+
+/// Classifies a lifecycle phase's execution outcome (mirrors [`render_executed_item`] but extracts the
+/// handler `data` instead of rendering an envelope): emits the per-invocation usage/audit events +
+/// records metrics on every path, then yields `Success(data)` or `Failure(envelope)`.
+fn lifecycle_outcome(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    result: Result<(Result<Outcome, EngineError>, EgressMetrics), task::JoinError>,
+    base_meta: Meta,
+) -> LifecyclePhase {
+    let metrics: &Metrics = &state.metrics;
+    let cfg = state.resp_cfg();
+    metrics.observe_execution(base_meta.exec_time_us);
+    match result {
+        Ok((Ok(exec), egress)) => {
+            record_capability_latencies(metrics, &exec.metrics, &egress.backend);
+            let meta = base_meta.with_metrics(exec.metrics, egress);
+            match exec.result {
+                ExecOutcome::Success(js_json) => {
+                    emit_executed(state, identity, &meta, "success");
+                    metrics.record_success();
+                    match serde_json::from_str::<Envelope<'_>>(&js_json) {
+                        Ok(env) => LifecyclePhase::Success(
+                            RawValue::from_string(env.data.get().to_owned())
+                                .unwrap_or_else(|_err| RAW_NULL.clone()),
+                        ),
+                        Err(parse_err) => LifecyclePhase::Failure(
+                            EngineError::Malformed(format!("malformed handler response: {parse_err}"))
+                                .into_envelope(cfg.error_debug, cfg.timeout_retryable),
+                        ),
+                    }
+                }
+                ExecOutcome::Error(engine_err) => {
+                    let outcome = engine_error_outcome(&engine_err);
+                    emit_executed(state, identity, &meta, outcome);
+                    metrics.record_engine_error(&engine_err);
+                    LifecyclePhase::Failure(
+                        engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable),
+                    )
+                }
+            }
+        }
+        Ok((Err(engine_err), _egress)) => {
+            let outcome = engine_error_outcome(&engine_err);
+            emit_executed(state, identity, &base_meta, outcome);
+            metrics.record_engine_error(&engine_err);
+            LifecyclePhase::Failure(engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable))
+        }
+        Err(join_err) => {
+            let engine_err = EngineError::Internal(format!("task panicked: {join_err}"));
+            let outcome = engine_error_outcome(&engine_err);
+            emit_executed(state, identity, &base_meta, outcome);
+            metrics.record_engine_error(&engine_err);
+            LifecyclePhase::Failure(engine_err.into_envelope(cfg.error_debug, cfg.timeout_retryable))
+        }
+    }
+}
+
+/// Phase 1 — the `before` barrier. Runs `before` (when present) alone, then builds the immutable
+/// shared context from the `shared` seed + `before`'s `data`, enforcing the `max_shared_bytes` cap.
+/// Returns the shared context (`None` ⇒ no lifecycle, inject nothing). Any `before` failure — or an
+/// over-cap shared context — becomes a non-200 batch-level barrier response (RQ1/D3): no item runs.
+async fn run_before_phase(
+    env: &BatchEnv<'_>,
+    before: Option<BatchItem>,
+    shared: Option<&RawValue>,
+) -> Result<Option<Arc<str>>, AxumResponse> {
+    let before_data: Option<Box<RawValue>> = match before {
+        None => None,
+        Some(item) => {
+            let context_json = item.context.get().to_owned();
+            match run_lifecycle_phase(LifecycleCtx {
+                state: env.state,
+                identity: env.identity,
+                partition: env.partition,
+                trace_id: env.trace_id,
+                item,
+                context_json,
+            })
+            .await
+            {
+                LifecyclePhase::Success(data) => Some(data),
+                LifecyclePhase::Failure(envelope) => {
+                    let meta = base_error_meta(env.trace_id, 0, 0, None, env.partition);
+                    return Err(projected_error_response(envelope, meta, env.cfg));
+                }
+            }
+        }
+    };
+
+    let Some(json) = build_shared_context(shared, before_data.as_deref()) else {
+        return Ok(None);
+    };
+    if json.len() > env.state.batch.max_shared_bytes {
+        emit_denied(
+            env.state,
+            env.identity,
+            env.trace_id,
+            "SHARED_CONTEXT_TOO_LARGE",
+            None,
+        );
+        let envelope = request_error(
+            "SHARED_CONTEXT_TOO_LARGE",
+            format!(
+                "shared context {} bytes exceeds the limit of {}",
+                json.len(),
+                env.state.batch.max_shared_bytes
+            ),
+        );
+        let meta = base_error_meta(env.trace_id, 0, 0, None, env.partition);
+        return Err(projected_error_response(envelope, meta, env.cfg));
+    }
+    Ok(Some(Arc::from(json.as_str())))
+}
+
+/// Phase 3 — the best-effort `after` reduce. Runs `after` (when present) alone over the full per-item
+/// envelopes (RQ2) plus the shared context, both injected as reserved keys on `after`'s own context.
+/// Returns `(summary, summary_error)`: on success the reduced `data` is the `summary`; any failure is
+/// surfaced as `summary_error` on a 200 with `results` intact (RQ1/D3) — it never fails the batch.
+async fn run_after_phase(
+    env: &BatchEnv<'_>,
+    after: Option<BatchItem>,
+    results: &[Box<RawValue>],
+    shared: Option<&str>,
+) -> (Option<Box<RawValue>>, Option<ErrorEnvelope>) {
+    // `env.cfg` is unused here: an `after` failure never projects an HTTP status — it rides the 200
+    // response as `summary_error`.
+    let Some(item) = after else {
+        return (None, None);
+    };
+
+    let results_json = serde_json::to_string(results).unwrap_or_else(|_err| "[]".to_owned());
+    let mut reserved: Vec<(&str, &str)> = vec![("results", results_json.as_str())];
+    if let Some(shared_json) = shared {
+        reserved.push(("shared", shared_json));
+    }
+    let Some(context_json) = context_with_reserved(&item.context, &reserved) else {
+        return (
+            None,
+            Some(request_error(
+                "INVALID_CONTEXT",
+                "after context must be a JSON object".to_owned(),
+            )),
+        );
+    };
+
+    match run_lifecycle_phase(LifecycleCtx {
+        state: env.state,
+        identity: env.identity,
+        partition: env.partition,
+        trace_id: env.trace_id,
+        item,
+        context_json,
+    })
+    .await
+    {
+        LifecyclePhase::Success(data) => (Some(data), None),
+        LifecyclePhase::Failure(envelope) => (None, Some(envelope)),
+    }
+}
+
+/// Renders the fan-out slots into the order-preserving `results` array, enforcing the total-response-
+/// bytes cap (D6): an item whose bytes would push the running total past the cap is truncated to a
+/// classified size-limit error envelope rather than buffered. Returns `(results, ok, failed)` — the
+/// same array feeds both the client response and the `after` reducer (RQ2), so it is built once.
+fn render_slots(
     slots: Vec<Option<RenderedItem>>,
-    trace_id: String,
-    duration_ms: u128,
+    trace_id: &str,
     max_response_bytes: usize,
-) -> AxumResponse {
+) -> (Vec<Box<RawValue>>, usize, usize) {
     let count = slots.len();
     let mut results: Vec<Box<RawValue>> = Vec::with_capacity(count);
     let mut ok = 0_usize;
     let mut failed = 0_usize;
     let mut used = 0_usize;
     for slot in slots {
-        let rendered = slot.unwrap_or_else(|| internal_error_item(&trace_id));
+        let rendered = slot.unwrap_or_else(|| internal_error_item(trace_id));
         let projected = used.saturating_add(rendered.bytes());
         let item = if projected > max_response_bytes {
-            let truncated = truncated_item(&trace_id);
+            let truncated = truncated_item(trace_id);
             used = used.saturating_add(truncated.bytes());
             failed = failed.saturating_add(1);
             truncated
@@ -1596,14 +2054,7 @@ fn assemble_batch(
         let raw = RawValue::from_string(item.body).unwrap_or_else(|_err| RAW_NULL.clone());
         results.push(raw);
     }
-    let meta = BatchMeta {
-        items: count,
-        ok,
-        failed,
-        duration_ms,
-        trace_id,
-    };
-    (StatusCode::OK, Json(BatchResponse { results, meta })).into_response()
+    (results, ok, failed)
 }
 
 /// A defensive per-item envelope for a slot that never completed (a panicked fan-out task) — a
@@ -3158,6 +3609,7 @@ mod batch_tests {
         AppState, BatchItem, BatchRequest, RequestConfig, RequestIo, TrustedRuntime, batch,
     };
     use crate::config::{BatchConfig, TrustedHeaders};
+    use crate::quota::{PlanLimit, TenantQuota};
     use crate::sidecar::SidecarTransport;
     use axum::Json;
     use axum::body::to_bytes;
@@ -3245,9 +3697,32 @@ mod batch_tests {
         map
     }
 
-    /// Drives `POST /batch` and returns `(status, parsed-body)`.
+    /// Drives `POST /batch` (items only, no lifecycle) and returns `(status, parsed-body)`.
     async fn run(state: &AppState, hdrs: HeaderMap, items: Vec<BatchItem>) -> (StatusCode, Value) {
-        let response = batch(State(state.clone()), hdrs, Ok(Json(BatchRequest { items })))
+        run_full(state, hdrs, items, None, None, None).await
+    }
+
+    /// Drives `POST /batch` with the full `before`/`shared`/`after` lifecycle and returns
+    /// `(status, parsed-body)`.
+    async fn run_full(
+        state: &AppState,
+        hdrs: HeaderMap,
+        items: Vec<BatchItem>,
+        before: Option<BatchItem>,
+        shared: Option<&str>,
+        after: Option<BatchItem>,
+    ) -> (StatusCode, Value) {
+        let shared = shared.map(|json| {
+            super::RawValue::from_string(json.to_owned())
+                .unwrap_or_else(|_err| super::default_context())
+        });
+        let request = BatchRequest {
+            items,
+            before,
+            shared,
+            after,
+        };
+        let response = batch(State(state.clone()), hdrs, Ok(Json(request)))
             .await
             .into_response();
         let status = response.status();
@@ -3429,6 +3904,213 @@ mod batch_tests {
             results[1]["data"], "plain",
             "an ungated item in the same batch still runs"
         );
+    }
+
+    // ===== batch-lifecycle-phases: before → items → after (RQ1–RQ3) =====
+
+    /// A trusted runtime carrying a per-tenant quota (and no capability gate).
+    fn trusted_runtime_with_quota(quota: TenantQuota) -> Arc<TrustedRuntime> {
+        Arc::new(TrustedRuntime {
+            headers: TrustedHeaders::default(),
+            capability_entitlements: HashMap::new(),
+            quota: Some(quota),
+        })
+    }
+
+    /// A `before`/`after` phase invocation running the given inline script (no id, default config).
+    fn phase(script: &str) -> BatchItem {
+        item(script)
+    }
+
+    /// 4.1 — Backward compat: a batch with only `items` (no lifecycle) yields no `summary`/
+    /// `summary_error`, byte-for-byte the pre-change shape.
+    #[tokio::test]
+    async fn no_lifecycle_omits_summary_fields() {
+        let app = state(None);
+        let items = vec![item("function handler(){ return { data: 1 }; }")];
+        let (status, body) = run(&app, HeaderMap::new(), items).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("summary").is_none(), "no summary without after");
+        assert!(
+            body.get("summary_error").is_none(),
+            "no summary_error without after"
+        );
+        assert_eq!(body["results"][0]["data"], 1);
+    }
+
+    /// 4.2 — Phase ordering by data dependency: items observe `before`'s output (so `before`
+    /// completed first) and `after` reduces every item's result (so all items completed first).
+    #[tokio::test]
+    async fn phases_run_before_items_after() {
+        let app = state(None);
+        let items = vec![
+            item("function handler(ctx){ return { data: ctx.shared.n }; }"),
+            item("function handler(ctx){ return { data: ctx.shared.n }; }"),
+            item("function handler(ctx){ return { data: ctx.shared.n }; }"),
+        ];
+        let before = Some(phase("function handler(){ return { data: { n: 10 } }; }"));
+        let after = Some(phase(
+            "function handler(ctx){ let s = 0; for (const r of ctx.results) { s += r.data; } return { data: s }; }",
+        ));
+        let (status, body) = run_full(&app, HeaderMap::new(), items, before, None, after).await;
+        assert_eq!(status, StatusCode::OK);
+        for index in 0..3 {
+            assert_eq!(body["results"][index]["data"], 10, "item read before's output");
+        }
+        assert_eq!(body["summary"], 30, "after reduced all three item results");
+    }
+
+    /// 4.3 — Shared context: items see `before`'s output merged over the `shared` seed (with
+    /// `before` winning on key collision), and a sibling item's mutation is invisible to another
+    /// (each item parses its own immutable copy).
+    #[tokio::test]
+    async fn shared_context_merges_and_is_isolated() {
+        let app = state(None);
+        let items = vec![
+            // Reads the merged view (seed `from_seed`/`k`, before `from_before`/`k`; before wins `k`).
+            item(
+                "function handler(ctx){ return { data: { seed: ctx.shared.from_seed, before: ctx.shared.from_before, k: ctx.shared.k } }; }",
+            ),
+            // Attempts to mutate its own copy of the shared context.
+            item("function handler(ctx){ ctx.shared.k = 999; return { data: 'mutated' }; }"),
+            // A later item must still see the original immutable value, not the sibling's write.
+            item("function handler(ctx){ return { data: ctx.shared.k }; }"),
+        ];
+        let before = Some(phase(
+            "function handler(){ return { data: { from_before: 1, k: 2 } }; }",
+        ));
+        let seed = r#"{"from_seed":9,"k":1}"#;
+        let (status, body) =
+            run_full(&app, HeaderMap::new(), items, before, Some(seed), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["data"]["seed"], 9, "seed value visible");
+        assert_eq!(body["results"][0]["data"]["before"], 1, "before value visible");
+        assert_eq!(body["results"][0]["data"]["k"], 2, "before wins the collision");
+        assert_eq!(
+            body["results"][2]["data"], 2,
+            "a sibling's mutation does not leak into another item"
+        );
+    }
+
+    /// 4.4 — Fetch-collapse: a single `before` produces the shared value that every one of N items
+    /// reads, so a per-item fetch is unnecessary (the fetch runs once, in `before`). The literal
+    /// egress-count assertion is integration-level; here the structural once-produced/N-read property
+    /// is proven by the identical value across items.
+    #[tokio::test]
+    async fn before_output_is_shared_by_all_items() {
+        let app = state(None);
+        let items = (0..4)
+            .map(|_idx| item("function handler(ctx){ return { data: ctx.shared.token }; }"))
+            .collect();
+        let before = Some(phase(
+            "function handler(){ return { data: { token: 'fetched-once' } }; }",
+        ));
+        let (status, body) = run_full(&app, HeaderMap::new(), items, before, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 4);
+        for result in results {
+            assert_eq!(
+                result["data"], "fetched-once",
+                "every item reads the one shared value"
+            );
+        }
+    }
+
+    /// 4.5 — `before` barrier: a throwing `before` aborts the whole batch non-200 with no `results`
+    /// array (no item ran) and no `after`.
+    #[tokio::test]
+    async fn before_throw_is_a_barrier() {
+        let app = state(None);
+        let items = vec![item("function handler(){ return { data: 1 }; }")];
+        let before = Some(phase("function handler(){ throw new Error('boom'); }"));
+        let after = Some(phase("function handler(){ return { data: 'never' }; }"));
+        let (status, body) = run_full(&app, HeaderMap::new(), items, before, None, after).await;
+        assert_ne!(status, StatusCode::OK, "a before failure is non-200");
+        assert!(
+            body.get("results").is_none(),
+            "no item runs when before is the barrier"
+        );
+        assert!(body.get("summary").is_none(), "after never runs");
+        assert!(!body["error"].is_null(), "the barrier carries the before error");
+    }
+
+    /// 4.6 — `after` reduce: a returning `after` surfaces its value as the top-level `summary`; a
+    /// throwing `after` keeps HTTP 200 with `results` intact and reports `summary_error`.
+    #[tokio::test]
+    async fn after_summary_and_failure() {
+        let app = state(None);
+        let mk_items = || {
+            vec![
+                item("function handler(){ return { data: 1 }; }"),
+                item("function handler(){ return { data: 2 }; }"),
+            ]
+        };
+        // Success: reduce to the item count.
+        let after_ok = Some(phase(
+            "function handler(ctx){ return { data: { count: ctx.results.length } }; }",
+        ));
+        let (status, body) = run_full(&app, HeaderMap::new(), mk_items(), None, None, after_ok).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["summary"]["count"], 2, "after's value is the summary");
+        assert!(body.get("summary_error").is_none(), "no error on success");
+
+        // Failure: a throwing after keeps the 200 + results, reports summary_error.
+        let after_err = Some(phase("function handler(){ throw new Error('reduce failed'); }"));
+        let (status, body) =
+            run_full(&app, HeaderMap::new(), mk_items(), None, None, after_err).await;
+        assert_eq!(status, StatusCode::OK, "a failed after does not fail the batch");
+        assert_eq!(body["results"][0]["data"], 1, "results stay intact");
+        assert_eq!(body["results"][1]["data"], 2);
+        assert!(body.get("summary").is_none(), "no summary on failure");
+        assert!(
+            !body["summary_error"].is_null(),
+            "the after failure is surfaced as summary_error"
+        );
+    }
+
+    /// 4.7a — Gates: `before` is subject to the same per-invocation quota an item is — a `0`-capacity
+    /// plan denies it, aborting the batch as a barrier before any item runs.
+    #[tokio::test]
+    async fn before_is_quota_gated() {
+        let mut plans = HashMap::new();
+        let _ = plans.insert("denied".to_owned(), PlanLimit { max_concurrent: 0 });
+        let app = state(Some(trusted_runtime_with_quota(TenantQuota::new(plans))));
+        let hdrs = headers(&[
+            ("x-workspace-id", "ws_a"),
+            ("x-tenant-scope", "acting"),
+            ("x-tenant-plan", "denied"),
+        ]);
+        let items = vec![item("function handler(){ return { data: 1 }; }")];
+        let before = Some(phase("function handler(){ return { data: 1 }; }"));
+        let (status, body) = run_full(&app, hdrs, items, before, None, None).await;
+        assert_ne!(status, StatusCode::OK, "quota-denied before aborts the batch");
+        assert_eq!(
+            body["error"]["code"], "QUOTA_EXCEEDED",
+            "before debits quota like an item"
+        );
+        assert!(body.get("results").is_none(), "no item runs past the barrier");
+    }
+
+    /// 4.7b — Gates: I/O in `before` is gated exactly as for an item — with no sidecar, a `before`
+    /// naming a broker-resolved `io` resource fails closed (`EGRESS_UNAVAILABLE`), a barrier that runs
+    /// no items. (The box HTTP front always runs the full profile; fail-closed egress is the box-level
+    /// analogue of the spec's "profile denies I/O in lifecycle phases".)
+    #[tokio::test]
+    async fn before_io_fails_closed() {
+        let app = state(None);
+        let items = vec![item("function handler(){ return { data: 1 }; }")];
+        let before = Some(BatchItem {
+            config: RequestConfig {
+                io: RequestIo(vec!["orders".to_owned()]),
+                ..RequestConfig::default()
+            },
+            ..phase("function handler(ctx){ return { data: ctx.io ? 1 : 0 }; }")
+        });
+        let (status, body) = run_full(&app, HeaderMap::new(), items, before, None, None).await;
+        assert_ne!(status, StatusCode::OK, "no sidecar ⇒ before I/O fails closed");
+        assert_eq!(body["error"]["code"], "EGRESS_UNAVAILABLE");
+        assert!(body.get("results").is_none(), "the barrier runs no items");
     }
 }
 

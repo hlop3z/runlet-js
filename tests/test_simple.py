@@ -144,6 +144,23 @@ def _post_batch(items: list, headers: dict | None = None) -> dict | None:
         return None
 
 
+def _post_batch_full(body: dict, headers: dict | None = None) -> dict | None:
+    """POST a full `/batch` body (may carry `before`/`shared`/`after` alongside `items`); returns the
+    parsed body. Hides the HTTP status like `_post_batch`."""
+    data = json.dumps(body).encode()
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(f"{BASE_URL}/batch", data=data, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return _parse_response(resp.getcode(), resp.read())
+    except urllib.error.HTTPError as err:
+        return _parse_response(err.code, err.read())
+    except Exception:
+        return None
+
+
 def _parse_response(status: int, raw: bytes) -> dict:
     """Parse a server response. A well-formed jsbox response is the JSON envelope; a
     non-JSON body (e.g. axum's plain-text deserialize rejection) is surfaced as a
@@ -794,6 +811,59 @@ def test_batch(t: Runner):
         bg.result()
     t.check("a large batch does not starve another partition's single request",
             good is not None and good.get("data") == "ok")
+
+    # --- Lifecycle: before / shared / after (batch-lifecycle-phases, RQ1-RQ3) ---
+
+    # before → items → after end-to-end: before produces a value merged over the shared seed, every
+    # item reads it via ctx.shared, and after reduces the full per-item results into the summary.
+    resp = _post_batch_full({
+        "before": {"script": "function handler(){ return json({ n: 10, k: 2 }, null); }"},
+        "shared": {"k": 1, "seed_only": 9},
+        "items": [
+            {"script": "function handler(ctx){ return json(ctx.shared.n, null); }"},
+            {"script": "function handler(ctx){ return json(ctx.shared.n, null); }"},
+            {"script": "function handler(ctx){ return json(ctx.shared.n, null); }"},
+        ],
+        "after": {"script": "function handler(ctx){ var s=0; ctx.results.forEach(function(r){ s+=r.data; }); return json({ sum: s, seed: ctx.shared.seed_only, k: ctx.shared.k }, null); }"},
+    })
+    rs = results_of(resp)
+    summary = resp.get("summary") if isinstance(resp, dict) else None
+    t.check("lifecycle before/shared/after: items read shared, after reduces to summary",
+            len(rs) == 3
+            and [r.get("data") for r in rs] == [10, 10, 10]
+            and isinstance(summary, dict)
+            and summary.get("sum") == 30            # after summed all three item results
+            and summary.get("seed") == 9            # the shared seed is visible
+            and summary.get("k") == 2)              # before wins the seed/before key collision
+
+    # Backward compat: a plain batch (no lifecycle) carries no summary/summary_error.
+    resp = _post_batch([{"script": "function handler(){ return json(1, null); }"}])
+    t.check("a plain batch omits summary/summary_error",
+            isinstance(resp, dict) and "summary" not in resp and "summary_error" not in resp)
+
+    # before is a barrier: a throwing before aborts the whole batch non-200 with no items run.
+    resp = _post_batch_full({
+        "before": {"script": "function handler(){ throw new Error('boom'); }"},
+        "items": [{"script": "function handler(){ return json(1, null); }"}],
+        "after": {"script": "function handler(){ return json('never', null); }"},
+    })
+    t.check("a throwing before is a barrier (non-200, no results, no summary)",
+            isinstance(resp, dict) and resp.get("error") is not None
+            and "results" not in resp and "summary" not in resp)
+
+    # after is best-effort: a throwing after keeps the 200 with results intact + a summary_error.
+    resp = _post_batch_full({
+        "items": [
+            {"script": "function handler(){ return json(1, null); }"},
+            {"script": "function handler(){ return json(2, null); }"},
+        ],
+        "after": {"script": "function handler(){ throw new Error('reduce failed'); }"},
+    })
+    rs = results_of(resp)
+    t.check("a throwing after keeps 200 + results, reports summary_error",
+            len(rs) == 2 and [r.get("data") for r in rs] == [1, 2]
+            and resp.get("summary") is None
+            and _err_code({"error": resp.get("summary_error")}) is not None)
 
 
 def test_metrics(t: Runner):

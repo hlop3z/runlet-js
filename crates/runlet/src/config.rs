@@ -188,11 +188,12 @@ impl Default for Config {
 #[serde(default)]
 #[expect(
     clippy::struct_field_names,
-    reason = "the `max_` prefix is the stable JSON config key contract (max_items / max_input_bytes / max_response_bytes)"
+    reason = "the `max_` prefix is the stable JSON config key contract (max_items / max_input_bytes / max_response_bytes / max_shared_bytes)"
 )]
 pub(crate) struct BatchConfig {
     /// Maximum items in one batch; a larger batch is rejected whole (`400`). Kept modest so a batch's
-    /// worst-case pool hold time stays bounded (design D3). Default `25`.
+    /// worst-case pool hold time stays bounded (design D3). Default `25`. The optional `before`/`after`
+    /// lifecycle phases do NOT consume item slots (design RQ3) — they are fixed per-batch overhead.
     pub(crate) max_items: usize,
     /// Maximum combined input bytes (Σ script + context over all items); an oversize batch body is
     /// rejected whole (`400`) before any item is admitted. Default `4 MiB`.
@@ -201,6 +202,11 @@ pub(crate) struct BatchConfig {
     /// total past this is truncated to a classified size-limit error envelope rather than buffered
     /// (design D6). Default `8 MiB`.
     pub(crate) max_response_bytes: usize,
+    /// Maximum serialized bytes of the immutable shared context built by the `before` phase (design
+    /// RQ3/D4). A shared context exceeding this aborts the batch as a `before`-phase barrier failure
+    /// (non-200, no items run), never a per-item clamp. Default `4 MiB` (mirrors `max_input_bytes`,
+    /// since the shared context is input-shaped data handed read-only to every item).
+    pub(crate) max_shared_bytes: usize,
 }
 
 impl Default for BatchConfig {
@@ -209,6 +215,7 @@ impl Default for BatchConfig {
             max_items: 25,
             max_input_bytes: 4 * 1024 * 1024,
             max_response_bytes: 8 * 1024 * 1024,
+            max_shared_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -773,15 +780,16 @@ mod tests {
         assert_eq!(cfg.batch.max_items, 25, "default item cap");
         assert_eq!(cfg.batch.max_input_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.batch.max_response_bytes, 8 * 1024 * 1024);
+        assert_eq!(cfg.batch.max_shared_bytes, 4 * 1024 * 1024, "default shared cap");
 
-        let json =
-            r#"{"batch":{"max_items":100,"max_input_bytes":1024,"max_response_bytes":2048}}"#;
+        let json = r#"{"batch":{"max_items":100,"max_input_bytes":1024,"max_response_bytes":2048,"max_shared_bytes":512}}"#;
         let parsed = serde_json::from_str::<Config>(json);
         assert!(parsed.is_ok(), "batch block should parse");
         let parsed_cfg = parsed.unwrap_or_default();
         assert_eq!(parsed_cfg.batch.max_items, 100);
         assert_eq!(parsed_cfg.batch.max_input_bytes, 1024);
         assert_eq!(parsed_cfg.batch.max_response_bytes, 2048);
+        assert_eq!(parsed_cfg.batch.max_shared_bytes, 512);
     }
 
     /// `timeout_retryable` defaults to `true` and `retry_after_seconds` to the constant default,
