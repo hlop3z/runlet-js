@@ -2,24 +2,34 @@
 
 ## Purpose
 
-The `$` / `Decimal` global gives handlers exact base-10 decimal arithmetic inside the QuickJS
-sandbox, avoiding binary-float drift (e.g. `0.1 + 0.2`). It is backed by `rust_decimal` — the
-same engine `db.rs` uses to decode Postgres `NUMERIC`/`DECIMAL` — so in-script math matches the
-database exactly. JavaScript has no operator overloading, so the API is method-based and
-chainable rather than `+ - * /`. Rationale: `src/decimal.rs`, `src/js/decimal.js`,
-`docs/05-decimal.md`, and `CLAUDE.md`.
+The `Decimal` global gives handlers exact base-10 decimal arithmetic inside the QuickJS sandbox
+for **non-money** numbers (quantities, rates, weights, percentages, ratios), avoiding binary-float
+drift (e.g. `0.1 + 0.2`). It is backed by `rust_decimal` — the same engine used to decode
+`NUMERIC`/`DECIMAL` values over the wire — so in-script math matches the database exactly.
+JavaScript has no operator overloading, so the API is method-based and chainable rather than
+`+ - * /`, and every author-facing method is snake_case. Currency-bound money is a separate global
+(`$` / `money`, see the `money` capability), which composes over this numeric core. Rationale:
+`src/decimal.rs`, `src/js/decimal.js`, `docs/05-decimal.md`, and `CLAUDE.md`.
 
 ## Requirements
 
 ### Requirement: Always-on injection
 
-The system SHALL inject the `$` / `Decimal` global into every execution context unconditionally,
-because the capability is pure (no I/O, no per-op metering) and takes no configuration.
+The system SHALL inject the `Decimal` global into every execution context unconditionally, because
+the capability is pure (no I/O, no per-op metering) and takes no configuration. `Decimal` SHALL NOT
+be an alias of `$` — `$` constructs a currency-bound money value (see the `money` capability),
+while `Decimal` is the exact-number engine for non-money values (quantities, rates, weights,
+percentages).
 
 #### Scenario: Available with no config
 
 - **WHEN** a handler runs with no capability config in the request
-- **THEN** `typeof $ === "function"` and `typeof Decimal === "function"`, and `$` and `Decimal` are the same constructor
+- **THEN** `typeof Decimal === "function"`
+
+#### Scenario: Decimal is distinct from money
+
+- **WHEN** a handler inspects the globals
+- **THEN** `Decimal !== $` and `$` constructs money while `Decimal` constructs an exact number
 
 #### Scenario: Not metered against the operation cap
 
@@ -28,32 +38,33 @@ because the capability is pure (no I/O, no per-op metering) and takes no configu
 
 ### Requirement: Decimal construction
 
-`$(value)` / `Decimal(value)` SHALL build a decimal from a string, a number, or another decimal,
-preserving exact value when the input is a string.
+`Decimal(value)` SHALL build a decimal from a string, a number, or another decimal, preserving
+exact value when the input is a string.
 
 #### Scenario: Construct from a string
 
-- **WHEN** a handler calls `$("19.99")`
-- **THEN** a decimal whose `.toString()` is `"19.99"` is produced
+- **WHEN** a handler calls `Decimal("2.5")`
+- **THEN** a decimal whose `to_string()` is `"2.5"` is produced
 
 #### Scenario: Construct from an existing decimal
 
-- **WHEN** a handler passes a decimal back into `$(...)`
+- **WHEN** a handler passes a decimal back into `Decimal(...)`
 - **THEN** the same value is returned without re-parsing
 
 #### Scenario: Invalid input throws
 
-- **WHEN** a handler calls `$("not-a-number")`
+- **WHEN** a handler calls `Decimal("not-a-number")`
 - **THEN** a JavaScript error is thrown that the handler can catch with `try/catch`
 
 ### Requirement: Method-based arithmetic
 
-The system SHALL expose arithmetic as chainable methods (`add`, `sub`, `mul`, `div`, `neg`,
-`abs`, `round`) — not the `+ - * /` operators — each returning a new decimal.
+The system SHALL expose arithmetic as chainable methods (`add`, `sub`, `mul`, `div`, `neg`, `abs`)
+— not the `+ - * /` operators — each returning a new decimal and coercing a number, string, or
+decimal argument.
 
 #### Scenario: Chained arithmetic
 
-- **WHEN** a handler evaluates `$("19.99").mul(3).add("0.01").toString()`
+- **WHEN** a handler evaluates `Decimal("19.99").mul(3).add("0.01").to_string()`
 - **THEN** the result is the exact string `"59.98"`
 
 #### Scenario: Method arguments are coerced
@@ -63,74 +74,117 @@ The system SHALL expose arithmetic as chainable methods (`add`, `sub`, `mul`, `d
 
 ### Requirement: Exactness
 
-Decimal arithmetic SHALL be exact in base 10, free of the binary-floating-point drift that
-afflicts native JS number math.
+Decimal arithmetic SHALL be exact in base 10, free of the binary-floating-point drift that afflicts
+native JS number math.
 
 #### Scenario: No 0.1 + 0.2 drift
 
-- **WHEN** a handler evaluates `$("0.1").add("0.2").toString()`
+- **WHEN** a handler evaluates `Decimal("0.1").add("0.2").to_string()`
 - **THEN** the result is exactly `"0.3"`, not `0.30000000000000004`
 
 #### Scenario: Matches the database NUMERIC engine
 
-- **WHEN** a handler wraps a `NUMERIC`/`DECIMAL` value read as a string from the database in `$(...)` and does math
+- **WHEN** a handler wraps a `NUMERIC`/`DECIMAL` value read as a string from the database in `Decimal(...)` and does math
 - **THEN** the result is exact and consistent with the database's own decimal arithmetic
 
 ### Requirement: Half-up rounding
 
-`round(places)` SHALL round to the given number of decimal places using half-away-from-zero
-(money-friendly half-up) rounding.
+`round(places, mode)` SHALL round to `places` decimal places (default `0`) using the rounding
+strategy named by `mode`, which SHALL default to `"half_up"` (half-away-from-zero) for
+backward-compatibility. The system SHALL also provide `round_to(step, mode)` to round to the nearest
+multiple of `step` (e.g. `"0.05"` for cash rounding).
 
-#### Scenario: Round to cents
+#### Scenario: Round to places (default mode)
 
-- **WHEN** a handler evaluates `$("19.985").round(2).toString()`
+- **WHEN** a handler evaluates `Decimal("19.985").round(2).to_string()`
 - **THEN** the result is `"19.99"`
 
 #### Scenario: Default places
 
 - **WHEN** a handler calls `.round()` with no argument
-- **THEN** it rounds to 0 decimal places
+- **THEN** it rounds to 0 decimal places using `half_up`
 
-### Requirement: Major/minor unit conversion
+#### Scenario: Round to a step
 
-The system SHALL provide chainable `toCents(places)` and `fromCents(places)` instance methods to
-convert between major units and integer minor units, where `places` is the number of minor-unit
-digits and defaults to 2 (cents).
+- **WHEN** a handler evaluates `Decimal("2.03").round_to("0.05").to_string()`
+- **THEN** the result is `"2.05"`
 
-#### Scenario: Dollars to cents
+### Requirement: Standard rounding-mode vocabulary
 
-- **WHEN** a handler evaluates `$("19.99").toCents().toString()`
-- **THEN** the result is the integer string `"1999"`
+`round` / `round_to` (on `Decimal`) and `round` (on `money`) SHALL accept a `mode` drawn from a
+fixed vocabulary that adopts the established industry meaning rendered in the box's snake_case
+dialect: `"half_up"` (half-away-from-zero, the default), `"half_even"` (banker's rounding), and the
+directed modes `"up"`, `"down"`, `"ceil"`, `"floor"`. Each SHALL map onto the corresponding exact
+rounding strategy. An unrecognized mode SHALL throw a catchable error.
 
-#### Scenario: Cents to dollars
+#### Scenario: half_even is banker's rounding
 
-- **WHEN** a handler evaluates `$(1999).fromCents().toString()`
-- **THEN** the result is `"19.99"` (fixed to `places` decimal places)
+- **WHEN** a handler evaluates `Decimal("2.5").round(0, "half_even").to_string()` and `Decimal("3.5").round(0, "half_even").to_string()`
+- **THEN** the results are `"2"` and `"4"` respectively (ties go to the even neighbor)
 
-#### Scenario: Configurable minor-unit digits
+#### Scenario: Unknown mode throws
 
-- **WHEN** a handler passes a `places` argument (e.g. `0` for yen, `3` for dinars)
-- **THEN** the conversion scales by `10^places` instead of `100`
+- **WHEN** a handler passes a `mode` not in the vocabulary (e.g. `"sideways"`)
+- **THEN** a catchable error is thrown naming the invalid mode
 
-#### Scenario: toCents rounds half-up to a whole number
+### Requirement: Bounded scalar helpers
 
-- **WHEN** a handler evaluates `$("1.005").toCents().toString()`
-- **THEN** the fractional minor unit is rounded half-away-from-zero to the integer `"101"`
+`Decimal` SHALL provide `clamp(lo, hi)`, `min(other)`, `max(other)`, and `pct(p)`. `clamp` returns
+the value constrained to the inclusive `[lo, hi]` range; `min`/`max` return the smaller/larger of
+the value and the argument; `pct(p)` returns `p` percent of the value.
+
+#### Scenario: Clamp to a range
+
+- **WHEN** a handler evaluates `Decimal("120").clamp(0, 100).to_string()`
+- **THEN** the result is `"100"`
+
+#### Scenario: Percentage of a value
+
+- **WHEN** a handler evaluates `Decimal("200").pct(15).to_string()`
+- **THEN** the result is `"30"`
 
 ### Requirement: Comparison
 
-The system SHALL provide comparison helpers (`cmp`, `eq`, `lt`, `lte`, `gt`, `gte`, `isZero`,
-`isNegative`) over exact decimal values.
+The system SHALL provide comparison helpers (`cmp`, `eq`, `lt`, `lte`, `gt`, `gte`, `is_zero`,
+`is_negative`, `is_positive`) over exact decimal values.
 
 #### Scenario: Ordering predicates
 
-- **WHEN** a handler evaluates `$("19.99").gt("9.99")`
+- **WHEN** a handler evaluates `Decimal("19.99").gt("9.99")`
 - **THEN** the result is `true`
 
 #### Scenario: cmp tri-state
 
 - **WHEN** a handler calls `.cmp(x)`
 - **THEN** it returns `-1`, `0`, or `1` for less-than, equal, or greater-than
+
+#### Scenario: Sign predicates
+
+- **WHEN** a handler evaluates `Decimal("0").is_zero()`
+- **THEN** the result is `true`
+
+### Requirement: snake_case naming with deprecated aliases
+
+Every author-facing method on `Decimal` SHALL be named in snake_case. The methods that were
+previously camelCase (`isZero`, `isNegative`, `toNumber`) SHALL be renamed to their snake_case forms
+(`is_zero`, `is_negative`, `to_number`) and the old camelCase spellings SHALL remain available as
+**deprecated aliases** for one release. The JS-runtime protocol hooks the engine invokes by fixed
+name (`toString`, `toJSON`, `valueOf`) SHALL keep their JS spelling.
+
+#### Scenario: snake_case is canonical
+
+- **WHEN** a handler calls `Decimal("5").is_zero()` and `Decimal("5").to_number()`
+- **THEN** both resolve to the snake_case methods
+
+#### Scenario: camelCase alias still works (deprecated)
+
+- **WHEN** a handler calls the legacy `Decimal("5").isZero()`
+- **THEN** it returns the same result as `is_zero()` (retained as a deprecated alias)
+
+#### Scenario: Protocol hooks keep JS spelling
+
+- **WHEN** the engine serializes a decimal via `JSON.stringify`
+- **THEN** it invokes `toJSON` (JS spelling), which returns the exact string value
 
 ### Requirement: Panic-free failure
 
@@ -139,7 +193,7 @@ parse failures as catchable JavaScript errors rather than crashing the engine.
 
 #### Scenario: Division by zero throws
 
-- **WHEN** a handler evaluates `$("10").div(0)`
+- **WHEN** a handler evaluates `Decimal("10").div(0)`
 - **THEN** a JavaScript error is thrown (no panic, no process abort)
 
 #### Scenario: Overflow throws
@@ -149,12 +203,12 @@ parse failures as catchable JavaScript errors rather than crashing the engine.
 
 ### Requirement: Output and serialization
 
-A decimal SHALL expose `toString()` for its exact text and `toNumber()` for a lossy JS number,
-and SHALL serialize to its exact string in `json(...)` / `JSON.stringify`.
+A decimal SHALL expose `to_string()` for its exact text and `to_number()` for a lossy JS number, and
+SHALL serialize to its exact string in `json(...)` / `JSON.stringify`.
 
 #### Scenario: Exact string output
 
-- **WHEN** a handler calls `.toString()` on a decimal
+- **WHEN** a handler calls `.to_string()` on a decimal
 - **THEN** it returns the exact decimal text (e.g. `"59.98"`)
 
 #### Scenario: Auto-stringified in the response
