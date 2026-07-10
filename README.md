@@ -722,6 +722,43 @@ function handler(ctx) {
 }
 ```
 
+### list / dict — field-name-first collection value-utils
+
+`list` (a table of records) and `dict` (one record) are **always-on** value-utils (no config, like
+`$`/`Decimal`/`datetime`/`text`): callable factories `list(input)` / `dict(input)` returning
+immutable, chainable collections. The surface is **field-name-first with no callbacks** — every verb
+takes a field-name string or a match-by-example object — using the SQL / Shopify-Liquid vocabulary
+(`where`/`sort_by`/`group_by`/`column`/`unique`/`sum`, `get`/`pick`/`omit`/`merge`). Pure and
+unmetered — injected identically under the deterministic profile (nothing to remove; no random-order
+verb exists). Column aggregates (`sum`/`avg`/`min`/`max`) return an exact `Decimal`, so a currency
+column is never float-summed. `group_by` returns a `dict`; `dict.entries`/`keys`/`values` return a
+`list`. The engine removes `Proxy`, so items are read with `.get(i)`/`.at(i)`, not `[i]`.
+
+```js
+function handler(ctx) {
+  var orders = ctx.orders; // [{ id, status, region, total }, …]
+
+  // filter → sort → select, all by field name (no arrow functions):
+  list(orders).where({ status: "paid" }).sort_by("total", "desc").column("id").to_array();
+
+  // exact-money aggregate — 0.1 + 0.2 is exactly 0.3, never 0.30000000000000004:
+  list(orders).where({ status: "paid" }).sum("total").toString(); // exact Decimal string
+
+  // group_by bridges to a dict of lists:
+  var byRegion = list(orders).group_by("region");
+  byRegion.get("US").count(); byRegion.get("EU").sum("total");
+
+  // dict — safe nested read with a fallback, plus reshaping:
+  dict(ctx.customer).get("address.city", "—");
+  dict(ctx.customer).pick("name", "email").to_object();
+  dict(ctx.customer).merge({ tier: "gold" }).to_object(); // last-wins
+
+  return json({ ok: true }, null); // json()/toString → plain array / object
+}
+```
+
+See [`docs/13-lists-and-dicts.md`](docs/13-lists-and-dicts.md).
+
 **Secrets are use-not-extract** (the multi-tenant guarantee). With
 `config.sys = { "env": { "REGION": "us-east-1" }, "secrets": { "SIGNING_KEY": "sk_live_…" } }`:
 

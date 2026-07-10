@@ -632,6 +632,111 @@ interface TextFactory {
 declare const text: TextFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// `list` — a table of records · `dict` — one record (always available)
+// Field-name-first, callback-free collection shaping (SQL / Shopify-Liquid names).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Immutable collection value-util over an array of records. Every verb takes a field-name string or
+ * a match-by-example object — never a callback. Transforms return a new `List` (or `Dict`);
+ * `sum`/`avg`/`min`/`max` return an exact {@link Decimal} so a currency column is never float-summed.
+ * Unwrap with `.to_array()`; it also serializes as a plain array via `toJSON`. Index with `.get(i)`/
+ * `.at(i)` (not `[i]`); iterate with `for..of` / spread.
+ *
+ * @example
+ * list(orders).where({ status: "paid" }).sort_by("date").sum("total");   // exact Decimal
+ */
+interface List {
+  // filtering / ordering / selection (no callbacks)
+  /** Keep records where every `field: value` in `match` strictly equals the record's field. */
+  where(match: Record<string, unknown>): List;
+  /** Stable sort by a named field (ascending; `"desc"` for descending). No field → sort elements. */
+  sort_by(field?: string, direction?: "asc" | "desc"): List;
+  /** A new list of one field's value from each record. */
+  column(field: string): List;
+  /** Distinct scalars by value (first occurrence wins). */
+  unique(): List;
+  /** Distinct records by a named field's value (first occurrence wins). */
+  unique_by(field: string): List;
+  /** Group records into a {@link Dict} of lists, keyed by the stringified field value. */
+  group_by(field: string): Dict;
+
+  // exact-Decimal aggregates over a named column (blanks/non-numeric skipped)
+  /** Exact sum of a column → {@link Decimal} (empty column → `Decimal(0)`). */
+  sum(field?: string): Decimal;
+  /** Exact average of a column → {@link Decimal}, or `null` when the column is empty. */
+  avg(field?: string): Decimal | null;
+  /** Minimum of a column → {@link Decimal}, or `null` when the column is empty. */
+  min(field?: string): Decimal | null;
+  /** Maximum of a column → {@link Decimal}, or `null` when the column is empty. */
+  max(field?: string): Decimal | null;
+  /** Number of elements (a plain count, never money). */
+  count(): number;
+
+  // access + interop
+  /** Element at `i` (negative counts from the end); `undefined` if out of range. */
+  get(i: number): unknown;
+  /** Alias of {@link List.get}. */
+  at(i: number): unknown;
+  /** First element, or `null` when empty. */
+  first(): unknown;
+  /** Last element, or `null` when empty. */
+  last(): unknown;
+  /** Number of elements. */
+  len(): number;
+  /** The underlying plain array (a defensive copy). */
+  to_array(): unknown[];
+  toJSON(): unknown[];
+  [Symbol.iterator](): Iterator<unknown>;
+}
+
+/** Collection value-util factory. `list(input)` wraps an array (non-array → single/empty). Always available. */
+interface ListFactory {
+  (input?: unknown): List;
+}
+
+/** Immutable table-of-records value-util (field-name-first, callback-free). Always available. */
+declare const list: ListFactory;
+
+/**
+ * Immutable record value-util over one plain object (string keys). Safe nested reads and key/value
+ * reshaping, no callbacks. Transforms return a new `Dict` (or {@link List}); unwrap with
+ * `.to_object()`; it also serializes as a plain object via `toJSON`.
+ *
+ * @example
+ * dict(customer).get("address.city", "—");   // safe nested read with a default
+ */
+interface Dict {
+  /** Read a dotted path (`"a.b.c"`), returning the value or `def` (else `undefined`) on any miss. */
+  get(path: string, def?: unknown): unknown;
+  /** A new dict with only the named keys that are present. */
+  pick(...fields: string[]): Dict;
+  /** A new dict without the named keys. */
+  omit(...fields: string[]): Dict;
+  /** Own-key membership. */
+  has(field: string): boolean;
+  /** A new dict: shallow last-wins merge of the receiver with `other`. */
+  merge(other: Record<string, unknown> | Dict): Dict;
+  /** Own string keys, in insertion order, as a {@link List}. */
+  keys(): List;
+  /** Own values, in insertion order, as a {@link List}. */
+  values(): List;
+  /** Own `[key, value]` pairs, in insertion order, as a {@link List}. */
+  entries(): List;
+  /** The underlying plain object (a defensive copy). */
+  to_object(): Record<string, unknown>;
+  toJSON(): Record<string, unknown>;
+}
+
+/** Record value-util factory. `dict(input)` wraps a plain object (non-object → empty). Always available. */
+interface DictFactory {
+  (input?: unknown): Dict;
+}
+
+/** Immutable one-record value-util (field-name-first, callback-free). Always available. */
+declare const dict: DictFactory;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Response `meta` — per-capability op metrics keyed by name (`meta.io.<name>`)
 // ─────────────────────────────────────────────────────────────────────────────
 

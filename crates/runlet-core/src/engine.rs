@@ -24,6 +24,7 @@ use serde_json::value::RawValue;
 
 use crate::bytecode::{self, BytecodeCache};
 use crate::capability::{CapabilityRegistry, MuxCall};
+use crate::collections;
 use crate::datetime;
 use crate::decimal;
 use crate::egress::Egress;
@@ -516,6 +517,11 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         // `text` is a pure string value-util (no bridge, no clock/randomness), so it is always-on
         // under both profiles like `Decimal`/`money`/`datetime` and the sanitizer removes nothing.
         text::inject_text(&qctx).map_err(EngineError::internal)?;
+        // `list`/`dict` are pure collection value-utils; their column aggregates compose over the
+        // `Decimal` global, so they must follow `inject_decimal` (above). Always-on under both
+        // profiles — no clock/randomness — so the sanitizer removes nothing and neither exposes a
+        // random-order verb.
+        collections::inject_collections(&qctx).map_err(EngineError::internal)?;
         inject_emit(&qctx, &effects, params.max_ops, params.max_emit_kind_len)
             .map_err(EngineError::internal)?;
         // `log.*` is injected under both profiles (D8) — logging a deterministic run is allowed;

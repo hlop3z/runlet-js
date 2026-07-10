@@ -40,7 +40,10 @@ Read these in order. Each one is short.
    query Hasura with one line and never miss a hidden GraphQL error. 🚀
 9. **[`text` — tidy strings the easy way](12-text.md)** — clean, pad, slug, and mask
    strings with Python-style names (`lower`, `strip`, `zfill`, `slugify`). Always on. ✂️
-10. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+10. **[`list` & `dict` — tidy tables and records](13-lists-and-dicts.md)** — filter, sort,
+   group, and sum by field name, no functions needed (`where`, `sort_by`, `group_by`, `sum`,
+   `get`). Always on. 📋
+11. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
    something fails, and how to read it. 🚦
 
 ## The super-powers 🦸
