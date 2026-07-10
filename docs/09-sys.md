@@ -4,15 +4,17 @@
 
 Some helpers don't talk to the internet, a database, or anything outside the box — they're
 just handy **tools the robot always carries**: making fingerprints of text (hashes),
-signing things, juggling dates. Those live under one name: **`$sys`**.
+signing things. Those live under one name: **`$sys`**.
 
 Think of `$sys` as the robot's tool belt:
 
 - **`$sys.crypto`** — hashing, signing, IDs, and encoders. 🔐
-- **`$sys.date`** — read and do math with dates and times. 📅
 
-Those two are **always on** — no config, just like `$`. Two more show up only when the
+`$sys.crypto` is **always on** — no config, just like `$`. Two more show up only when the
 operator fills them in:
+
+> 📅 Looking for dates and times? They moved out of `$sys` into their own always-on tool,
+> **`datetime`** — see [the `datetime` guide](10-datetime.md).
 
 - **`$sys.env`** — little settings the operator hands your script (like `REGION`). ⚙️
 - **`$sys.secrets`** — passwords/keys you can _use_ but never _see_. 🤫
@@ -86,58 +88,6 @@ $sys.crypto.url.encode("a b&c"); // "a%20b%26c"  (safe to drop in a URL)
 
 ---
 
-## `$sys.date` — dates without the headache 📅
-
-Your script can't **sleep** or wait, but it can **read** and **reshape** dates all day.
-
-### Get "now", or read a date someone sent you
-
-```js
-var today = $sys.date.now(); // right now (always in UTC)
-var when = $sys.date.parse("2026-06-04T12:00:00Z"); // read an ISO date
-var d2 = $sys.date.parse("2026-06-04"); // just a day works too
-var d3 = $sys.date.parse(1780000000000); // or epoch milliseconds
-```
-
-`parse` understands ISO 8601 / RFC 3339 (with or without a timezone), a plain
-`YYYY-MM-DD`, or epoch millis — and always normalizes to **UTC**. Garbage in → it throws,
-so you know right away.
-
-### Add or subtract time (like Python's `timedelta`)
-
-Pass any mix of `weeks`, `days`, `hours`, `minutes`, `seconds`, `ms`:
-
-```js
-var due = $sys.date.now().add({ days: 3, hours: 12 }); // 3½ days from now
-var ago = $sys.date.parse(ctx.when).sub({ weeks: 1 }); // a week earlier
-```
-
-> 💡 Only **fixed-length** units (no "months"/"years") — a month isn't always the same
-> length, so we leave that out on purpose.
-
-### Get your answer out
-
-```js
-due.iso(); // "2026-06-08T00:00:00Z"   (a string to store or send back)
-due.unix(); // 1780876800              (epoch seconds)
-```
-
-In `json(...)`, a date turns into its ISO string **automatically**:
-
-```js
-return json({ due: due }, null); // -> { "due": "2026-06-08T00:00:00Z" }
-```
-
-### How far apart are two dates?
-
-```js
-var gap = $sys.date.parse(b).diff($sys.date.parse(a));
-// { total_ms, total_seconds, days, hours, minutes, seconds }
-gap.days; // e.g. 3
-```
-
----
-
 ## `$sys.env` — settings from the operator ⚙️
 
 The operator can hand your script little named settings, so the **same script** runs in
@@ -202,7 +152,7 @@ $sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws: secrets can'
 
 ## Turning it on 🔘
 
-`$sys.crypto` and `$sys.date` are **always there** — no config. `$sys.env` and
+`$sys.crypto` is **always there** — no config. `$sys.env` and
 `$sys.secrets` are empty `{}` until the operator adds them:
 
 ```jsonc
@@ -222,10 +172,9 @@ $sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws: secrets can'
 - `$sys.crypto.hmac("sha256", key, msg)` → sign (key can be a `$sys.secrets.X` handle).
 - `$sys.crypto.uuid()` → a fresh ID (UUIDv7, time-ordered).
 - `$sys.crypto.base64 / base64url / hex / url` → `.encode()` / `.decode()`.
-- `$sys.date.now()` / `.parse(x)` → a date; then `.add({days})`, `.sub({...})`, `.diff(d)`.
-- `.iso()` / `.unix()` to get it out; `json(...)` makes it an ISO string for free.
 - `$sys.env.KEY` → operator settings. `$sys.secrets.KEY` → use (HMAC), never read.
+- Dates & times? They live in **`datetime`** now — see [10-datetime.md](10-datetime.md).
 
-**Next:** [Hasura — GraphQL the easy way →](11-hasura.md)
+**Next:** [`datetime` — dates & times done right →](10-datetime.md)
 
 [← Back to the guide](README.md)

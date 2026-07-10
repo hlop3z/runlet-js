@@ -27,7 +27,7 @@
  * `typeof s3 === "undefined"`). They are declared here as
  * always-present for convenient autocomplete; guard with `typeof` if a
  * capability is optional.
- * `json`, `$`, `Decimal`, and `$sys.crypto` / `$sys.date` are pure and **always**
+ * `json`, `$`, `Decimal`, `datetime`, and `$sys.crypto` are pure and **always**
  * available; `$sys.env` / `$sys.secrets` populate only when `config.sys` is set.
  *
  * `eval` and `Proxy` are removed before your `handler` runs.
@@ -332,6 +332,184 @@ declare const $: MoneyFactory;
 declare const money: MoneyFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// `datetime` — immutable UTC instant + timezone-aware views (always available)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A value accepted anywhere a {@link DateTime} is expected: an ISO/RFC-3339 string, a
+ * `YYYY-MM-DD` string, epoch milliseconds, or an existing {@link DateTime}. */
+type DateTimeInput = string | number | DateTime;
+
+/** The period unit for {@link DateTime.start_of} / {@link DateTime.end_of}. Weeks start Monday (ISO). */
+type DateTimeUnit = "day" | "week" | "month" | "quarter" | "year";
+
+/** The whole-unit for {@link DateTime.diff_in}. */
+type DateTimeDiffUnit = "ms" | "seconds" | "minutes" | "hours" | "days" | "weeks";
+
+/** Calendar/clock parts for {@link DateTimeFactory.from}. `month` is 1–12, `day` 1–31. */
+interface DateTimeParts {
+  year: number;
+  month: number;
+  day: number;
+  hour?: number;
+  minute?: number;
+  second?: number;
+  millisecond?: number;
+}
+
+/**
+ * A shift for {@link DateTime.add} / {@link DateTime.sub}. `years`/`months` are calendar units
+ * (end-of-month-clamped: Jan 31 + 1 month → Feb 28/29); the rest are fixed-length.
+ */
+interface DateTimeDelta {
+  years?: number;
+  months?: number;
+  weeks?: number;
+  days?: number;
+  hours?: number;
+  minutes?: number;
+  seconds?: number;
+  ms?: number;
+}
+
+/** The gap between two instants, from {@link DateTime.diff}. */
+interface DateTimeDiff {
+  /** Signed total milliseconds (`this - other`). */
+  total_ms: number;
+  /** Signed total seconds. */
+  total_seconds: number;
+  /** Whole days in the absolute gap. */
+  days: number;
+  /** Remaining whole hours (0–23). */
+  hours: number;
+  /** Remaining whole minutes (0–59). */
+  minutes: number;
+  /** Remaining whole seconds (0–59). */
+  seconds: number;
+}
+
+/** ISO-8601 week number and its week-numbering year (which may differ from the calendar year). */
+interface IsoWeek {
+  /** ISO week number (1–53). */
+  week: number;
+  /** ISO week-numbering year. */
+  week_year: number;
+}
+
+/**
+ * An immutable date-time — a **canonical UTC instant** with chainable, snake_case methods. Every
+ * operation returns a new value; the receiver is never mutated. A zoned *view* from
+ * {@link in_zone} re-interprets components, period boundaries, and formatting in an IANA timezone
+ * while the underlying instant (and {@link epoch_ms}) stays the same. Serializes to its RFC 3339
+ * UTC (`Z`) string inside {@link json} / `JSON.stringify`.
+ *
+ * @example
+ * const due = datetime.parse(ctx.invoiced).add({ months: 1 }).end_of("month");
+ * due.in_zone("America/New_York").format("YYYY-MM-DD HH:mm"); // month-end in the customer's zone
+ */
+interface DateTime {
+  /** Calendar year (e.g. `2026`). */
+  year(): number;
+  /** Month, 1–12. */
+  month(): number;
+  /** Day of month, 1–31. */
+  day(): number;
+  /** Hour, 0–23. */
+  hour(): number;
+  /** Minute, 0–59. */
+  minute(): number;
+  /** Second, 0–59. */
+  second(): number;
+  /** Millisecond, 0–999. */
+  millisecond(): number;
+  /** ISO weekday: 1 = Monday … 7 = Sunday. */
+  weekday(): number;
+  /** Calendar quarter, 1–4. */
+  quarter(): number;
+  /** Day of the year, 1–366. */
+  day_of_year(): number;
+  /** ISO-8601 week `{ week, week_year }`. */
+  iso_week(): IsoWeek;
+  /** Number of days in this value's month (28–31). */
+  days_in_month(): number;
+  /** A new instant shifted forward by `delta` (calendar `years`/`months` clamp end-of-month). */
+  add(delta: DateTimeDelta): DateTime;
+  /** A new instant shifted backward by `delta`. */
+  sub(delta: DateTimeDelta): DateTime;
+  /** The signed gap `this - other` broken into fields (accepts a value or epoch millis). */
+  diff(other: DateTimeInput): DateTimeDiff;
+  /** The signed count of whole `unit`s in `this - other` (truncated toward zero). */
+  diff_in(other: DateTimeInput, unit: DateTimeDiffUnit): number;
+  /** The first instant of the `unit` containing this value (in the view zone; weeks start Monday). */
+  start_of(unit: DateTimeUnit): DateTime;
+  /** The last instant of the `unit` containing this value (in the view zone). */
+  end_of(unit: DateTimeUnit): DateTime;
+  /** `true` on a Saturday or Sunday (in the view zone). */
+  is_weekend(): boolean;
+  /** `true` on a weekday (Mon–Fri); holidays are **not** considered. */
+  is_business_day(): boolean;
+  /** Shifts by `n` business days, skipping weekends (negative `n` goes backward). */
+  add_business_days(n: number): DateTime;
+  /** Compares by instant: `-1` if `this < other`, `0` if equal, `1` if greater. */
+  cmp(other: DateTimeInput): number;
+  /** `this === other` by instant. */
+  eq(other: DateTimeInput): boolean;
+  /** `this < other` by instant. */
+  lt(other: DateTimeInput): boolean;
+  /** `this <= other` by instant. */
+  lte(other: DateTimeInput): boolean;
+  /** `this > other` by instant. */
+  gt(other: DateTimeInput): boolean;
+  /** `this >= other` by instant. */
+  gte(other: DateTimeInput): boolean;
+  /** `lo <= this <= hi`, inclusive, by instant. */
+  is_between(lo: DateTimeInput, hi: DateTimeInput): boolean;
+  /**
+   * A zoned **view** over the same instant: components, boundaries, and {@link format} / {@link iso}
+   * resolve in `zone` (an IANA name like `"America/New_York"`). {@link epoch_ms} is unchanged. An
+   * unknown zone throws.
+   */
+  in_zone(zone: string): DateTime;
+  /** RFC 3339 — UTC `Z` by default (or this view's zone), or the given `zone`'s offset. */
+  iso(zone?: string): string;
+  /** Epoch seconds (floored). */
+  unix(): number;
+  /** Epoch milliseconds — the canonical value, unaffected by any view zone. */
+  epoch_ms(): number;
+  /**
+   * Formats with locale-neutral **numeric** tokens — `YYYY YY MM DD HH mm ss SSS`; any other
+   * character is a literal. No locale-language month/day names. Renders in `zone` (or this view's).
+   * @example dt.format("YYYY-MM-DD HH:mm:ss"); // "2026-07-10 13:30:00"
+   */
+  format(pattern: string, zone?: string): string;
+  /** Serializes as the RFC 3339 UTC (`Z`) string inside {@link json} / `JSON.stringify`. */
+  toJSON(): string;
+  /** The RFC 3339 UTC (`Z`) string. */
+  toString(): string;
+}
+
+/**
+ * The `datetime` factory (always available). Callable as `datetime(input)` (≡ {@link parse}) plus
+ * named constructors. Parsing normalizes to a UTC instant; ambiguous locale strings like
+ * `"07/10/2026"` are **not** guessed — they throw.
+ *
+ * @example
+ * datetime("2026-07-10T13:30:00Z");        // parse RFC 3339
+ * datetime.from({ year: 2026, month: 7, day: 10 }, "Asia/Tokyo"); // parts in a zone
+ */
+interface DateTimeFactory {
+  (input: DateTimeInput): DateTime;
+  /** The current instant (UTC). Removed under the deterministic profile. */
+  now(): DateTime;
+  /** Parses an RFC 3339 / `YYYY-MM-DD` string, epoch millis, or a {@link DateTime}. Throws on bad input. */
+  parse(input: DateTimeInput): DateTime;
+  /** Builds an instant from calendar {@link DateTimeParts}, interpreted in `zone` (else UTC). */
+  from(parts: DateTimeParts, zone?: string): DateTime;
+}
+
+/** Date-time factory (immutable UTC instants + zoned views). Always available. */
+declare const datetime: DateTimeFactory;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Response `meta` — per-capability op metrics keyed by name (`meta.io.<name>`)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -422,7 +600,7 @@ interface BatchResponse {
   meta: BatchMeta;
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// `$sys` — runtime stdlib: crypto + date (always on); env/secrets when config.sys set
+// `$sys` — runtime stdlib: crypto (always on); env/secrets when config.sys set
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** HMAC hash algorithm. */
@@ -473,70 +651,6 @@ interface SysCrypto {
 }
 
 /**
- * A fixed-length duration for {@link SysDate.add} / {@link SysDate.sub}, like Python's
- * `timedelta`. Only constant-length units — no months/years (ambiguous length).
- */
-interface SysDuration {
-  weeks?: number;
-  days?: number;
-  hours?: number;
-  minutes?: number;
-  seconds?: number;
-  ms?: number;
-}
-
-/** The gap between two dates, from {@link SysDate.diff}. */
-interface SysDateDiff {
-  /** Signed total milliseconds (`this - other`). */
-  total_ms: number;
-  /** Signed total seconds. */
-  total_seconds: number;
-  /** Whole days in the absolute gap. */
-  days: number;
-  /** Remaining whole hours (0–23). */
-  hours: number;
-  /** Remaining whole minutes (0–59). */
-  minutes: number;
-  /** Remaining whole seconds (0–59). */
-  seconds: number;
-}
-
-/**
- * An immutable UTC instant. Arithmetic is method-based and returns a new instance;
- * serializes as its RFC 3339 string inside {@link json} / `JSON.stringify`.
- */
-interface SysDate {
-  /** A new instant shifted forward by `delta`. */
-  add(delta: SysDuration): SysDate;
-  /** A new instant shifted backward by `delta`. */
-  sub(delta: SysDuration): SysDate;
-  /** Breakdown of `this - other` (accepts another instant or epoch millis). */
-  diff(other: SysDate | number): SysDateDiff;
-  /** RFC 3339 string in UTC, e.g. `"2026-06-08T00:00:00Z"`. */
-  iso(): string;
-  /** Epoch seconds. */
-  unix(): number;
-  /** Epoch milliseconds (the canonical value). */
-  epochMs(): number;
-  /** Serializes as {@link iso}. */
-  toJSON(): string;
-  /** Serializes as {@link iso}. */
-  toString(): string;
-}
-
-/** Date helpers (always available). Parsing normalizes everything to UTC. */
-interface SysDateFactory {
-  /** The current instant (UTC). */
-  now(): SysDate;
-  /**
-   * Parses an ISO 8601 / RFC 3339 string (offset-aware), a `YYYY-MM-DD` date, or epoch
-   * millis → a UTC {@link SysDate}. Throws on unparseable input.
-   * @example $sys.date.parse(ctx.when).add({ days: 3 }).iso();
-   */
-  parse(input: string | number | SysDate): SysDate;
-}
-
-/**
  * An opaque secret handle from {@link Sys.secrets}. The plaintext **never enters JS** —
  * pass it as the `key` of {@link SysCrypto.hmac}; any coercion (`String(x)`, a template
  * literal, `JSON.stringify`) yields `"[secret:NAME]"`, never the value.
@@ -549,15 +663,13 @@ interface SysSecret {
 }
 
 /**
- * The `$sys` runtime standard library. `crypto` and `date` are pure and **always**
- * available; `env` and `secrets` are populated only when `config.sys` is supplied
- * (otherwise they are empty objects).
+ * The `$sys` runtime standard library. `crypto` is pure and **always** available; `env` and
+ * `secrets` are populated only when `config.sys` is supplied (otherwise they are empty objects).
+ * Date/time lives in the top-level {@link datetime} value-util, not here.
  */
 interface Sys {
   /** Pure crypto + encoding (always available). */
   crypto: SysCrypto;
-  /** Date parse + timedelta math (always available). */
-  date: SysDateFactory;
   /**
    * Plain, returnable operator config values from `config.sys.env`. Typed as possibly
    * `undefined` so you can probe optional keys (`$sys.env.FLAG === undefined`); a key
@@ -573,7 +685,7 @@ interface Sys {
   secrets: { readonly [key: string]: SysSecret };
 }
 
-/** Runtime stdlib. `$sys.crypto` / `$sys.date` always available; `env` / `secrets` need `config.sys`. */
+/** Runtime stdlib. `$sys.crypto` always available; `env` / `secrets` need `config.sys`. */
 declare const $sys: Sys;
 
 // ─────────────────────────────────────────────────────────────────────────────

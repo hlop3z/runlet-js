@@ -4,8 +4,9 @@
 
 The `$sys` capability is the always-on runtime standard library for the sandbox: one
 `$`-prefixed global grouping pure, zero-I/O helpers. `$sys.crypto` (hashing, HMAC, UUID,
-encoding) and `$sys.date` (now, parse, math, diff, formatting) are always injected — pure
-like `$`/Decimal, no config and no per-op metering. Two further surfaces, `$sys.env` (plain
+encoding) is always injected — pure like `$`/Decimal, no config and no per-op metering.
+(Date/time helpers are no longer part of `$sys`; they are provided by the always-on
+top-level `datetime` value-util.) Two further surfaces, `$sys.env` (plain
 operator settings) and `$sys.secrets` (operator credentials), are populated only when a
 `config.sys` block is supplied. The defining guarantee is that `$sys.secrets` values are
 opaque handles whose plaintext never enters the JS heap. Rationale: `src/sys.rs`,
@@ -15,13 +16,14 @@ opaque handles whose plaintext never enters the JS heap. Rationale: `src/sys.rs`
 
 ### Requirement: Pure helpers always injected
 
-The system SHALL always expose `$sys.crypto` and `$sys.date` on every execution, without any
-configuration and without per-operation metering, because they perform no I/O.
+The system SHALL always expose `$sys.crypto` on every execution, without any configuration and
+without per-operation metering, because it performs no I/O. (Date/time helpers are no longer part
+of `$sys`; they are provided by the always-on top-level `datetime` value-util.)
 
-#### Scenario: Crypto and date available with no config
+#### Scenario: Crypto available with no config
 
 - **WHEN** a request supplies no `config.sys` block
-- **THEN** `$sys.crypto` and `$sys.date` are defined and callable in the handler
+- **THEN** `$sys.crypto` is defined and callable in the handler, and `$sys.date` does not exist
 
 #### Scenario: Env and secrets default to empty without config
 
@@ -73,27 +75,6 @@ with `.encode()` and `.decode()` over UTF-8 strings.
 
 - **WHEN** the handler decodes a value that is not valid for the codec (bad base64/hex, non-UTF-8 bytes)
 - **THEN** the call throws a developer/script error
-
-### Requirement: Date helpers
-
-The `$sys.date` surface SHALL provide `now()` and `parse(input)` producing date objects with
-`add`/`sub` (fixed-length `weeks`/`days`/`hours`/`minutes`/`seconds`/`ms` deltas), `diff`,
-`iso()`, and `unix()`, normalizing all inputs to UTC.
-
-#### Scenario: Parse multiple input forms to UTC
-
-- **WHEN** the handler calls `$sys.date.parse` with an RFC 3339 string, a `YYYY-MM-DD` string, or epoch millis
-- **THEN** it returns a date object normalized to UTC, and unparseable input throws
-
-#### Scenario: Date math and diff
-
-- **WHEN** the handler calls `.add({days:3, hours:12})`, `.sub({weeks:1})`, or `a.diff(b)`
-- **THEN** `add`/`sub` return a shifted date and `diff` returns `{total_ms, total_seconds, days, hours, minutes, seconds}`
-
-#### Scenario: Date serializes as ISO
-
-- **WHEN** a date object is returned via `json(...)` or stringified
-- **THEN** it serializes to its RFC 3339 ISO string (`Z`, UTC)
 
 ### Requirement: Env is plain operator config
 

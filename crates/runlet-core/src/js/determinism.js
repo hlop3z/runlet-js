@@ -4,8 +4,8 @@
   // eval/Proxy removal.
   //
   // D9 (WASI lesson): the ambient authorities are *removed*, not stubbed. A present-but-gated
-  // authority is one refactor away from being un-gated, so `Math.random`/`Date.now`/`$sys` clock
-  // + entropy are `delete`d outright — the property is simply gone (`typeof x === "undefined"`),
+  // authority is one refactor away from being un-gated, so `Math.random`/`Date.now`/`datetime.now`
+  // + `$sys` entropy are `delete`d outright — the property is simply gone (`typeof x === "undefined"`),
   // with no closure left holding the real function to re-reach. `new Date()` (no args) is the one
   // surface that cannot be a property deletion: it is blocked by replacing the constructor, so the
   // wall clock is still structurally unreachable (there is no residual property to reach).
@@ -42,8 +42,14 @@
     globalThis.Date = SafeDate;
   }
 
+  // `datetime.now` is the sole ambient-clock reader on the `datetime` value-util — delete it
+  // (removed, not stubbed). Everything else on `datetime` (parse/from/components/arithmetic/
+  // comparison/formatting) is pure given an explicit instant and stays available.
+  if (typeof datetime !== "undefined") {
+    delete datetime.now;
+  }
+
   if (typeof $sys !== "undefined") {
-    if ($sys.date) delete $sys.date.now;
     if ($sys.crypto) delete $sys.crypto.uuid;
   }
 })();

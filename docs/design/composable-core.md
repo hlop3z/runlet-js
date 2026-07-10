@@ -41,7 +41,7 @@ script that do **not** pass the mux are, exhaustively:
 | `s3` | in-engine (`s3.rs`), operator-configured endpoint | pure SigV4 signing, no egress round-trip | SSRF-checks the operator endpoint host before signing; performs only signing |
 | wall clock | ambient JS (`Date`, `Date.now`) | JS runtime primitive, not a capability | removed under `Profile::Deterministic` (see below) |
 | entropy / RNG | ambient JS (`Math.random`), `$sys.crypto.uuid` | JS runtime primitive | removed under `Profile::Deterministic` |
-| `$sys` clock | `$sys.date.now` | injected utility, not I/O | removed under `Profile::Deterministic` |
+| `datetime` clock | `datetime.now` | injected utility, not I/O | removed under `Profile::Deterministic` |
 | process exit | not exposed | QuickJS has no host process access | n/a |
 
 Adding any new authority to this list is a reviewed change, not an implementation detail.
@@ -49,7 +49,7 @@ Adding any new authority to this list is a reviewed change, not an implementatio
 ### Deterministic profile *removes*, it does not gate
 
 `Profile::Deterministic` injects **no** registered I/O capability and no `io` mux at all, and it
-`delete`s the ambient nondeterministic surfaces (`Math.random`, `Date.now`, `$sys.date.now`,
+`delete`s the ambient nondeterministic surfaces (`Math.random`, `Date.now`, `datetime.now`,
 `$sys.crypto.uuid`) rather than replacing them with throwing stubs — the WASI lesson that a
 present-but-gated authority gets un-gated by a later refactor. After the sanitizer runs,
 `typeof Math.random === "undefined"`: the property is gone, with no closure left holding the real

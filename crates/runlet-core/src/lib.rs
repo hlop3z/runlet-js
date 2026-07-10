@@ -20,6 +20,7 @@ pub mod bytecode;
 pub mod bytesize;
 pub mod capability;
 pub mod config;
+pub mod datetime;
 pub mod decimal;
 pub mod egress;
 pub mod engine;

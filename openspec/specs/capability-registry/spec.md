@@ -122,7 +122,7 @@ gated; a registered-but-disabled import is not acceptable.
 #### Scenario: Ambient authority is removed, not gated, under deterministic profile
 
 - **WHEN** an invocation runs with the deterministic profile
-- **THEN** the neutralized ambient authorities (time, randomness, `$sys` clock/entropy) are absent from the context such that a script cannot re-reach them, rather than present-but-stubbed in a way that could be un-gated by a later change
+- **THEN** the neutralized ambient authorities (time, randomness — the `datetime` clock and `$sys` crypto entropy) are absent from the context such that a script cannot re-reach them, rather than present-but-stubbed in a way that could be un-gated by a later change
 
 #### Scenario: In-engine capabilities are declared as mux bypasses
 
