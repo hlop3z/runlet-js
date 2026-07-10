@@ -413,8 +413,14 @@ mod tests {
 
     #[test]
     fn round_to_nearest_step() {
-        assert_eq!(scalar("round_to", "2.03", "0.05", ""), Ok("2.05".to_owned()));
-        assert_eq!(scalar("round_to", "2.02", "0.05", ""), Ok("2.00".to_owned()));
+        assert_eq!(
+            scalar("round_to", "2.03", "0.05", ""),
+            Ok("2.05".to_owned())
+        );
+        assert_eq!(
+            scalar("round_to", "2.02", "0.05", ""),
+            Ok("2.00".to_owned())
+        );
     }
 
     #[test]
@@ -428,7 +434,11 @@ mod tests {
     fn allocate_equal_split_preserves_total() {
         assert_eq!(
             list("100.00", "2", "[1,1,1]"),
-            Ok(vec!["33.34".to_owned(), "33.33".to_owned(), "33.33".to_owned()])
+            Ok(vec![
+                "33.34".to_owned(),
+                "33.33".to_owned(),
+                "33.33".to_owned()
+            ])
         );
     }
 
@@ -459,7 +469,11 @@ mod tests {
     fn allocate_preserves_share_count_with_zero_weight() {
         assert_eq!(
             list("10.00", "2", "[1,0,1]"),
-            Ok(vec!["5.00".to_owned(), "0.00".to_owned(), "5.00".to_owned()])
+            Ok(vec![
+                "5.00".to_owned(),
+                "0.00".to_owned(),
+                "5.00".to_owned()
+            ])
         );
     }
 

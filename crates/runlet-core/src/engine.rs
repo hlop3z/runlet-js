@@ -1640,7 +1640,10 @@ mod money_tests {
         );
         assert!(out.contains("\"sum\":\"0.3\""), "exact base-10: {out}");
         assert!(out.contains("\"distinct\":true"), "Decimal !== $: {out}");
-        assert!(out.contains("\"snake\":true") && out.contains("\"camel\":true"), "{out}");
+        assert!(
+            out.contains("\"snake\":true") && out.contains("\"camel\":true"),
+            "{out}"
+        );
     }
 
     /// `Decimal` bounded helpers + banker's rounding + cash rounding compose in JS.
@@ -1654,7 +1657,10 @@ mod money_tests {
             None,
         );
         assert!(out.contains("\"clamp\":\"100\""), "{out}");
-        assert!(out.contains("\"bankers\":\"2\""), "half_even ties to even: {out}");
+        assert!(
+            out.contains("\"bankers\":\"2\""),
+            "half_even ties to even: {out}"
+        );
         assert!(out.contains("\"cash\":\"2.05\""), "{out}");
     }
 
@@ -1702,7 +1708,10 @@ mod money_tests {
         );
         // Money arithmetic stays exact (rounding is explicit): 99.00 / 3 keeps the 2-place scale.
         assert!(out.contains("\"unit\":\"33.00\""), "{out}");
-        assert!(out.contains("\"ratio\":\"1.15\""), "money/money ratio: {out}");
+        assert!(
+            out.contains("\"ratio\":\"1.15\""),
+            "money/money ratio: {out}"
+        );
     }
 
     /// Currency safety: cross-currency add throws a catchable error (no implicit FX).
@@ -1755,17 +1764,32 @@ mod money_tests {
     /// The ISO 4217 exponent table drives precision: BHD=3, CLF=4 minor units; an unknown code throws.
     #[test]
     fn money_currency_exponent_table() {
-        let bhd = run_script("function handler() { return json($('1.234', 'BHD')); }", None);
-        assert!(bhd.contains("\"minor_units\":1234"), "BHD exponent 3: {bhd}");
-        let clf = run_script("function handler() { return json($('1.2345', 'CLF')); }", None);
-        assert!(clf.contains("\"minor_units\":12345"), "CLF exponent 4: {clf}");
+        let bhd = run_script(
+            "function handler() { return json($('1.234', 'BHD')); }",
+            None,
+        );
+        assert!(
+            bhd.contains("\"minor_units\":1234"),
+            "BHD exponent 3: {bhd}"
+        );
+        let clf = run_script(
+            "function handler() { return json($('1.2345', 'CLF')); }",
+            None,
+        );
+        assert!(
+            clf.contains("\"minor_units\":12345"),
+            "CLF exponent 4: {clf}"
+        );
         let bad = run_script(
             "function handler() { \
                try { $('10', 'ZZZ'); return json(null, 'no throw'); } \
                catch (e) { return json({ caught: true }); } }",
             None,
         );
-        assert!(bad.contains("\"caught\":true"), "unknown currency throws: {bad}");
+        assert!(
+            bad.contains("\"caught\":true"),
+            "unknown currency throws: {bad}"
+        );
     }
 }
 
