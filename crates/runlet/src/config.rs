@@ -136,6 +136,12 @@ pub(crate) struct Config {
     /// circuit-breaker cool-down applies. Default [`DEFAULT_RETRY_AFTER_SECONDS`].
     #[serde(default = "default_retry_after_seconds")]
     pub(crate) retry_after_seconds: u32,
+    /// Operator-global default currency for `$` / `money` construction — the last level of the
+    /// three-level cascade (explicit arg → per-request `config.currency` → this). An ISO 4217 code
+    /// (e.g. `"USD"`). Omit to leave money construction currency-less: a `$("19.99")` with no
+    /// per-request currency then throws a plain-language error asking for one.
+    #[serde(default)]
+    pub(crate) default_currency: Option<String>,
 }
 
 /// serde default for [`Config::timeout_retryable`] — retry a timeout unless the operator opts out.
@@ -168,6 +174,7 @@ impl Default for Config {
             batch: BatchConfig::default(),
             timeout_retryable: default_timeout_retryable(),
             retry_after_seconds: default_retry_after_seconds(),
+            default_currency: None,
         }
     }
 }

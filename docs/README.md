@@ -25,8 +25,8 @@ Read these in order. Each one is short.
 3. **[Build your own capability](03-capabilities.md)** — reach a database, cache, queue,
    mail relay, or any service through the one primitive `io.call(name, action, payload)`.
    The three extension paths + the box-direct local shortcut. 🔌
-4. **[`$` — Exact Decimal Math](05-decimal.md)** — the built-in money helper. Do exact
-   decimal math with `$("19.99").mul(3)`. Always on, no setup. 💵
+4. **[`$` — Money & Exact Numbers](05-decimal.md)** — currency-safe money with `$("19.99",
+   "USD")` (tax, penny-safe splits) plus `Decimal` for exact non-money math. Always on. 💵
 5. **[`s3` — signed upload/download links](06-s3.md)** — let a browser upload files
    straight to your bucket (S3, R2, MinIO…). 🔗
 6. **[`$sys` — the built-in toolbox](09-sys.md)** — hashing, signing, dates, and
@@ -58,8 +58,9 @@ local service** bound in the box's config, or one held by a little key-keeper he
 live there, never in your request and never in the robot's box. See
 **[Build your own capability](03-capabilities.md)**.
 
-(`$` — exact decimal math — and **`$sys.crypto` / `$sys.date`** are the exceptions:
-they're **always on**, no config. Only `$sys.env` / `$sys.secrets` need `config.sys`.)
+(`$` / `money` — currency-safe money — `Decimal` — exact numbers — and **`$sys.crypto` /
+`$sys.date`** are the exceptions: they're **always on**, no config. Only `$sys.env` /
+`$sys.secrets` need `config.sys`.)
 
 If you don't turn a super-power on, the robot simply doesn't have it. (For example, with no
 `allowed_hosts`, `http` is `undefined` — it isn't there at all.)

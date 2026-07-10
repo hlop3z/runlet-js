@@ -125,21 +125,32 @@ declare const log: Logger;
 type Handler = (ctx: any) => string;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// `$` / `Decimal` — exact decimal math (always available)
+// `Decimal` — exact number math · `$` / `money` — currency-safe money (always available)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** A value accepted anywhere a decimal is expected. */
+/** A value accepted anywhere an exact number is expected. */
 type DecimalInput = number | string | Decimal;
 
 /**
- * An exact, arbitrary-precision decimal. JavaScript has no operator overloading,
- * so arithmetic is method-based and **immutable** — every operation returns a new
- * `Decimal`. Backed by the same engine that decodes Postgres `NUMERIC`, so it
- * round-trips DB decimals without precision loss.
+ * The rounding strategy for `Decimal.round`/`round_to` and `Money.round`. Adopts the
+ * standard Java `RoundingMode` meaning, spelled snake_case:
+ * - `"half_up"` — round half away from zero (the default; commercial rounding).
+ * - `"half_even"` — banker's rounding (ties to the even neighbour), for ledgers.
+ * - `"up"` / `"down"` — always away from / toward zero.
+ * - `"ceil"` / `"floor"` — toward +∞ / −∞.
+ */
+type RoundingMode = "half_up" | "half_even" | "up" | "down" | "ceil" | "floor";
+
+/**
+ * An exact, arbitrary-precision decimal for **non-money** numbers (quantities, rates,
+ * weights, percentages, ratios). JavaScript has no operator overloading, so arithmetic
+ * is method-based and **immutable** — every operation returns a new `Decimal`. Backed by
+ * the same engine that decodes Postgres `NUMERIC`, so it round-trips DB decimals without
+ * precision loss. For currency use {@link Money} (`$`), which is currency-safe.
  *
  * @example
- * const total = $("0.1").add("0.2");   // exact 0.3, not 0.30000000000000004
- * total.toString();                    // "0.3"
+ * const total = Decimal("0.1").add("0.2");   // exact 0.3, not 0.30000000000000004
+ * total.to_string();                         // "0.3"
  */
 interface Decimal {
   /** Returns `this + other`. */
@@ -154,22 +165,21 @@ interface Decimal {
   neg(): Decimal;
   /** Returns `|this|`. */
   abs(): Decimal;
-  /** Rounds to `places` decimal places (default `0`), half-away-from-zero. */
-  round(places?: number): Decimal;
+  /** Rounds to `places` decimal places (default `0`) using `mode` (default `"half_up"`). */
+  round(places?: number, mode?: RoundingMode): Decimal;
   /**
-   * Converts major units to integer minor units: `this * 10^places`, rounded
-   * half-away-from-zero to a whole number. `places` is the count of minor-unit
-   * digits and defaults to `2` (cents) — pass `0` for yen, `3` for dinars.
-   * @example $("19.99").toCents();   // 1999
-   * @example $("1.005").toCents();   // 101  (sub-cent rounds half-up)
+   * Rounds to the nearest multiple of `step` using `mode` (default `"half_up"`).
+   * @example Decimal("2.03").round_to("0.05");   // 2.05  (cash rounding)
    */
-  toCents(places?: number): Decimal;
-  /**
-   * Converts integer minor units back to major units: `this / 10^places`, fixed to
-   * `places` decimal places. `places` defaults to `2` (cents).
-   * @example $(1999).fromCents(); // "19.99"
-   */
-  fromCents(places?: number): Decimal;
+  round_to(step: DecimalInput, mode?: RoundingMode): Decimal;
+  /** `p` percent of the value: `this * p / 100`. */
+  pct(p: DecimalInput): Decimal;
+  /** The value constrained to the inclusive `[lo, hi]` range. */
+  clamp(lo: DecimalInput, hi: DecimalInput): Decimal;
+  /** The smaller of `this` and `other`. */
+  min(other: DecimalInput): Decimal;
+  /** The larger of `this` and `other`. */
+  max(other: DecimalInput): Decimal;
   /** Compares: returns `-1` if `this < other`, `0` if equal, `1` if greater. */
   cmp(other: DecimalInput): number;
   /** `this === other`. */
@@ -183,32 +193,143 @@ interface Decimal {
   /** `this >= other`. */
   gte(other: DecimalInput): boolean;
   /** `true` if the value is exactly zero. */
-  isZero(): boolean;
+  is_zero(): boolean;
   /** `true` if the value is less than zero. */
-  isNegative(): boolean;
+  is_negative(): boolean;
+  /** `true` if the value is greater than zero. */
+  is_positive(): boolean;
   /** The exact value as a decimal string (e.g. `"19.99"`). */
   toString(): string;
   /** The value as a JS `number` — may lose precision for large/long decimals. */
-  toNumber(): number;
+  to_number(): number;
   /** Serializes as the exact string value inside {@link json} / `JSON.stringify`. */
   toJSON(): string;
+  /** @deprecated Use {@link is_zero}. */
+  isZero(): boolean;
+  /** @deprecated Use {@link is_negative}. */
+  isNegative(): boolean;
+  /** @deprecated Use {@link to_number}. */
+  toNumber(): number;
 }
 
-/**
- * Creates a {@link Decimal} from a number, string, or another `Decimal`.
- * `$` and `Decimal` are the same function.
- *
- * @example
- * const price = $("19.99").mul(3).round(2); // "59.97"
- */
+/** Creates a {@link Decimal} from a number, string, or another `Decimal`. */
 interface DecimalFactory {
   (value?: DecimalInput): Decimal;
 }
 
-/** Exact-decimal factory. Alias of {@link Decimal}. Always available. */
-declare const $: DecimalFactory;
-/** Exact-decimal factory. Alias of {@link $}. Always available. */
+/** Exact-number factory (non-money). Always available. Distinct from `$` (money). */
 declare const Decimal: DecimalFactory;
+
+/** An ISO 4217 currency code (e.g. `"USD"`, `"EUR"`, `"JPY"`). */
+type CurrencyCode = string;
+
+/** The self-describing shape a {@link Money} serializes to in {@link json} / `JSON.stringify`. */
+interface MoneyJSON {
+  /** The exact amount as a decimal string (e.g. `"19.99"`). */
+  amount: string;
+  /** The ISO 4217 currency code. */
+  currency: CurrencyCode;
+  /** Integer minor units, currency-correct (USD `1999`, JPY `1000`, BHD `1234`). */
+  minor_units: number;
+}
+
+/**
+ * A currency-bound money value — **safe by construction**. Arithmetic only combines the
+ * **same** currency (no implicit FX), precision follows the currency's ISO 4217 minor unit
+ * (USD 2 places, JPY 0, BHD 3), and splitting is penny-safe. Immutable: every op returns a
+ * new `Money`. Use {@link Decimal} for non-money numbers.
+ *
+ * @example
+ * const total = $("100.00", "USD").add_pct(8.25);   // 108.25 USD (tax)
+ * total.allocate_to(3);                              // [36.09, 36.08, 36.08], sums exactly
+ */
+interface Money {
+  /** Returns `this + other` (same currency; else throws). */
+  add(other: Money): Money;
+  /** Returns `this - other` (same currency; else throws). */
+  sub(other: Money): Money;
+  /** Returns `this * scalar`. Multiplying money by money throws. */
+  mul(scalar: DecimalInput): Money;
+  /**
+   * Divides by a scalar → `Money`, or by same-currency money → a dimensionless
+   * {@link Decimal} ratio (margin/variance/growth). Cross-currency division throws.
+   */
+  div(other: DecimalInput | Money): Money | Decimal;
+  /** Returns `-this`. */
+  neg(): Money;
+  /** Returns `|this|`. */
+  abs(): Money;
+  /** `p` percent of the amount, rounded to the currency precision (e.g. tax). */
+  pct(p: DecimalInput): Money;
+  /** The amount increased by `p` percent, rounded to the currency precision (tax/markup). */
+  add_pct(p: DecimalInput): Money;
+  /** The amount decreased by `p` percent, rounded to the currency precision (discount). */
+  sub_pct(p: DecimalInput): Money;
+  /** Rounds to the currency's minor unit using `mode` (default `"half_up"`). */
+  round(mode?: RoundingMode): Money;
+  /**
+   * Splits the amount by `weights` so the shares sum to the total **exactly** (largest-remainder /
+   * Hamilton method; leftover minor units go to the largest remainders, ties by input order).
+   * @example $("0.05", "USD").allocate([70, 30]);   // [0.04, 0.01]
+   */
+  allocate(weights: number[]): Money[];
+  /** Equal penny-safe split into `n` shares (sums to the total exactly). */
+  allocate_to(n: number): Money[];
+  /** Alias of {@link allocate_to}. */
+  split(n: number): Money[];
+  /** Compares same-currency amounts: `-1` / `0` / `1` (cross-currency throws). */
+  cmp(other: Money): number;
+  /** `this === other` (same currency). */
+  eq(other: Money): boolean;
+  /** `this < other` (same currency). */
+  lt(other: Money): boolean;
+  /** `this <= other` (same currency). */
+  lte(other: Money): boolean;
+  /** `this > other` (same currency). */
+  gt(other: Money): boolean;
+  /** `this >= other` (same currency). */
+  gte(other: Money): boolean;
+  /** `true` if the amount is exactly zero. */
+  is_zero(): boolean;
+  /** `true` if the amount is negative. */
+  is_negative(): boolean;
+  /** `true` if the amount is positive. */
+  is_positive(): boolean;
+  /** Integer minor units for a payment API (USD `1999`, JPY `1000` — zero-decimal-correct). */
+  to_minor(): number;
+  /** The amount as a currency-less {@link Decimal}. */
+  amount(): Decimal;
+  /** The ISO 4217 currency code. */
+  currency(): CurrencyCode;
+  /** A human display string (e.g. `"$19.99"`). */
+  format(): string;
+  /** The exact amount string, currency omitted (e.g. `"19.99"`). */
+  to_string(): string;
+  /** Same as {@link to_string} — the amount only. */
+  toString(): string;
+  /** The amount as a lossy JS `number`. */
+  to_number(): number;
+  /** Serializes as {@link MoneyJSON} inside {@link json} / `JSON.stringify`. */
+  toJSON(): MoneyJSON;
+}
+
+/**
+ * Creates a {@link Money} value. `$` and `money` are the same constructor. The currency
+ * resolves through a cascade: the explicit `currency` argument, else the per-request
+ * `config.currency`, else the operator `default_currency`; if none is set, construction throws.
+ *
+ * @example
+ * const price = $("19.99", "USD");   // explicit currency
+ * const tax = $("19.99").pct(8.25);  // currency from config.currency / default
+ */
+interface MoneyFactory {
+  (amount: DecimalInput | Money, currency?: CurrencyCode): Money;
+}
+
+/** Money factory (currency-bound). Always available. Same as {@link money}. */
+declare const $: MoneyFactory;
+/** Money factory (currency-bound). Always available. Same as {@link $}. */
+declare const money: MoneyFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Response `meta` — per-capability op metrics keyed by name (`meta.io.<name>`)

@@ -116,6 +116,10 @@ pub(crate) struct AppState {
     pub(crate) timeout_retryable: bool,
     /// Seconds advertised in the `Retry-After` header on a retryable `503`/`500`.
     pub(crate) retry_after_seconds: u32,
+    /// Operator-global default currency for `$` / `money` construction (the last cascade level).
+    /// `None` = no global default; a request without `config.currency` then constructs money
+    /// currency-less and a `$("19.99")` throws asking for a currency.
+    pub(crate) default_currency: Option<Arc<str>>,
 }
 
 impl AppState {
@@ -225,6 +229,11 @@ pub(crate) struct RequestConfig {
     /// to the co-located endpoint. The request never carries endpoints or credentials.
     #[serde(default)]
     pub(crate) io: RequestIo,
+    /// Default currency for `$` / `money` construction in this request (the middle level of the
+    /// cascade: explicit arg → this → operator `default_currency`). An ISO 4217 code (e.g.
+    /// `"EUR"`); lets a script embed its currency once instead of repeating it per call.
+    #[serde(default)]
+    pub(crate) currency: Option<String>,
 }
 
 /// The `config.io` allowlist: a **flat list of logical resource names** the script may address
@@ -801,6 +810,7 @@ async fn run_execute(
         config,
         cache_ns,
         log_floor,
+        default_currency: state.default_currency.clone(),
     })
     .await;
 
@@ -842,6 +852,9 @@ struct ExecuteBlocking {
     /// Trusted per-request diagnostic-log floor override (D6/OQ2). `None` uses the host's configured
     /// floor; the gateway lowers it for a capture run.
     log_floor: Option<LogLevel>,
+    /// Operator-global default currency (the last cascade level). The per-request `config.currency`
+    /// takes precedence; this is the fallback resolved inside the blocking closure.
+    default_currency: Option<Arc<str>>,
 }
 
 /// Runs one invocation to completion on a blocking thread — the shared execute core for `/execute`
@@ -863,6 +876,7 @@ async fn execute_blocking(
         config,
         cache_ns,
         log_floor,
+        default_currency,
     } = params;
     task::spawn_blocking(move || -> (Result<Outcome, EngineError>, EgressMetrics) {
         // The broker session (if any) is wrapped as a `SidecarEgress`, then composed with the
@@ -896,6 +910,11 @@ async fn execute_blocking(
             io: &enabled_io,
         };
         let mut invocation = Invocation::inline(source.as_str(), &context_json).caps(caps);
+        // Currency cascade (last two levels): per-request `config.currency` wins over the operator
+        // default. The explicit `$(amount, currency)` arg (level 1) resolves script-side.
+        if let Some(currency) = config.currency.as_deref().or(default_currency.as_deref()) {
+            invocation = invocation.default_currency(currency);
+        }
         if let Some(port) = egress {
             invocation = invocation.egress(port);
         }
@@ -1356,6 +1375,7 @@ async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         cache_ns: partition.map(str::to_owned),
         // Batch items neither mirror nor stream logs (out of scope for §3); use the host's floor.
         log_floor: None,
+        default_currency: state.default_currency.clone(),
     })
     .await;
 
@@ -2866,6 +2886,7 @@ mod trusted_pipeline_tests {
             batch: crate::config::BatchConfig::default(),
             timeout_retryable: true,
             retry_after_seconds: 1,
+            default_currency: None,
         }
     }
 
@@ -3191,6 +3212,7 @@ mod batch_tests {
             batch: BatchConfig::default(),
             timeout_retryable: true,
             retry_after_seconds: 1,
+            default_currency: None,
         }
     }
 
@@ -3474,6 +3496,7 @@ mod execute_status_tests {
             batch: crate::config::BatchConfig::default(),
             timeout_retryable: true,
             retry_after_seconds: 7,
+            default_currency: None,
         }
     }
 

@@ -1,6 +1,8 @@
 (function () {
-  function call(op, a, b) {
-    var raw = __decimal(op, a, b === undefined ? "" : b);
+  // One native bridge: __decimal(op, lhs, rhs, aux). `rhs`/`aux` carry per-op auxiliary
+  // arguments (a second operand, a places count, a rounding mode, a step, a weights array).
+  function call(op, a, b, aux) {
+    var raw = __decimal(op, a, b === undefined ? "" : String(b), aux === undefined ? "" : String(aux));
     var res = JSON.parse(raw);
     if (res && res.error) throw new Error(res.error);
     return res.v;
@@ -23,16 +25,13 @@
   Dec.prototype.div = function (o) { return new Dec(call("div", this.v, coerce(o))); };
   Dec.prototype.neg = function () { return new Dec(call("neg", this.v)); };
   Dec.prototype.abs = function () { return new Dec(call("abs", this.v)); };
-  Dec.prototype.round = function (places) {
-    return new Dec(call("round", this.v, String(places === undefined ? 0 : places)));
+  // Round to `places` decimal places (default 0) using `mode` (default "half_up").
+  Dec.prototype.round = function (places, mode) {
+    return new Dec(call("round", this.v, places === undefined ? 0 : places, mode));
   };
-  // Major units -> minor units (e.g. 1.50 dollars -> 150 cents). places defaults to 2.
-  Dec.prototype.toCents = function (places) {
-    return new Dec(call("to_cents", this.v, places === undefined ? "" : String(places)));
-  };
-  // Minor units -> major units (e.g. 150 cents -> 1.50 dollars). places defaults to 2.
-  Dec.prototype.fromCents = function (places) {
-    return new Dec(call("from_cents", this.v, places === undefined ? "" : String(places)));
+  // Round to the nearest multiple of `step` (e.g. "0.05" cash rounding), using `mode`.
+  Dec.prototype.round_to = function (step, mode) {
+    return new Dec(call("round_to", this.v, coerce(step), mode));
   };
   Dec.prototype.cmp = function (o) { return parseInt(call("cmp", this.v, coerce(o)), 10); };
   Dec.prototype.eq = function (o) { return this.cmp(o) === 0; };
@@ -40,18 +39,31 @@
   Dec.prototype.lte = function (o) { return this.cmp(o) <= 0; };
   Dec.prototype.gt = function (o) { return this.cmp(o) > 0; };
   Dec.prototype.gte = function (o) { return this.cmp(o) >= 0; };
-  Dec.prototype.isZero = function () { return this.cmp(0) === 0; };
-  Dec.prototype.isNegative = function () { return this.cmp(0) < 0; };
+  Dec.prototype.is_zero = function () { return this.cmp(0) === 0; };
+  Dec.prototype.is_negative = function () { return this.cmp(0) < 0; };
+  Dec.prototype.is_positive = function () { return this.cmp(0) > 0; };
+  // Bounded scalar helpers — composed in JS over cmp/mul (no Rust).
+  Dec.prototype.min = function (o) { var d = make(o); return this.lte(d) ? this : d; };
+  Dec.prototype.max = function (o) { var d = make(o); return this.gte(d) ? this : d; };
+  Dec.prototype.clamp = function (lo, hi) { return this.max(lo).min(hi); };
+  // `p` percent of the value: this * p / 100.
+  Dec.prototype.pct = function (p) { return this.mul(p).div(100); };
   Dec.prototype.toString = function () { return this.v; };
-  Dec.prototype.toNumber = function () { return Number(this.v); };
+  Dec.prototype.to_number = function () { return Number(this.v); };
   // Lets json()/JSON.stringify serialize a decimal as its exact string value.
   Dec.prototype.toJSON = function () { return this.v; };
+
+  // Deprecated camelCase aliases (removed one release later) — delegate to snake_case.
+  Dec.prototype.isZero = function () { return this.is_zero(); };
+  Dec.prototype.isNegative = function () { return this.is_negative(); };
+  Dec.prototype.toNumber = function () { return this.to_number(); };
 
   function make(value) {
     if (value instanceof Dec) return value;
     return new Dec(call("parse", coerce(value)));
   }
 
-  globalThis.$ = make;
+  // Expose the constructor + a marker so money.js can build ratio Decimals and detect them.
+  make._Dec = Dec;
   globalThis.Decimal = make;
 })();

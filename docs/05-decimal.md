@@ -1,161 +1,201 @@
-# 5. `$` — Exact Decimal Math 💵
+# 5. `$` — Money & Exact Numbers 💵
 
 [← Back to the guide](README.md)
 
-Remember the decimal problem (`0.1 + 0.2 = 0.30000000000000004`)? Here's the fix.
+Remember the decimal problem (`0.1 + 0.2 = 0.30000000000000004`)? Here's the fix — and a lot
+more, built for **money**.
 
-jsbox gives you a built-in helper called **`$`** (you can also write `Decimal`) that does
-**exact** decimal math — no tiny rounding mistakes. It's **always on**, so you don't need
-any config. Perfect for money. 🎉
+jsbox gives you two always-on helpers:
 
-> Under the hood it uses the **same exact-decimal engine** that reads `NUMERIC` columns
-> from the database, so the numbers match perfectly.
+- **`$`** (you can also write `money`) — a **money** value that knows its currency. It rounds
+  to the right number of cents by itself, refuses to mix currencies, and splits without losing
+  a penny. Perfect for prices, tax, and refunds. 🎉
+- **`Decimal`** — an **exact number** for everything that _isn't_ money: quantities, weights,
+  rates, percentages, ratios.
 
-## Make a decimal
+> Under the hood both use the **same exact-decimal engine** that reads `NUMERIC` columns from
+> the database, so the numbers match perfectly.
 
-Wrap a value with `$(...)`. Use a **string** for perfect accuracy:
+## Make some money 💰
+
+Wrap an amount with `$(...)` and tell it the currency. Use a **string** for perfect accuracy:
 
 ```js
-var price = $("19.99"); // ✅ exact
-var qty = $(3); // numbers work too
+var price = $("19.99", "USD"); // ✅ exact, in US dollars
+var yen = $("1000", "JPY"); // yen has no cents
 ```
 
-> 💡 Tip: `$("0.1")` is exact. `$(0.1)` is _usually_ fine, but `$(0.1 + 0.2)` is already
-> broken **before** `$` sees it — so prefer strings when you can.
+Don't want to repeat the currency everywhere? Set it once for the whole request in your
+`config` (`"config": { "currency": "USD" }`), or let the operator set a box-wide default. Then
+just write the amount:
+
+```js
+var price = $("19.99"); // currency comes from config / the box default
+```
+
+If no currency is set anywhere, `$("19.99")` throws a friendly error asking for one. Better to
+be told than to guess. 🙂
 
 ## Do the math (with methods, not `+`)
 
-⚠️ **Important:** you can't use `+ - * /` symbols on a `$` decimal — JavaScript won't let
-us make those exact. Use **methods** instead:
+⚠️ **Important:** you can't use `+ - * /` symbols — JavaScript won't let us make those exact.
+Use **methods** instead, and they **chain**:
 
 ```js
-var total = $("19.99").mul(3).add("0.01"); // 19.99 × 3 + 0.01
-total.toString(); // "59.98"  ✅ exact!
+var net = $("100.00", "USD");
+var gross = net.add_pct(8.25); // add 8.25% tax → 108.25 USD
 ```
 
-The methods **chain** — each one returns a new decimal you can keep working with.
+| Method              | Means                                | Example                                       |
+| ------------------- | ------------------------------------ | --------------------------------------------- |
+| `.add(m)`           | plus (same currency)                 | `$("1.10","USD").add($("0.20","USD"))` → 1.30 |
+| `.sub(m)`           | minus (same currency)                | `$("5","USD").sub($("1.50","USD"))` → 3.50    |
+| `.mul(n)`           | times a **number**                   | `$("19.99","USD").mul(3)` → 59.97             |
+| `.div(n)`           | divided by a **number** → money      | `$("99.00","USD").div(3)` → 33.00             |
+| `.div(m)`           | divided by **money** → a ratio       | `$("115","USD").div($("100","USD"))` → 1.15   |
+| `.pct(p)`           | `p` percent of it                    | `$("200","USD").pct(8.25)` → 16.50            |
+| `.add_pct(p)`       | add `p` percent (tax, markup)        | `$("100","USD").add_pct(8.25)` → 108.25       |
+| `.sub_pct(p)`       | take off `p` percent (discount)      | `$("50","USD").sub_pct(10)` → 45.00           |
+| `.round(mode?)`     | round to the currency's cents        | `$("1.005","USD").round()` → 1.01             |
 
-| Method           | Means         | Example                          |
-| ---------------- | ------------- | -------------------------------- |
-| `.add(x)`        | plus          | `$("1.10").add("0.20")` → `1.30` |
-| `.sub(x)`        | minus         | `$("5").sub("1.50")` → `3.50`    |
-| `.mul(x)`        | times         | `$("19.99").mul(3)` → `59.97`    |
-| `.div(x)`        | divided by    | `$("10").div(4)` → `2.5`         |
-| `.neg()`         | flip the sign | `$("5").neg()` → `-5`            |
-| `.abs()`         | make positive | `$("-5").abs()` → `5`            |
-| `.round(places)` | round it      | `$("19.985").round(2)` → `19.99` |
+Two safety rules the money value enforces for you:
 
-`.round` rounds **half-up** (the normal way you learned in school: `19.985` → `19.99`).
+- **No mixing currencies.** `$("1","USD").add($("1","EUR"))` throws — there's no exchange rate
+  inside jsbox, so it never guesses one.
+- **Money times money isn't money.** `.mul` only takes a plain number. But **money ÷ money**
+  _is_ allowed — it gives a plain `Decimal` **ratio** (great for margin or growth: `115/100 = 1.15`).
 
-## Dollars ↔ cents 🪙
+## Split without losing a penny 🪙
 
-Money is often stored as a whole number of the **smallest unit** (cents) so there's no
-fraction to lose. Use `.toCents()` to go from dollars to cents, and `.fromCents()` to come
-back:
+Refunds and shared costs need the parts to add back up to the whole — exactly. `.allocate_to(n)`
+splits evenly, `.allocate(weights)` splits by weight, and `.split(n)` is a nickname for
+`.allocate_to`:
 
 ```js
-$("19.99").toCents(); // 1999   (dollars → cents)
-$(1999).fromCents(); // "19.99" (cents → dollars)
+$("100.00", "USD").allocate_to(3); // [33.34, 33.33, 33.33]  → sums to 100.00
+$("0.05", "USD").allocate([70, 30]); // [0.04, 0.01]          → sums to 0.05
 ```
 
-Both default to **2** minor-unit digits (cents). Currencies are different — pass the number
-of digits to match: `0` for yen, `3` for dinars:
+The leftover cents go to the biggest fractions first (and, on a tie, to the earlier share), so
+the same input always gives the same answer.
+
+## Rounding, your way
+
+`.round()` uses **half-up** by default (the way you learned in school: `1.005` → `1.01`). Need
+banker's rounding for a ledger, or always-up/always-down? Pass a mode:
 
 ```js
-$("1000").toCents(0); // 1000   (¥1000 → 1000, no fraction)
-$("1.234").toCents(3); // 1234   (3-digit minor unit)
+$("1.005", "USD").round("half_even"); // 1.00  (ties go to the even neighbour)
 ```
 
-`.toCents()` rounds **half-up** to a whole number, so fractions of a cent don't sneak
-through (`$("1.005").toCents()` → `101`). `.fromCents()` gives you back exactly that many
-decimal places (`$(150).fromCents()` → `"1.50"`).
+Modes: `"half_up"` (default), `"half_even"`, `"up"`, `"down"`, `"ceil"`, `"floor"`.
 
-## Compare two decimals
+## Getting money out 📤
 
-```js
-$("19.99").gt("9.99"); // true   (greater than)
-$("5.00").eq("5"); // true   (equal)
-$("1.50").lt("2"); // true   (less than)
-```
+| Method         | Gives you                                                          |
+| -------------- | ----------------------------------------------------------------- |
+| `.to_minor()`  | integer cents for a payment API — `$("19.99","USD")` → `1999`      |
+| `.format()`    | a display string — `"$19.99"`                                     |
+| `.amount()`    | the number **without** the currency, as a `Decimal`               |
+| `.currency()`  | the currency code — `"USD"`                                        |
+| `.to_string()` | the exact amount text — `"19.99"`                                  |
 
-| Method      | Asks…                   |
-| ----------- | ----------------------- |
-| `.eq(x)`    | equal?                  |
-| `.lt(x)`    | less than?              |
-| `.lte(x)`   | less than or equal?     |
-| `.gt(x)`    | greater than?           |
-| `.gte(x)`   | greater than or equal?  |
-| `.isZero()` | is it zero?             |
-| `.cmp(x)`   | gives `-1`, `0`, or `1` |
-
-## Getting your answer out
-
-- **`.toString()`** → the exact text, like `"59.98"`. Use this to show it or save it.
-- **`.toNumber()`** → a normal JS number (⚠️ can round — only for display/quick stuff).
-- In `json(...)`, a `$` decimal turns into its exact string **automatically**:
+In `json(...)`, money turns into a **self-describing** object automatically — amount, currency,
+and currency-correct minor units:
 
 ```js
-function handler(ctx) {
-  var total = $("19.99").mul(ctx.qty);
-  return json({ total: total }, null); // -> { "total": "39.98" }  (already a string!)
+function handler() {
+  return json({ total: $("19.99", "USD") }, null);
 }
+// -> { "total": { "amount": "19.99", "currency": "USD", "minor_units": 1999 } }
 ```
 
-## A full money example 🛒
+(For yen, `minor_units` is `1000` for ¥1000 — no phantom ×100.)
+
+## Compare two amounts
+
+Same currency on both sides (or it throws):
+
+```js
+$("19.99", "USD").gt($("9.99", "USD")); // true
+$("-1.00", "USD").is_negative(); // true
+```
+
+Methods: `.eq .lt .lte .gt .gte`, `.cmp` (gives `-1`/`0`/`1`), and `.is_zero .is_negative
+.is_positive`.
+
+## `Decimal` — exact numbers that aren't money 🔢
+
+For quantities, weights, rates, and percentages, use `Decimal`. Same method style, no currency:
+
+```js
+Decimal("0.1").add("0.2").to_string(); // "0.3"  (no float mistakes)
+Decimal("120").clamp(0, 100).to_string(); // "100"
+Decimal("2.03").round_to("0.05").to_string(); // "2.05"  (round to the nearest 5¢)
+Decimal("200").pct(15).to_string(); // "30"   (15% of 200)
+```
+
+Handy `Decimal` extras: `.clamp(lo, hi)`, `.min(x)`, `.max(x)`, `.pct(p)`, `.round(places, mode)`,
+and `.round_to(step, mode)`. It has the same compares as money (`.eq .lt … .is_zero`), plus
+`.to_number()` and `.to_string()`.
+
+## A full order example 🛒
 
 ```js
 function handler(ctx) {
-  // ctx = { items: [ { price: "19.99", qty: 2 }, { price: "4.50", qty: 3 } ] }
-  var total = $("0");
+  // ctx = { items: [ { price: "19.99", qty: 2 }, { price: "4.50", qty: 3 } ], currency: "USD" }
+  var subtotal = $("0", ctx.currency);
   for (var i = 0; i < ctx.items.length; i++) {
     var item = ctx.items[i];
-    total = total.add($(item.price).mul(item.qty));
+    subtotal = subtotal.add($(item.price, ctx.currency).mul(item.qty));
   }
-  var withTax = total.mul("1.08").round(2); // add 8% tax, round to cents
+  var total = subtotal.add_pct(8).round(); // +8% tax, rounded to cents
 
   return json(
     {
-      subtotal: total.toString(), // "53.48"
-      total_with_tax: withTax.toString(), // "57.76"
+      subtotal: subtotal.round(), // { amount, currency, minor_units }
+      total: total,
+      pay_cents: total.to_minor(), // integer for a payment API
     },
     null,
   );
 }
 ```
 
-## Works great with a database 🗄️
-
-Values that don't fit a JS number exactly — big integers, `NUMERIC`/`DECIMAL` columns —
-arrive as **strings** (from `io.call`, see [Build your own capability](03-capabilities.md)).
-Wrap them in `$` to do exact math, then send the result back as a string:
-
-```js
-function handler(ctx) {
-  var row = io.call("products", "query", {
-    sql: "SELECT price FROM products WHERE id = $1",
-    params: [ctx.id],
-  }).rows[0];
-  var newPrice = $(row.price).mul("1.10").round(2); // +10%, rounded
-  io.call("products", "execute", {
-    sql: "UPDATE products SET price = $1 WHERE id = $2",
-    params: [newPrice.toString(), ctx.id],
-  });
-  return json({ price: newPrice }, null);
-}
-```
-
 ## Good to know
 
-- **Always on** — no `config` needed. `$` and `Decimal` are the same thing.
+- **Always on** — no `config` needed to use them. `$` and `money` are the same thing; `Decimal`
+  is separate (numbers, not money).
+- Money math stays **exact** until you `.round()` — so round when you're ready to show or store.
 - Holds about **28–29 digits** — plenty for money and counting. (Not for giant science numbers.)
-- Dividing by zero, or a number too big to hold, **throws an error** (catch it with `try/catch`).
+- Dividing by zero, mixing currencies, an unknown currency code, or a number too big to hold all
+  **throw an error** you can catch with `try/catch`.
 
 ## Cheat sheet 📝
 
-- `$("19.99")` makes an exact decimal.
-- Use **methods** (`.add .sub .mul .div`), **not** `+ - * /`.
-- `.toString()` to show/save, `.round(2)` for cents.
-- In `json(...)`, decimals become exact strings for free.
+- `$("19.99", "USD")` makes money; `Decimal("2.5")` makes a plain exact number.
+- Use **methods** (`.add .sub .mul .div .add_pct .allocate_to`), **not** `+ - * /`.
+- `.round("half_even")` for a ledger; `.to_minor()` for a payment API; `.format()` to show it.
+- In `json(...)`, money becomes `{ amount, currency, minor_units }` for free.
+
+> **Moving from the old `$`?** `$` used to be a plain decimal. That's now **`Decimal`**. And
+> `.toCents(places)` is now **`.to_minor()`** on money (the currency supplies the digits). See the
+> [migration note](#migrating-from-the-old-) below.
+
+## Migrating from the old `$`
+
+`$` changed from "a bare decimal" to "money". Quick mapping:
+
+| Old (decimal `$`)          | New                                             |
+| -------------------------- | ----------------------------------------------- |
+| `$("19.99")` (not money)   | `Decimal("19.99")`                              |
+| `$("19.99").toCents()`     | `$("19.99", "USD").to_minor()`                  |
+| `$("1000").toCents(0)`     | `$("1000", "JPY").to_minor()` (currency sets 0) |
+| `$(1999).fromCents()`      | build money from minor units at construction    |
+| `.isZero()` / `.toNumber()`| `.is_zero()` / `.to_number()` (old names still work for one release) |
+
+The old camelCase names (`isZero`, `isNegative`, `toNumber`) keep working as **deprecated
+aliases** for one release, so existing scripts don't break the day this ships.
 
 **Next:** [`s3` — Signed Upload & Download Links →](06-s3.md)
 

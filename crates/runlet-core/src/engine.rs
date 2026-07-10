@@ -30,6 +30,7 @@ use crate::errors::{self, ErrorCategory, ErrorDebug, ErrorEnvelope, ErrorOwner, 
 #[cfg(feature = "http")]
 use crate::http::{self, HttpMetric};
 use crate::modules;
+use crate::money;
 #[cfg(feature = "s3")]
 use crate::s3::{self, S3Config, S3Metric};
 // The metric collector apparatus is needed only by the in-engine capabilities (`http`/`s3`); the
@@ -314,6 +315,10 @@ pub(crate) struct ExecParams<'a> {
     /// without a local backend. `None` = no per-request fallback. Withheld under
     /// [`Profile::Deterministic`] (it performs I/O).
     pub(crate) egress: Option<Arc<dyn Egress>>,
+    /// The resolved default currency for `$` / `money` construction (`config.currency` else the
+    /// operator `default_currency`). `None` leaves the cascade fallback unset, so a currency-less
+    /// construction throws.
+    pub(crate) default_currency: Option<&'a str>,
     /// Max operations per execution (also caps the number of `emit` effects).
     pub(crate) max_ops: usize,
     /// Max character length of an `emit` `kind` tag; a longer tag is rejected.
@@ -498,6 +503,9 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     let js_result = ctx.with(|qctx| -> Result<ExecOutcome, EngineError> {
         inject_bridge(&qctx).map_err(EngineError::internal)?;
         decimal::inject_decimal(&qctx).map_err(EngineError::internal)?;
+        // `$` / `money` composes over `__decimal`, so it must follow the `Decimal` injection.
+        // Pure (no I/O), so injected under both profiles like `Decimal`.
+        money::inject_money(&qctx, params.default_currency).map_err(EngineError::internal)?;
         sys::inject_sys(&qctx, params.sys_config).map_err(EngineError::internal)?;
         inject_emit(&qctx, &effects, params.max_ops, params.max_emit_kind_len)
             .map_err(EngineError::internal)?;
@@ -1503,6 +1511,7 @@ mod bytecode_cache_tests {
             registry: None,
             enabled_io: &[],
             egress: None,
+            default_currency: None,
             max_ops: 64,
             max_emit_kind_len: 64,
             log_level: super::LogLevel::Info,
@@ -1571,6 +1580,192 @@ mod bytecode_cache_tests {
         assert_eq!(stats.stored, 0, "nothing admitted below the size floor");
         assert_eq!(stats.hits, 0, "no cache hits");
         assert_eq!(stats.entries, 0, "cache stays empty");
+    }
+}
+
+/// End-to-end `Decimal` (exact number) + `$` / `money` (currency-bound) surface: drives the JS
+/// wrappers (`decimal.js` + `money.js`) through the engine so the FFI, the ISO 4217 table, the
+/// currency cascade, and serialization are all exercised together. Capability-free build (no
+/// in-engine `http`/`s3` fields on `ExecParams`).
+#[cfg(test)]
+#[cfg(not(feature = "_io"))]
+mod money_tests {
+    use super::{ExecOutcome, ExecParams, Profile, run};
+    use rquickjs::Runtime;
+    use std::time::Duration;
+
+    /// Runs `script` and returns the success `data`/`error` envelope JSON. `default_currency` seeds
+    /// the construction cascade fallback (the resolved `config.currency` else operator default).
+    fn run_script(script: &str, default_currency: Option<&str>) -> String {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let params = ExecParams {
+            runtime: &runtime,
+            bytecode_cache: None,
+            cache_namespace: None,
+            script,
+            context_json: "{}",
+            timeout: Duration::from_secs(5),
+            profile: Profile::Full,
+            sys_config: None,
+            registry: None,
+            enabled_io: &[],
+            egress: None,
+            default_currency,
+            max_ops: 4096,
+            max_emit_kind_len: 64,
+            log_level: super::LogLevel::Info,
+            max_log_entries: 256,
+            max_log_entry_bytes: 256 * 1024,
+            max_log_total_bytes: 1024 * 1024,
+            max_output_size: 0,
+            allow_private_targets: false,
+        };
+        let result = run(&params).unwrap_or_else(|_err| unreachable!());
+        match result.outcome {
+            ExecOutcome::Success(json) => json,
+            ExecOutcome::Error(err) => format!("ERROR: {err:?}"),
+        }
+    }
+
+    /// `Decimal` is exact and distinct from `$`; snake_case + deprecated camelCase both resolve.
+    #[test]
+    fn decimal_is_exact_and_distinct_from_money() {
+        let out = run_script(
+            "function handler() { return json({ \
+               sum: Decimal('0.1').add('0.2').toString(), \
+               distinct: Decimal !== $, \
+               snake: Decimal('0').is_zero(), \
+               camel: Decimal('0').isZero() }); }",
+            None,
+        );
+        assert!(out.contains("\"sum\":\"0.3\""), "exact base-10: {out}");
+        assert!(out.contains("\"distinct\":true"), "Decimal !== $: {out}");
+        assert!(out.contains("\"snake\":true") && out.contains("\"camel\":true"), "{out}");
+    }
+
+    /// `Decimal` bounded helpers + banker's rounding + cash rounding compose in JS.
+    #[test]
+    fn decimal_helpers_and_modes() {
+        let out = run_script(
+            "function handler() { return json({ \
+               clamp: Decimal('120').clamp(0, 100).toString(), \
+               bankers: Decimal('2.5').round(0, 'half_even').toString(), \
+               cash: Decimal('2.03').round_to('0.05').toString() }); }",
+            None,
+        );
+        assert!(out.contains("\"clamp\":\"100\""), "{out}");
+        assert!(out.contains("\"bankers\":\"2\""), "half_even ties to even: {out}");
+        assert!(out.contains("\"cash\":\"2.05\""), "{out}");
+    }
+
+    /// An invoice-with-tax flow: percentages round to the currency precision, `$`/`money` alias.
+    #[test]
+    fn money_invoice_with_tax() {
+        let out = run_script(
+            "function handler() { \
+               const net = $('100.00', 'USD'); \
+               const gross = net.add_pct(8.25); \
+               return json({ gross: gross.to_string(), alias: money === $, \
+                 minor: gross.to_minor(), fmt: gross.format() }); }",
+            None,
+        );
+        assert!(out.contains("\"gross\":\"108.25\""), "{out}");
+        assert!(out.contains("\"alias\":true"), "{out}");
+        assert!(out.contains("\"minor\":10825"), "{out}");
+        assert!(out.contains("\"fmt\":\"$108.25\""), "{out}");
+    }
+
+    /// A refund split: penny-safe allocation whose shares sum to the total exactly.
+    #[test]
+    fn money_refund_split_is_penny_safe() {
+        let out = run_script(
+            "function handler() { \
+               const parts = $('100.00', 'USD').allocate_to(3).map(function (m) { return m.to_string(); }); \
+               return json({ parts: parts }); }",
+            None,
+        );
+        assert!(
+            out.contains("[\"33.34\",\"33.33\",\"33.33\"]"),
+            "equal split sums to 100.00: {out}"
+        );
+    }
+
+    /// `div` is overloaded: money ÷ scalar → money, money ÷ same-currency money → a Decimal ratio.
+    #[test]
+    fn money_div_overload() {
+        let out = run_script(
+            "function handler() { \
+               const unit = $('99.00', 'USD').div(3).to_string(); \
+               const ratio = $('115.00', 'USD').div($('100.00', 'USD')).toString(); \
+               return json({ unit: unit, ratio: ratio }); }",
+            None,
+        );
+        // Money arithmetic stays exact (rounding is explicit): 99.00 / 3 keeps the 2-place scale.
+        assert!(out.contains("\"unit\":\"33.00\""), "{out}");
+        assert!(out.contains("\"ratio\":\"1.15\""), "money/money ratio: {out}");
+    }
+
+    /// Currency safety: cross-currency add throws a catchable error (no implicit FX).
+    #[test]
+    fn money_cross_currency_add_throws() {
+        let out = run_script(
+            "function handler() { \
+               try { $('1.00','USD').add($('1.00','EUR')); return json(null, 'no throw'); } \
+               catch (e) { return json({ caught: true }); } }",
+            None,
+        );
+        assert!(out.contains("\"caught\":true"), "{out}");
+    }
+
+    /// The currency cascade: no explicit arg falls back to the resolved default currency.
+    #[test]
+    fn money_currency_cascade_uses_default() {
+        let out = run_script(
+            "function handler() { return json($('19.99')); }",
+            Some("EUR"),
+        );
+        assert!(out.contains("\"currency\":\"EUR\""), "{out}");
+        assert!(out.contains("\"minor_units\":1999"), "{out}");
+    }
+
+    /// No currency resolvable → a catchable construction error.
+    #[test]
+    fn money_no_currency_throws() {
+        let out = run_script(
+            "function handler() { \
+               try { $('19.99'); return json(null, 'no throw'); } \
+               catch (e) { return json({ caught: true }); } }",
+            None,
+        );
+        assert!(out.contains("\"caught\":true"), "{out}");
+    }
+
+    /// Self-describing serialization: JPY (exponent 0) has integer `minor_units`, no ×100.
+    #[test]
+    fn money_serializes_self_describing_zero_decimal() {
+        let out = run_script(
+            "function handler() { return json({ y: $('1000', 'JPY') }); }",
+            None,
+        );
+        assert!(out.contains("\"amount\":\"1000\""), "{out}");
+        assert!(out.contains("\"currency\":\"JPY\""), "{out}");
+        assert!(out.contains("\"minor_units\":1000"), "not 100000: {out}");
+    }
+
+    /// The ISO 4217 exponent table drives precision: BHD=3, CLF=4 minor units; an unknown code throws.
+    #[test]
+    fn money_currency_exponent_table() {
+        let bhd = run_script("function handler() { return json($('1.234', 'BHD')); }", None);
+        assert!(bhd.contains("\"minor_units\":1234"), "BHD exponent 3: {bhd}");
+        let clf = run_script("function handler() { return json($('1.2345', 'CLF')); }", None);
+        assert!(clf.contains("\"minor_units\":12345"), "CLF exponent 4: {clf}");
+        let bad = run_script(
+            "function handler() { \
+               try { $('10', 'ZZZ'); return json(null, 'no throw'); } \
+               catch (e) { return json({ caught: true }); } }",
+            None,
+        );
+        assert!(bad.contains("\"caught\":true"), "unknown currency throws: {bad}");
     }
 }
 
@@ -1704,6 +1899,7 @@ mod egress_tests {
             registry: reg.registry,
             enabled_io: reg.enabled,
             egress,
+            default_currency: None,
             max_ops: 8,
             max_emit_kind_len: 64,
             log_level: super::LogLevel::Info,
@@ -2112,6 +2308,7 @@ mod emit_tests {
             registry: None,
             enabled_io: &[],
             egress: None,
+            default_currency: None,
             max_ops: 8,
             max_emit_kind_len: 64,
             log_level: super::LogLevel::Info,
@@ -2278,6 +2475,7 @@ mod log_tests {
             registry: None,
             enabled_io: &[],
             egress: None,
+            default_currency: None,
             max_ops: 64,
             max_emit_kind_len: 64,
             log_level: caps.floor,

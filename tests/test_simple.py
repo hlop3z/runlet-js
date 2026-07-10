@@ -235,6 +235,49 @@ def test_functionality(t: Runner):
     t.test("default empty context",    h("return json(Object.keys(ctx).length, null);"), data_eq(0))
 
 
+def test_money(t: Runner):
+    t.section("Money & Decimal value-utils")
+    # Decimal — exact non-money math, snake_case surface, distinct from $.
+    t.test("Decimal exact add",        h("return json(Decimal('0.1').add('0.2').toString(), null);"), data_eq("0.3"))
+    t.test("Decimal distinct from $",  h("return json(Decimal !== $, null);"), data_eq(True))
+    t.test("Decimal round half_even",  h("return json(Decimal('2.5').round(0, 'half_even').toString(), null);"), data_eq("2"))
+    t.test("Decimal round_to cash",    h("return json(Decimal('2.03').round_to('0.05').toString(), null);"), data_eq("2.05"))
+    t.test("Decimal clamp",            h("return json(Decimal('120').clamp(0, 100).toString(), null);"), data_eq("100"))
+    t.test("deprecated isZero alias",  h("return json(Decimal('0').isZero(), null);"), data_eq(True))
+    # Money — an invoice with tax, end to end through /execute.
+    t.test("invoice with tax",
+           h("var gross = $('100.00','USD').add_pct(8.25); return json({total: gross.to_string(), cents: gross.to_minor(), fmt: gross.format()}, null);"),
+           lambda r: r["data"]["total"] == "108.25" and r["data"]["cents"] == 10825 and r["data"]["fmt"] == "$108.25")
+    t.test("money serializes self-describing",
+           h("return json({price: $('19.99','USD')}, null);"),
+           lambda r: r["data"]["price"] == {"amount": "19.99", "currency": "USD", "minor_units": 1999})
+    t.test("JPY minor_units no x100",
+           h("return json({y: $('1000','JPY')}, null);"),
+           lambda r: r["data"]["y"]["minor_units"] == 1000)
+    # A refund split — penny-safe allocation summing to the total exactly.
+    t.test("refund split sums exactly",
+           h("var p = $('100.00','USD').allocate_to(3).map(function(m){return m.to_string()}); return json(p, null);"),
+           data_eq(["33.34", "33.33", "33.33"]))
+    t.test("weighted split leftover cent",
+           h("var p = $('0.05','USD').allocate([70,30]).map(function(m){return m.to_string()}); return json(p, null);"),
+           data_eq(["0.04", "0.01"]))
+    # div overload: money/scalar -> money; money/money -> a Decimal ratio.
+    t.test("money div scalar -> money",
+           h("return json($('99.00','USD').div(3).to_string(), null);"), data_eq("33.00"))
+    t.test("money div money -> ratio",
+           h("return json($('115.00','USD').div($('100.00','USD')).toString(), null);"), data_eq("1.15"))
+    # Currency safety + cascade.
+    t.test("cross-currency add throws",
+           h("try { $('1','USD').add($('1','EUR')); return json(null, 'no throw'); } catch(e){ return json({caught:true}, null); }"),
+           lambda r: r["data"] == {"caught": True})
+    t.test("config.currency supplies currency",
+           h("return json($('19.99'), null);", config={"currency": "EUR"}),
+           lambda r: r["data"]["currency"] == "EUR" and r["data"]["minor_units"] == 1999)
+    t.test("no currency resolvable throws",
+           h("try { $('19.99'); return json(null, 'no throw'); } catch(e){ return json({caught:true}, null); }"),
+           lambda r: r["data"] == {"caught": True})
+
+
 def test_user_errors(t: Runner):
     t.section("User-defined errors")
     t.test("push error messages",
@@ -1393,6 +1436,7 @@ def main():
 
     t = Runner()
     test_functionality(t)
+    test_money(t)
     test_user_errors(t)
     test_exceptions(t)
     test_sandbox(t)

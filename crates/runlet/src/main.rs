@@ -252,6 +252,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         batch: config.batch,
         timeout_retryable: config.timeout_retryable,
         retry_after_seconds: config.retry_after_seconds,
+        default_currency: config.default_currency.map(Arc::from),
     };
 
     // `/batch` gets its own (larger) body limit sized to the combined-input cap so a batch is not

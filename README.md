@@ -354,25 +354,38 @@ reproducible outputs — billing/audit/intent); `log` is how it *went* (develope
 level-filtered, lossy, outside the reproducible contract). See
 [`docs/design/diagnostic-logging.md`](docs/design/diagnostic-logging.md) for the rationale.
 
-### $ / Decimal — exact decimal math
+### $ / money — currency-safe money · Decimal — exact numbers
 
-Always available (no config). Backed by the same `rust_decimal` engine that reads
+Both always available (no config), backed by the same `rust_decimal` engine that reads
 `NUMERIC` columns, so in-script math matches the database exactly. JavaScript has no
-operator overloading, so use **methods**, not `+ - * /`:
+operator overloading, so use **methods**, not `+ - * /`. Method names are snake_case.
+
+**`$` / `money`** is a currency-bound value: precision follows the currency's ISO 4217 minor
+unit, arithmetic never mixes currencies (no implicit FX), and splitting is penny-safe. The
+currency resolves through a cascade — explicit arg → per-request `config.currency` → operator
+`default_currency`:
 
 ```js
 function handler(ctx) {
-  var total = $("19.99").mul(ctx.qty).add("0.01").round(2);
-  // methods: add sub mul div neg abs round(places) toCents(places) fromCents(places)
-  //          cmp eq lt lte gt gte isZero
-  // output:  toString() | toNumber() (lossy) | json() serializes as the exact string
-  return json({ total: total }, null); // { "total": "..." }
+  var gross = $("100.00", "USD").add_pct(8.25).round(); // 108.25 USD
+  // arithmetic: add sub (same currency) · mul(n) · div(n)→money / div(money)→Decimal ratio · neg abs
+  // percent:    pct add_pct sub_pct     rounding: round(mode?)  ["half_up" default, "half_even", up/down/ceil/floor]
+  // split:      allocate(weights) allocate_to(n) split(n)   (largest-remainder, sums exactly)
+  // compare:    cmp eq lt lte gt gte is_zero is_negative is_positive
+  // out:        to_minor() (integer cents) · amount()→Decimal · currency() · format() · to_string()
+  return json({ total: gross, cents: gross.to_minor() }, null);
+  // json → { "total": { "amount": "108.25", "currency": "USD", "minor_units": 10825 }, "cents": 10825 }
 }
 ```
 
-`.round()` is half-up. `.toCents()` / `.fromCents()` convert major↔minor units (places
-defaults to 2). Holds ~28–29 significant digits. Divide-by-zero and overflow throw.
-See [`docs/05-decimal.md`](docs/05-decimal.md).
+**`Decimal`** is for non-money numbers (quantities, rates, ratios): `add sub mul div neg abs`,
+`round(places, mode)`, `round_to(step, mode)`, `pct(p)`, `clamp(lo, hi)`, `min max`, the same
+compares, `to_string()` / `to_number()`. `Decimal("0.1").add("0.2")` is exactly `0.3`.
+
+Holds ~28–29 significant digits. Divide-by-zero, currency mismatch, unknown currency, and
+overflow throw. **`$` is no longer a bare decimal** — that's `Decimal` now; `.toCents()` →
+money `.to_minor()`. Old camelCase names (`isZero`/`toNumber`) remain as deprecated aliases for
+one release. See [`docs/05-decimal.md`](docs/05-decimal.md).
 
 ### http.get / post / put / patch / delete
 

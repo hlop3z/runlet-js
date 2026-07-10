@@ -29,6 +29,7 @@ pub mod host;
 pub mod http;
 pub mod metrics;
 pub mod modules;
+pub mod money;
 pub mod partition;
 pub mod pool;
 pub mod registry;

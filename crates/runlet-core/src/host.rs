@@ -135,6 +135,9 @@ pub struct Invocation<'a> {
     /// `EngineConfig.log_level`; the trusted gateway lowers it for a capture run so the playground
     /// gets `debug`/`trace` while production stays `info`+.
     pub log_level: Option<LogLevel>,
+    /// Resolved default currency for `$` / `money` construction (`config.currency` else the operator
+    /// `default_currency`). `None` leaves the construction cascade fallback unset.
+    pub default_currency: Option<&'a str>,
 }
 
 impl fmt::Debug for Invocation<'_> {
@@ -152,6 +155,7 @@ impl fmt::Debug for Invocation<'_> {
             .field("egress", &self.egress.as_ref().map(|_res| "<egress>"))
             .field("cache_namespace", &self.cache_namespace)
             .field("log_level", &self.log_level)
+            .field("default_currency", &self.default_currency)
             .finish()
     }
 }
@@ -183,6 +187,7 @@ impl<'a> Invocation<'a> {
             egress: None,
             cache_namespace: None,
             log_level: None,
+            default_currency: None,
         }
     }
 
@@ -219,6 +224,13 @@ impl<'a> Invocation<'a> {
     #[must_use]
     pub const fn log_level(mut self, level: LogLevel) -> Self {
         self.log_level = Some(level);
+        self
+    }
+
+    /// Sets the resolved default currency for `$` / `money` construction (the cascade fallback).
+    #[must_use]
+    pub const fn default_currency(mut self, currency: &'a str) -> Self {
+        self.default_currency = Some(currency);
         self
     }
 }
@@ -409,6 +421,7 @@ impl LogicHost {
                 registry: Some(&self.capabilities),
                 enabled_io: inv.caps.io,
                 egress: inv.egress,
+                default_currency: inv.default_currency,
                 max_ops: self.limits.max_ops,
                 max_emit_kind_len: self.limits.max_emit_kind_len,
                 // The per-request override (D6/OQ2) else the host's configured floor.
