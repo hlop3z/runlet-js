@@ -71,8 +71,22 @@ fn bench_mux(crit: &mut Criterion) {
     let host = build_host();
 
     // A pure-compute baseline: the same host.run offset (context creation + mux injection) without
-    // crossing the io.call boundary even once.
+    // crossing the io.call boundary even once. Under lazy `$std` materialization this touches NO
+    // value-util, so it pays only the structural bootstrap + the lazy-accessor install.
     const BASELINE: &str = "function handler(ctx) { return json(ctx.n + 1); }";
+    // Touches exactly one value-util (`$`/money, which builds `decimal` too): the marginal cost of
+    // materializing one member on demand, read off the delta vs BASELINE.
+    const ONE_UTIL: &str = "function handler(ctx) { return json($(ctx.n, 'USD').to_minor()); }";
+    // Touches every lazy value-util: the worst case degenerates to (about) the pre-change eager cost,
+    // since every member is built.
+    const ALL_UTILS: &str = "function handler(ctx) { \
+        var a = $(ctx.n, 'USD').to_minor(); \
+        var b = $std.decimal(ctx.n).add($std.decimal(1)).toString(); \
+        var d = $std.text('x').upper().value; \
+        var force = [typeof $std.datetime, typeof $std.list, typeof $std.dict, \
+          typeof $std.template, typeof $std.check, typeof $std.crypto, \
+          typeof $std.env, typeof $std.secrets]; \
+        return json([a, b, d, force]); }";
     // One io.call routed through the mux to the no-op backend.
     const ONE_CALL: &str =
         "function handler(ctx) { io.call('noop', 'ping', { x: ctx.n }); return json(ctx.n + 1); }";
@@ -88,6 +102,12 @@ fn bench_mux(crit: &mut Criterion) {
 
     group.bench_function("baseline_0_calls", |bencher| {
         bencher.iter(|| run_once(&host, black_box(BASELINE)));
+    });
+    group.bench_function("one_util", |bencher| {
+        bencher.iter(|| run_once(&host, black_box(ONE_UTIL)));
+    });
+    group.bench_function("all_utils", |bencher| {
+        bencher.iter(|| run_once(&host, black_box(ALL_UTILS)));
     });
     group.bench_function("one_io_call", |bencher| {
         bencher.iter(|| run_once(&host, black_box(ONE_CALL)));
