@@ -24,6 +24,7 @@ use serde_json::value::RawValue;
 
 use crate::bytecode::{self, BytecodeCache};
 use crate::capability::{CapabilityRegistry, MuxCall};
+use crate::check;
 use crate::collections;
 use crate::datetime;
 use crate::decimal;
@@ -543,6 +544,10 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         // the minijinja env exposes no ambient builtins), so it is always-on under both profiles
         // like `text`/`datetime` and the sanitizer removes nothing.
         template::inject_template(&qctx).map_err(EngineError::internal)?;
+        // `check` is a pure checksum-verification value-util (no bridge, no clock/randomness, no
+        // dependency — just integer arithmetic), so it is always-on under both profiles like
+        // `text`/`template` and the sanitizer removes nothing.
+        check::inject_check(&qctx).map_err(EngineError::internal)?;
         inject_emit(&qctx, &effects, params.max_ops, params.max_emit_kind_len)
             .map_err(EngineError::internal)?;
         // `log.*` is injected under both profiles (D8) — logging a deterministic run is allowed;
