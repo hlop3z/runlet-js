@@ -59,6 +59,40 @@ $std.template.text("{% for item in items %}- {{ item }}\n{% endfor %}")
 // "- Coffee\n- Tea\n- Cake\n"
 ```
 
+## Long templates: backticks work, with one gotcha ⚠️💲
+
+For a big multi-line template, JavaScript **backtick strings** (`` ` ``) are much nicer than
+gluing lines with `+`. They work fine here! There's just **one trap**: a `$` sitting *right before*
+a `{{ blank }}`.
+
+Backtick strings have their own blanks too — JavaScript's `${…}`. So when JavaScript sees
+`${{ total }}`, it thinks the `${` is **its** blank and tries to fill it in — and the whole thing
+breaks before the robot ever sees your template. 💥
+
+The fix: put a backslash before that dollar sign — `\$` — so JavaScript leaves it alone. You only
+need this where a `$` touches a `{{`; a plain `{{ customer }}` needs nothing.
+
+```js
+var body = $std.template.html(`
+  <h1>Invoice for {{ customer }}</h1>
+  <ul>
+  {% for line in lines %}<li>{{ line.item }} — \${{ line.price }}</li>{% endfor %}
+  </ul>
+  <p><b>Total: \${{ total }}</b></p>
+`).render(ctx);
+// the \$ becomes a normal "$", and {{ line.price }} / {{ total }} fill in as usual
+```
+
+Don't like backslashes? Let the template add the `$` instead, so it never touches JavaScript's `${`:
+
+```js
+`<p><b>Total: {{ "$" ~ total }}</b></p>`   // ~ glues text together in a blank → "$12.00"
+```
+
+(One more note: backticks keep your line breaks and indentation, so those spaces show up in the
+output. That's fine for email and web pages; if you want it tight, un-indent the lines or go back
+to `+`.)
+
 ## Missing blanks are gentle, not scary 🌤️
 
 If the data is missing a blank, the robot just leaves it **empty** — it won't throw a tantrum:

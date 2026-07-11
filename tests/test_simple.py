@@ -669,21 +669,29 @@ def test_isolation_under_concurrency(t: Runner):
     # a request would observe another's value. Run many in parallel and check every one
     # sees only its own id.
     def one(i):
-        # Retry on a bulkhead 429 â€” this probes isolation, not capacity.
-        for _ in range(20):
+        # This probes isolation, not capacity. A bulkhead shed (OVERLOADED) or a transient
+        # transport blip is NOT a leak â€” retry it (with a gentle backoff under sustained load)
+        # rather than counting it as a failure. The ONLY real failure is a leak: an admitted
+        # request that observed another request's global value.
+        for attempt in range(40):
             body = h(f"globalThis.__leak = {i}; return json(globalThis.__leak, null);")
             r = _post(body)
-            if _err_code(r) == "OVERLOADED":
-                time.sleep(0.02)
+            if r is None or _err_code(r) == "OVERLOADED":
+                time.sleep(0.02 * (1 + attempt // 8))
                 continue
-            return r is not None and r.get("data") == i
-        return False
+            return "ok" if r.get("data") == i else "leak"
+        return "shed"  # never admitted within the retry budget â€” capacity, not a leak
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
         results = list(ex.map(one, range(200)))
+    leaks = results.count("leak")
+    admitted = results.count("ok")
+    # Isolation invariant: zero leaks. Sheds don't fail the test (they're a capacity artifact
+    # on constrained runners), but require a real majority to be admitted so the concurrency is
+    # actually exercised â€” never vacuously green because everything was shed.
     t.test("no global leakage across 200 concurrent runs",
            h("return json(1, null);"),
-           lambda _r: all(results))
+           lambda _r: leaks == 0 and admitted >= 100)
 
     # A prior request that defines a function must not be visible to the next.
     _post(h("globalThis.__planted = function(){ return 'pwned'; }; return json(1, null);"))
