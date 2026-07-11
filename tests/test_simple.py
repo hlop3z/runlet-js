@@ -350,6 +350,26 @@ def test_template(t: Runner):
            lambda r: r["data"] == {"caught": True})
 
 
+def test_check(t: Runner):
+    t.section("check value-util")
+    # Luhn (ISO/IEC 7812-1): valid card, off-by-one neighbour, and space/hyphen tolerance.
+    t.test("luhn valid/invalid + formatting",
+           h("return json({a:$std.check('4111111111111111').luhn(), b:$std.check('4111111111111112').luhn(), c:$std.check('4111 1111-1111 1111').luhn()}, null);"),
+           lambda r: r["data"] == {"a": True, "b": False, "c": True})
+    # GTIN (GS1 mod-10 / ISO/IEC 15420): EAN-13, UPC-A, wrong digit, and an unsupported length.
+    t.test("gtin ean13/upca + rejects",
+           h("return json({a:$std.check('4006381333931').gtin(), b:$std.check('036000291452').gtin(), c:$std.check('4006381333932').gtin(), d:$std.check('12345').gtin()}, null);"),
+           lambda r: r["data"] == {"a": True, "b": True, "c": False, "d": False})
+    # ISO 7064 MOD 97-10: the GB82 IBAN rearranged (country+check to the end), and a corrupted one.
+    t.test("iso7064 mod_97_10 valid/corrupted",
+           h("return json({a:$std.check('WEST12345698765432GB82').iso7064('mod_97_10'), b:$std.check('WEST12345698765433GB82').iso7064('mod_97_10'), c:$std.check('123').iso7064('mod_999')}, null);"),
+           lambda r: r["data"] == {"a": True, "b": False, "c": False})
+    # Malformed input returns false, never throws — safe to call straight inside an if.
+    t.test("malformed input is false, no throw",
+           h("try { var out={x:$std.check('').luhn(), y:$std.check('12x4').luhn(), z:$std.check('!!').iso7064('mod_97_10')}; return json(out, null); } catch(e){ return json(null,'threw'); }"),
+           lambda r: r["data"] == {"x": False, "y": False, "z": False})
+
+
 def test_list_interop(t: Runner):
     t.section("list value-util interop (money / datetime wrappers)")
     # A money column sums to a money value (currency preserved), not a bare Decimal, and never 0.
@@ -1604,6 +1624,7 @@ def main():
     test_money(t)
     test_datetime(t)
     test_template(t)
+    test_check(t)
     test_list_interop(t)
     test_user_errors(t)
     test_exceptions(t)

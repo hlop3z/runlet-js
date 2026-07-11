@@ -654,6 +654,43 @@ interface TemplateFactory {
   text(source: string): CompiledTemplate;
 }
 
+/**
+ * A wrapped value ready for checksum verification. Each method asserts only that the value's check
+ * digit is INTERNALLY CONSISTENT — never that the entity is real, registered, or active (a
+ * checksum-valid card or IBAN can still map to no account). Malformed input (wrong length, stray
+ * characters, empty) returns `false`, never throws.
+ */
+interface Check {
+  /** Luhn mod-10 check (ISO/IEC 7812-1) — credit/debit cards, IMEI. Tolerates space/hyphen formatting. */
+  luhn(): boolean;
+  /** GS1 mod-10 GTIN check digit (ISO/IEC 15420) — UPC-A, EAN-13, GTIN-8, GTIN-14 (strict digits). */
+  gtin(): boolean;
+  /**
+   * ISO/IEC 7064 check-character verification. v1 supports the `"mod_97_10"` system (the check
+   * underlying IBAN and LEI): pass the string as-is for a numeric/LEI value; for an IBAN, move its
+   * country + check characters to the end first — this method does no rearrangement, registry, or
+   * length logic. Unknown `system` → `false`.
+   */
+  iso7064(system: "mod_97_10"): boolean;
+}
+
+/**
+ * Checksum verification for cards, barcodes, and standard identifiers. `$std.check(value)` wraps a
+ * value; pick a scheme method (see {@link Check}). Standards-only and registry-free (ISO/IEC
+ * 7812-1, 15420, 7064) — deterministic, available under both profiles. It verifies a CONSISTENT
+ * check digit, not existence. Registry/jurisdiction validators (`iban`/`bic`/`vat`) and
+ * publishing schemes (`isbn`/`issn`) are deliberate non-goals; use `iso7064("mod_97_10")` on a
+ * caller-rearranged IBAN for its checksum.
+ *
+ * @example
+ * $std.check("4111111111111111").luhn();                         // true
+ * $std.check("4006381333931").gtin();                            // true (EAN-13)
+ * $std.check("WEST12345698765432GB82").iso7064("mod_97_10");     // true (rearranged GB82 IBAN)
+ */
+interface CheckFactory {
+  (value: string | number): Check;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // `list` — a table of records · `dict` — one record (always available)
 // Field-name-first, callback-free collection shaping (SQL / Shopify-Liquid names).
@@ -976,6 +1013,8 @@ interface Std {
   dict: DictFactory;
   /** Deterministic Jinja2 string templating (html/text modes). See {@link TemplateFactory}. */
   template: TemplateFactory;
+  /** Checksum verification (Luhn/GTIN/ISO-7064) — consistent check digit, not existence. See {@link CheckFactory}. */
+  check: CheckFactory;
   /** Operator-named logical egress. Present only when `config.io` lists a name. See {@link Io}. */
   io: Io;
   /** SSRF-guarded HTTP client. Present only when `config.allowed_hosts` is set. See {@link HttpClient}. */

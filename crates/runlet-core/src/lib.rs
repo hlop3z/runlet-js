@@ -19,6 +19,7 @@ pub mod breaker;
 pub mod bytecode;
 pub mod bytesize;
 pub mod capability;
+pub mod check;
 pub mod collections;
 pub mod config;
 pub mod datetime;

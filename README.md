@@ -798,6 +798,37 @@ emit it (`{{ "$" ~ total }}`). A `{{ x }}` with no leading `$` needs nothing.
 
 See [`docs/14-template.md`](docs/14-template.md).
 
+### check — checksum verification (Luhn / GTIN / ISO 7064)
+
+`check` is an **always-on** value-util (no config, like `$`/`Decimal`/`datetime`/`text`), pure JS with
+**no dependency**. `$std.check(value)` wraps a value; each scheme method returns a **boolean** asserting
+the value's check digit is *internally consistent* — **never** that the entity is real or registered (a
+checksum-valid card/IBAN can still map to no account). Malformed input (wrong length, stray characters,
+empty) returns `false` and **never throws**, so it drops straight into an `if`. Standards-anchored and
+registry-free: Luhn (ISO/IEC 7812-1), GS1 mod-10 GTIN (ISO/IEC 15420), and ISO/IEC 7064.
+
+```js
+function handler(ctx) {
+  $std.check("4111111111111111").luhn();       // true   (cards/IMEI; tolerates spaces & hyphens)
+  $std.check("4111111111111112").luhn();        // false  (last-digit typo)
+  $std.check("4006381333931").gtin();           // true   (EAN-13; also UPC-A/GTIN-8/14)
+  $std.check("036000291452").gtin();            // true   (UPC-A)
+
+  // ISO 7064 MOD 97-10 (IBAN/LEI math). For an IBAN, move country+check to the end first:
+  const iban = "GB82WEST12345698765432";
+  $std.check(iban.slice(4) + iban.slice(0, 4)).iso7064("mod_97_10"); // true
+
+  return json({ ok: true }, null);
+}
+```
+
+**Deliberate non-goals:** no branded registry/jurisdiction validators (`iban`/`bic`/`vat`, national-ID
+tables) — they depend on living data that rots — and no publishing schemes (`isbn`/`issn`). An IBAN's
+checksum is reachable via `iso7064("mod_97_10")` on a caller-rearranged string; the primitive holds no
+country/registry/rearrangement logic of its own. This is the **final** value-util.
+
+See [`docs/15-check.md`](docs/15-check.md).
+
 **Secrets are use-not-extract** (the multi-tenant guarantee). With
 `config.sys = { "env": { "REGION": "us-east-1" }, "secrets": { "SIGNING_KEY": "sk_live_…" } }`:
 

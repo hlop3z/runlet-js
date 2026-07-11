@@ -46,7 +46,9 @@ Read these in order. Each one is short.
 11. **[`template` — fill-in-the-blank text](14-template.md)** — turn data into invoices, emails,
    SMS, and receipts with `{{ blanks }}`; `html` mode auto-escapes, `text` mode is verbatim.
    Always on. 📝
-12. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+12. **[`check` — is this number typed right?](15-check.md)** — catch typos in cards, barcodes,
+   and bank codes with their built-in check digit (`luhn`, `gtin`, `iso7064`). Always on. ✅
+13. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
    something fails, and how to read it. 🚦
 
 ## The super-powers 🦸
