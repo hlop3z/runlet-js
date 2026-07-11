@@ -16,13 +16,13 @@ under every profile. `entries()` returns a `list`, making `list` and `dict` one 
 The system SHALL inject a top-level `dict` global into every execution context unconditionally and
 identically under both `Profile::Full` and `Profile::Deterministic`, because the capability is pure
 — it reads no clock, no randomness, and no ambient state — and needs no capability config. `dict`
-SHALL be a factory usable as a callable (`dict(input)`) that treats its argument as a plain object
+SHALL be a factory usable as a callable (`$std.dict(input)`) that treats its argument as a plain object
 (non-objects yield an empty record) and returns an immutable `dict` value with string keys.
 
 #### Scenario: Available with no capability config
 
 - **WHEN** a handler runs with no capability config in the request
-- **THEN** `typeof dict === "function"` and `dict({a:1})` returns a value with the dict methods
+- **THEN** `typeof dict === "function"` and `$std.dict({a:1})` returns a value with the dict methods
 
 #### Scenario: Present and identical under the deterministic profile
 
@@ -43,12 +43,12 @@ underlying plain JavaScript object via `.to_object()` and SHALL coerce to that o
 
 #### Scenario: Transforms do not mutate the receiver
 
-- **WHEN** a handler holds `d = dict({a:1,b:2})` and calls `d.omit("b")`
+- **WHEN** a handler holds `d = $std.dict({a:1,b:2})` and calls `d.omit("b")`
 - **THEN** a new `dict` equal to `{a:1}` is returned while `d.to_object()` still equals `{a:1,b:2}`
 
 #### Scenario: Unwrap to a plain object
 
-- **WHEN** a handler calls `dict({a:1}).to_object()` and `JSON.stringify(dict({a:1}))`
+- **WHEN** a handler calls `$std.dict({a:1}).to_object()` and `JSON.stringify($std.dict({a:1}))`
 - **THEN** it obtains the plain object `{a:1}` (JSON as `"{\"a\":1}"`), never a wrapper object
 
 ### Requirement: Safe nested read with dotted path
@@ -59,12 +59,12 @@ when no default is given) if any intermediate segment is missing or is not an ob
 
 #### Scenario: Read a present nested value
 
-- **WHEN** a handler calls `dict({a:{b:{c:42}}}).get("a.b.c")`
+- **WHEN** a handler calls `$std.dict({a:{b:{c:42}}}).get("a.b.c")`
 - **THEN** it obtains `42`
 
 #### Scenario: Missing path returns the default
 
-- **WHEN** a handler calls `dict({a:{}}).get("a.b.c", "fallback")` and `dict({}).get("x.y")`
+- **WHEN** a handler calls `$std.dict({a:{}}).get("a.b.c", "fallback")` and `$std.dict({}).get("x.y")`
 - **THEN** it obtains `"fallback"` and `undefined` respectively
 
 ### Requirement: Key/value reshaping and membership (no callbacks)
@@ -76,12 +76,12 @@ a shallow last-wins merge of the receiver with `other`).
 
 #### Scenario: Pick and omit named fields
 
-- **WHEN** a handler calls `dict({a:1,b:2,c:3}).pick("a","c").to_object()` and `dict({a:1,b:2,c:3}).omit("b").to_object()`
+- **WHEN** a handler calls `$std.dict({a:1,b:2,c:3}).pick("a","c").to_object()` and `$std.dict({a:1,b:2,c:3}).omit("b").to_object()`
 - **THEN** it obtains `{a:1,c:3}` and `{a:1,c:3}` respectively
 
 #### Scenario: Membership and shallow merge
 
-- **WHEN** a handler calls `dict({a:1}).has("a")`, `dict({a:1}).has("z")`, and `dict({a:1,b:2}).merge({b:9,c:3}).to_object()`
+- **WHEN** a handler calls `$std.dict({a:1}).has("a")`, `$std.dict({a:1}).has("z")`, and `$std.dict({a:1,b:2}).merge({b:9,c:3}).to_object()`
 - **THEN** it obtains `true`, `false`, and `{a:1,b:9,c:3}` respectively
 
 ### Requirement: keys, values, and entries bridge to list
@@ -92,5 +92,5 @@ return a `list` of `[key, value]` pairs, bridging `dict` to `list`.
 
 #### Scenario: keys, values, and entries as lists
 
-- **WHEN** a handler calls `dict({a:1,b:2}).keys().to_array()`, `.values().to_array()`, and `.entries().to_array()`
+- **WHEN** a handler calls `$std.dict({a:1,b:2}).keys().to_array()`, `.values().to_array()`, and `.entries().to_array()`
 - **THEN** it obtains `["a","b"]`, `[1,2]`, and `[["a",1],["b",2]]` respectively

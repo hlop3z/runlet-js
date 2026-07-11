@@ -16,11 +16,11 @@ that change's `design.md`.
   a single **non-generic** `LogicHost` (D1). Capabilities are held as data (`Vec` / `HashMap`),
   never a type parameter, so adding or removing a capability never changes a downstream
   signature. Duplicate names are rejected at build, before any request is served.
-- **The egress mux** (`CapabilityRegistry::dispatch`) — every `io.call(name, action, payload)`
+- **The egress mux** (`CapabilityRegistry::dispatch`) — every `$std.io.call(name, action, payload)`
   routes by `name`: a locally-bound backend first, then the per-request fallback (the stock
   server's `fabricd` sidecar), then the builder-wired fallback; an unrouted registered name with
   no fallback fails `EGRESS_UNAVAILABLE`. An **unregistered** name has no JS global at all, but a
-  raw `io.call` still reaches the fallback (the sidecar resolves the logical name, or nothing
+  raw `$std.io.call` still reaches the fallback (the sidecar resolves the logical name, or nothing
   does) — the box grants no authority the operator did not wire.
 - **Per-request opt-in** — a registered def's wrapper is injected only when its name is in the
   request's enabled `io` list (and only under `Profile::Full`).
@@ -40,8 +40,8 @@ script that do **not** pass the mux are, exhaustively:
 | `http` | in-engine (`http.rs`), script-controlled URL | carries in-engine reqwest code, not an egress backend | the SSRF guard (allowlist + private-IP block + connect-time DNS pinning) is applied in-module and cannot be forgotten |
 | `s3` | in-engine (`s3.rs`), operator-configured endpoint | pure SigV4 signing, no egress round-trip | SSRF-checks the operator endpoint host before signing; performs only signing |
 | wall clock | ambient JS (`Date`, `Date.now`) | JS runtime primitive, not a capability | removed under `Profile::Deterministic` (see below) |
-| entropy / RNG | ambient JS (`Math.random`), `$sys.crypto.uuid` | JS runtime primitive | removed under `Profile::Deterministic` |
-| `datetime` clock | `datetime.now` | injected utility, not I/O | removed under `Profile::Deterministic` |
+| entropy / RNG | ambient JS (`Math.random`), `$std.crypto.uuid` | JS runtime primitive | removed under `Profile::Deterministic` |
+| `datetime` clock | `$std.datetime.now` | injected utility, not I/O | removed under `Profile::Deterministic` |
 | process exit | not exposed | QuickJS has no host process access | n/a |
 
 Adding any new authority to this list is a reviewed change, not an implementation detail.
@@ -49,8 +49,8 @@ Adding any new authority to this list is a reviewed change, not an implementatio
 ### Deterministic profile *removes*, it does not gate
 
 `Profile::Deterministic` injects **no** registered I/O capability and no `io` mux at all, and it
-`delete`s the ambient nondeterministic surfaces (`Math.random`, `Date.now`, `datetime.now`,
-`$sys.crypto.uuid`) rather than replacing them with throwing stubs — the WASI lesson that a
+`delete`s the ambient nondeterministic surfaces (`Math.random`, `Date.now`, `$std.datetime.now`,
+`$std.crypto.uuid`) rather than replacing them with throwing stubs — the WASI lesson that a
 present-but-gated authority gets un-gated by a later refactor. After the sanitizer runs,
 `typeof Math.random === "undefined"`: the property is gone, with no closure left holding the real
 function to re-reach. The one exception is `new Date()` (no args), which is a constructor path
@@ -103,7 +103,7 @@ use runlet_core::{CapabilityDef, LogicHost, Trust};
 // implements runlet_wire::Egress), plus the stock preset for everything else via the sidecar.
 let my_pg = CapabilityDef::new(
     "db",
-    include_str!("js/db.js"),      // routes through io.call('db', <action>, payload)
+    include_str!("js/db.js"),      // routes through $std.io.call('db', <action>, payload)
     include_str!("js/db.d.ts"),    // travels with the capability (D11)
     Trust::OperatorSupplied,       // targets from operator config → no SSRF guard
 ).with_backend(Arc::new(my_in_process_db_backend));

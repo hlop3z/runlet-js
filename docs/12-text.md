@@ -13,15 +13,15 @@ helpers.
 ## Make a `text`
 
 ```js
-var t = text("  Hello World  "); // wrap any string
-text(42);                        // numbers become "42"
-text(t);                         // already a text? you get it back
+var t = $std.text("  Hello World  "); // wrap any string
+$std.text(42);                        // numbers become "42"
+$std.text(t);                         // already a text? you get it back
 ```
 
 Get the plain string back out any time with `.value`:
 
 ```js
-text("Ac-Me").lower().value; // "ac-me"  ← a normal string again
+$std.text("Ac-Me").lower().value; // "ac-me"  ← a normal string again
 ```
 
 ## A `text` never changes 🔒
@@ -29,7 +29,7 @@ text("Ac-Me").lower().value; // "ac-me"  ← a normal string again
 Every method gives you a **new** value; the one you had stays put. Great for avoiding bugs.
 
 ```js
-var t = text("  Hi  ");
+var t = $std.text("  Hi  ");
 t.strip().value; // "Hi"
 t.value;         // "  Hi  "  (unchanged!)
 ```
@@ -37,48 +37,48 @@ t.value;         // "  Hi  "  (unchanged!)
 You can **chain** as many as you like — each step hands the next one a fresh value:
 
 ```js
-text("  Café Ör 01! ").strip().slugify().value; // "cafe-or-01"
+$std.text("  Café Ör 01! ").strip().slugify().value; // "cafe-or-01"
 ```
 
 ## The everyday helpers (Python names)
 
 ```js
-text("HELLO").lower().value;          // "hello"
-text("hello").upper().value;          // "HELLO"
-text("hello world").title().value;    // "Hello World"
-text("hello").capitalize().value;     // "Hello"
+$std.text("HELLO").lower().value;          // "hello"
+$std.text("hello").upper().value;          // "HELLO"
+$std.text("hello world").title().value;    // "Hello World"
+$std.text("hello").capitalize().value;     // "Hello"
 
-text("  spaced  ").strip().value;     // "spaced"
-text("xxcodexx").strip("x").value;    // "code"   (strip specific characters)
+$std.text("  spaced  ").strip().value;     // "spaced"
+$std.text("xxcodexx").strip("x").value;    // "code"   (strip specific characters)
 
-text("SKU-0042").starts_with("SKU-"); // true
-text("SKU-0042").removeprefix("SKU-").value; // "0042"
-text("invoice.pdf").removesuffix(".pdf").value; // "invoice"
+$std.text("SKU-0042").starts_with("SKU-"); // true
+$std.text("SKU-0042").removeprefix("SKU-").value; // "0042"
+$std.text("invoice.pdf").removesuffix(".pdf").value; // "invoice"
 
-text("a.b.c").replace(".", "-").value; // "a-b-c"  (replaces ALL, like Python)
-text("a.b.c").count(".");              // 2
+$std.text("a.b.c").replace(".", "-").value; // "a-b-c"  (replaces ALL, like Python)
+$std.text("a.b.c").count(".");              // 2
 
-text("a,b,c").split(",");              // ["a", "b", "c"]  (plain strings)
-text("line1\nline2").splitlines();     // ["line1", "line2"]
+$std.text("a,b,c").split(",");              // ["a", "b", "c"]  (plain strings)
+$std.text("line1\nline2").splitlines();     // ["line1", "line2"]
 ```
 
 **Is it made of…?** (handy for checking codes — `false` for an empty string)
 
 ```js
-text("0042").is_digit(); // true
-text("Café").is_alpha(); // true
-text("A1").is_alnum();   // true
-text("   ").is_space();  // true
+$std.text("0042").is_digit(); // true
+$std.text("Café").is_alpha(); // true
+$std.text("A1").is_alnum();   // true
+$std.text("   ").is_space();  // true
 ```
 
 ## Line things up (padding)
 
 ```js
-text("42").zfill(6).value;         // "000042"   (zero-pad a reference number)
-text("-42").zfill(6).value;        // "-00042"   (keeps the sign in front)
-text("x").rjust(5).value;          // "    x"
-text("x").ljust(5, ".").value;     // "x...."
-text("hi").center(6, "-").value;   // "--hi--"
+$std.text("42").zfill(6).value;         // "000042"   (zero-pad a reference number)
+$std.text("-42").zfill(6).value;        // "-00042"   (keeps the sign in front)
+$std.text("x").rjust(5).value;          // "    x"
+$std.text("x").ljust(5, ".").value;     // "x...."
+$std.text("hi").center(6, "-").value;   // "--hi--"
 ```
 
 > 🛟 Padding widths are **capped** so a runaway number (like `rjust(9999999999)`) can't eat all
@@ -88,23 +88,23 @@ text("hi").center(6, "-").value;   // "--hi--"
 
 ```js
 // Turn a name into a URL-safe / code-safe slug (accents are folded away):
-text("Café Málaga #2").slugify().value; // "cafe-malaga-2"
+$std.text("Café Málaga #2").slugify().value; // "cafe-malaga-2"
 
 // Hide all but the last few characters (for showing a card or account safely):
-text("4111111111111234").mask().value;            // "************1234"
-text("4111111111111234").mask({ keep: 4, char: "#" }).value; // "############1234"
-text("secret@mail.com").redact({ keep: 3 }).value; // "************com"  (redact = mask)
+$std.text("4111111111111234").mask().value;            // "************1234"
+$std.text("4111111111111234").mask({ keep: 4, char: "#" }).value; // "############1234"
+$std.text("secret@mail.com").redact({ keep: 3 }).value; // "************com"  (redact = mask)
 
 // Squash messy spacing into single spaces:
-text("too    many\t spaces").collapse().value; // "too many spaces"
+$std.text("too    many\t spaces").collapse().value; // "too many spaces"
 
 // Shorten long text with an ellipsis (…):
-text("a very long description").truncate(10).value; // "a very lo…"
+$std.text("a very long description").truncate(10).value; // "a very lo…"
 ```
 
 > 🔐 **`mask`/`redact` is for *showing* things safely — it is not encryption.** The hidden
 > characters are simply gone from the result; there's no way to get them back. To hash or sign a
-> value (something reversible/verifiable), reach for [`$sys.crypto`](09-sys.md) instead.
+> value (something reversible/verifiable), reach for [`$std.crypto`](09-sys.md) instead.
 
 ## Good to know
 
@@ -122,7 +122,7 @@ text("a very long description").truncate(10).value; // "a very lo…"
 
 ## Cheat-sheet
 
-- **Make / unwrap:** `text(x)` → value; `.value` / `String(v)` → plain string; `json()` → the string.
+- **Make / unwrap:** `$std.text(x)` → value; `.value` / `String(v)` → plain string; `json()` → the string.
 - **Case:** `lower/upper`, `capitalize`, `title`, `swap_case`.
 - **Trim:** `strip/lstrip/rstrip` (optional characters, else whitespace).
 - **Ends:** `starts_with/ends_with`, `removeprefix/removesuffix`.

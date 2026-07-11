@@ -1,23 +1,10 @@
-# sys Specification
-
-## Purpose
-
-The `sys` capability is the always-on runtime standard library for the sandbox, exposed under the
-canonical `$std` namespace. `$std.crypto` (hashing, HMAC, UUID, encoding) is always injected — pure
-like `$`/`$std.decimal`, no config and no per-op metering. (Date/time helpers are not part of the
-crypto surface; they are provided by the always-on top-level `$std.datetime` value-util.) Two further
-surfaces, `$std.env` (plain operator settings) and `$std.secrets` (operator credentials), are
-populated only when a `config.sys` block is supplied. The defining guarantee is that `$std.secrets`
-values are opaque handles whose plaintext never enters the JS heap. Rationale: `src/sys.rs`,
-`src/js/sys.js`, and `docs/09-sys.md`.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Pure helpers always injected
 
 The system SHALL always expose `$std.crypto` on every execution, without any configuration and
-without per-operation metering, because it performs no I/O. (Date/time helpers are not part of the
-crypto surface; they are provided by the always-on `$std.datetime` value-util.)
+without per-operation metering, because it performs no I/O. (Date/time helpers are not part of
+the crypto surface; they are provided by the always-on `$std.datetime` value-util.)
 
 #### Scenario: Crypto available with no config
 

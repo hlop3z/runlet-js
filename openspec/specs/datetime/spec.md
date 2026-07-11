@@ -7,7 +7,7 @@ top-level factory that produces immutable UTC-canonical instants with a snake_ca
 business-scripting author surface. It provides construction/parsing, calendar components,
 calendar-aware arithmetic, difference, weekend-aware business-day helpers, comparison, period
 boundaries, timezone-aware views, and numeric/ISO formatting — all pure (no I/O, no
-per-operation metering) except the current-time reader `datetime.now()`, which the
+per-operation metering) except the current-time reader `$std.datetime.now()`, which the
 deterministic profile removes. It supersedes the former `$sys.date` helpers.
 
 ## Requirements
@@ -16,13 +16,13 @@ deterministic profile removes. It supersedes the former `$sys.date` helpers.
 
 The system SHALL inject a top-level `datetime` global into every execution context
 unconditionally, because the capability is pure (no I/O, no per-operation metering) and needs no
-capability config. `datetime` SHALL be a factory usable both as a callable (`datetime(input)`) and
-via named constructors (`datetime.now()`, `datetime.parse(input)`, `datetime.from(parts, zone?)`).
+capability config. `datetime` SHALL be a factory usable both as a callable (`$std.datetime(input)`) and
+via named constructors (`$std.datetime.now()`, `$std.datetime.parse(input)`, `$std.datetime.from(parts, zone?)`).
 
 #### Scenario: Available with no capability config
 
 - **WHEN** a handler runs with no capability config in the request
-- **THEN** `typeof datetime === "function"`, `datetime.now`, `datetime.parse`, and `datetime.from` are callable
+- **THEN** `typeof datetime === "function"`, `$std.datetime.now`, `$std.datetime.parse`, and `$std.datetime.from` are callable
 
 #### Scenario: Not metered against the operation cap
 
@@ -31,7 +31,7 @@ via named constructors (`datetime.now()`, `datetime.parse(input)`, `datetime.fro
 
 ### Requirement: Deterministic profile removes the clock
 
-Under the deterministic execution profile the current-time reader `datetime.now()` SHALL be
+Under the deterministic execution profile the current-time reader `$std.datetime.now()` SHALL be
 removed from the context — absent such that a script cannot re-reach it — not stubbed. All other
 `datetime` behavior (parsing explicit inputs, components, arithmetic, comparison, formatting) SHALL
 remain fully available, because it is pure given an explicit instant.
@@ -39,7 +39,7 @@ remain fully available, because it is pure given an explicit instant.
 #### Scenario: now() is absent under the deterministic profile
 
 - **WHEN** an invocation runs with the deterministic profile
-- **THEN** `datetime.now` is undefined and cannot be re-reached, while `datetime.parse` / `datetime.from` and all instance methods still work
+- **THEN** `$std.datetime.now` is undefined and cannot be re-reached, while `$std.datetime.parse` / `$std.datetime.from` and all instance methods still work
 
 #### Scenario: Same input is reproducible under the deterministic profile
 
@@ -48,20 +48,20 @@ remain fully available, because it is pure given an explicit instant.
 
 ### Requirement: Construction and parsing normalize to a UTC instant
 
-`datetime.parse(input)` (and the callable `datetime(input)`) SHALL accept an RFC 3339 / ISO 8601
+`$std.datetime.parse(input)` (and the callable `$std.datetime(input)`) SHALL accept an RFC 3339 / ISO 8601
 string, a `YYYY-MM-DD` date-only string, epoch milliseconds, or an existing `datetime`, and return
-an immutable value canonicalized to a UTC instant. `datetime.from(parts, zone?)` SHALL build an
+an immutable value canonicalized to a UTC instant. `$std.datetime.from(parts, zone?)` SHALL build an
 instant from `{year, month, day, hour?, minute?, second?, millisecond?}`, interpreting the parts in
 `zone` when supplied else UTC. Unparseable or out-of-range input SHALL throw a developer/script error.
 
 #### Scenario: Parse multiple input forms
 
-- **WHEN** the handler calls `datetime.parse` with an RFC 3339 string, a `YYYY-MM-DD` string, epoch millis, or another `datetime`
+- **WHEN** the handler calls `$std.datetime.parse` with an RFC 3339 string, a `YYYY-MM-DD` string, epoch millis, or another `datetime`
 - **THEN** it returns a UTC-canonical instant, and unparseable input throws
 
 #### Scenario: Construct from parts
 
-- **WHEN** the handler calls `datetime.from({ year: 2026, month: 7, day: 10 })`
+- **WHEN** the handler calls `$std.datetime.from({ year: 2026, month: 7, day: 10 })`
 - **THEN** it returns the corresponding UTC midnight instant, and supplying a `zone` interprets the parts in that zone
 
 #### Scenario: Locale-format strings are not guessed
@@ -105,7 +105,7 @@ A `datetime` value SHALL expose its calendar components: `year()`, `month()` (1�
 
 #### Scenario: Read components of an instant
 
-- **WHEN** the handler reads components of `datetime.parse("2026-07-10T13:30:00Z")`
+- **WHEN** the handler reads components of `$std.datetime.parse("2026-07-10T13:30:00Z")`
 - **THEN** `year()` is 2026, `month()` is 7, `day()` is 10, `weekday()` is 5 (Friday), `quarter()` is 3, and `days_in_month()` is 31
 
 #### Scenario: ISO week reporting
@@ -171,7 +171,7 @@ country/company-specific and out of scope.
 
 The value SHALL provide `cmp(other)` (`-1`/`0`/`1`), `eq`, `lt`, `lte`, `gt`, `gte`, and
 `is_between(a, b)`, comparing by instant. No comparison helper SHALL read the ambient wall clock;
-comparing against "now" requires an explicit `datetime.now()` argument.
+comparing against "now" requires an explicit `$std.datetime.now()` argument.
 
 #### Scenario: Ordering comparisons
 

@@ -8,7 +8,7 @@ surface. It provides Pythonic-named renames that delegate to native JavaScript s
 operations plus a small set of ERP-common shaping verbs (slugify, mask, whitespace collapse,
 truncate, padding). It is pure (no I/O, no clock, no randomness, no per-operation metering) and
 is injected identically under every profile. It does human-readable *shaping* and is distinct
-from `$sys.crypto`/codec (reversible byte encoding, hmac, uuid) and from any future
+from `$std.crypto`/codec (reversible byte encoding, hmac, uuid) and from any future
 semantic-domain validation util.
 
 ## Requirements

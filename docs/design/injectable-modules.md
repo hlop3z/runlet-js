@@ -45,7 +45,7 @@ enforced in review, not in code, because it cannot be enforced in code.
 
 The injection seam already exists and is exercised on every request. `engine.rs::run`
 evals operator-controlled JS into the fresh context before the user script:
-`bridge.js`, the Decimal global, `$sys`, and each capability wrapper (`src/js/*.js`
+`bridge.js`, the Decimal global, `$std`, and each capability wrapper (`src/js/*.js`
 via `include_str!`). An injectable module is the same mechanism with the source coming
 from a registry instead of the binary.
 

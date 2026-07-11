@@ -26,13 +26,13 @@ Read these in order. Each one is short.
    shape of every answer.
 2. **[`http` — talk to the internet](02-api.md)** — fetch data from other websites.
 3. **[Build your own capability](03-capabilities.md)** — reach a database, cache, queue,
-   mail relay, or any service through the one primitive `io.call(name, action, payload)`.
+   mail relay, or any service through the one primitive `$std.io.call(name, action, payload)`.
    The three extension paths + the box-direct local shortcut. 🔌
 4. **[`$` — Money & Exact Numbers](05-decimal.md)** — currency-safe money with `$("19.99",
    "USD")` (tax, penny-safe splits) plus `Decimal` for exact non-money math. Always on. 💵
 5. **[`s3` — signed upload/download links](06-s3.md)** — let a browser upload files
    straight to your bucket (S3, R2, MinIO…). 🔗
-6. **[`$sys` — the built-in toolbox](09-sys.md)** — hashing, signing, and
+6. **[`$std` — the built-in toolbox](09-sys.md)** — hashing, signing, and
    use-but-never-see secrets. Always on (no setup) for `crypto`. 🧰
 7. **[`datetime` — dates & times done right](10-datetime.md)** — parse, calendar math,
    period boundaries, and **timezone-correct** answers. Always on. 📅
@@ -60,7 +60,7 @@ There are **three** built-in super-powers:
 | `io`        | Talk to a named service or database   | `config.io: ["nickname"]` |
 
 Anything else — a database, a cache, a queue, a mail relay, your own service — you reach
-through the **one primitive** `io.call("nickname", action, payload)` after listing the
+through the **one primitive** `$std.io.call("nickname", action, payload)` after listing the
 nickname in `config.io`. `config.io` is a **flat list of nicknames** (`["orders", "cache"]`).
 Each nickname points at a resource the grown-up (operator) set up — either a **co-located
 local service** bound in the box's config, or one held by a little key-keeper helper
@@ -68,9 +68,9 @@ local service** bound in the box's config, or one held by a little key-keeper he
 live there, never in your request and never in the robot's box. See
 **[Build your own capability](03-capabilities.md)**.
 
-(`$` / `money` — currency-safe money — `Decimal` — exact numbers — `datetime` — dates &
-times — and **`$sys.crypto`** are the exceptions: they're **always on**, no config. Only
-`$sys.env` / `$sys.secrets` need `config.sys`.)
+(`$` / `$std.money` — currency-safe money — `$std.decimal` — exact numbers — `$std.datetime` — dates &
+times — and **`$std.crypto`** are the exceptions: they're **always on**, no config. Only
+`$std.env` / `$std.secrets` need `config.sys`.)
 
 If you don't turn a super-power on, the robot simply doesn't have it. (For example, with no
 `allowed_hosts`, `http` is `undefined` — it isn't there at all.)
