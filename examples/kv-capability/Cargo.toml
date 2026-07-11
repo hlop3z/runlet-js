@@ -1,0 +1,21 @@
+[package]
+name = "kv-capability"
+description = "Worked example: bring your own capability (an in-memory kv store). Run: cargo run -p kv-capability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The extension model lives in runlet-core's public API: LogicHost::builder, CapabilityDef,
+# Trust, the Egress port, Invocation. `default-features = false` keeps this light — the `io`
+# mux this example uses is in the base crate, so it pulls no network stack (reqwest/aws-lc-rs).
+runlet-core = { path = "../../crates/runlet-core", default-features = false }
+# The Egress backend parses the JSON payload and builds the JSON reply.
+serde_json.workspace = true
+
+# Intentionally NOT `[lints] workspace = true`: this is a fork-me example, not shipped code. A
+# real capability author writes their CapabilityDef in their own crate with their own (normal)
+# lints — they never inherit runlet-core's internal restriction gauntlet, so neither does this
+# example. Default lint levels apply, exactly like the `runlet-bench` scaffolding crate.

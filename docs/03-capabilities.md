@@ -67,6 +67,49 @@ trust declaration + an in-process `Egress` backend). Your driver and your creden
 **your** process; `$std.io.call("<your-name>", …)` is serviced in-process with no broker. See
 [the composable-core design](design/composable-core.md).
 
+#### A worked example you can fork: `kv`
+
+There is a tiny, runnable one in the repo — an in-memory key/value store, the "hello world" of
+capabilities. Run it:
+
+```
+cargo run -p kv-capability
+```
+
+It builds a host with a `kv` capability, runs a handler that does
+`$std.kv.set("name", "Ada")` then `$std.kv.get("name")`, and prints the result. The whole thing
+is one file: [`examples/kv-capability/src/main.rs`](../examples/kv-capability/src/main.rs).
+
+A capability is really just **four pieces that have to agree**:
+
+```
+  handler (JS)          wrapper (JS)            the mux            backend (Rust)
+ $std.kv.get(k) ──▶ io.call('kv','get',…) ──▶ routes 'kv' ──▶  KvBackend::call("get")
+       ▲                    │                    │                     │
+       └──── "Ada" ─────────┴──── {value:"Ada"} ─┴───── {"value":"Ada"} ┘
+```
+
+The magic is the **action token**: `'get'` / `'set'` is the *same* `snake_case` word in the JS
+wrapper and in the backend's `match`. If they don't match, the call can't route.
+
+```
+   wrapper says…                backend answers…
+   io.call('kv','get',…)  ⇄     match action { "get" => …, "set" => … }
+              └────────── must be the same word ──────────┘
+```
+
+**Make it yours — change these spots** in `examples/kv-capability/src/main.rs`:
+
+1. **The name** — `"kv"` in the `CapabilityDef::new(...)` call and in `io.channel('kv')`.
+2. **The actions** — the `'get'`/`'set'` verbs in the JS wrapper and the matching `match` arms.
+3. **The backend body** — swap the `HashMap` for your real driver (a DB client, an HTTP call).
+4. **The wrapper methods** — the JS functions your handler will call (`get`, `set`, …).
+5. **The `.d.ts`** — the type fragment so script authors get autocomplete.
+
+Pick `Trust::OperatorSupplied` when the target comes from your config (like `kv`), or
+`Trust::ScriptControlled(...)` when the script chooses the address (then the framework SSRF-guards
+it for you).
+
 ### (c) Route `io` to a broker (the box holds nothing)
 
 Point the box at a **broker** (the reference `fabricd` image, or anything that speaks the wire

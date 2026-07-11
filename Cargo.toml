@@ -5,6 +5,7 @@ members = [
     "crates/runlet-core",
     "crates/runlet",
     "crates/runlet-bench",
+    "examples/kv-capability",
 ]
 
 # ──────────────────────────────────────────────────────────────

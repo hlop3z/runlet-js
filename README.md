@@ -57,7 +57,9 @@ POST /execute
 The box ships **three in-engine built-ins** — `http` (script-controlled URL, SSRF-guarded), `s3`
 (pure signing), and `io` (operator-named logical egress). Any other capability (a database, cache,
 queue, mail relay, …) is reached through the one primitive `$std.io.call(name, action, payload)` and is
-**user-composed** — see the guide [Build your own capability](docs/03-capabilities.md). `config.io`
+**user-composed** — see the guide [Build your own capability](docs/03-capabilities.md), with a
+runnable fork-me example at [`examples/kv-capability`](examples/kv-capability/src/main.rs)
+(`cargo run -p kv-capability`). `config.io`
 is a **flat allowlist of logical names** (`["orders","cache"]`); the box is kind-blind and forwards
 only the names. Each name resolves either **box-direct** to an operator-declared co-located loopback
 endpoint (`local_resources` config) or through a **broker** (the reference `fabricd` sidecar) that
