@@ -42,6 +42,20 @@ use crate::sandbox::{self, Collector};
 use crate::sys::{self, SysConfig};
 use crate::text;
 
+/// The `$std` namespace bootstrap (`globalThis.$std = {}` + the `__stdExpose` list) — loaded from
+/// `src/js/std.js`. The FIRST injected script: every util/capability IIFE populates `$std`, and the
+/// bare globals a script sees are a projection of it (see [`STD_PROJECT`] / [`STD_FREEZE`]).
+const STD_BOOTSTRAP: &str = include_str!("js/std.js");
+
+/// The `$std` → `globalThis` projection epilogue — loaded from `src/js/std_project.js`. Mirrors the
+/// curated `__stdExpose` members onto globals (identity-equal references) BEFORE the user script
+/// evals, so a handler sees `$`/`json`/`log`/`emit`.
+const STD_PROJECT: &str = include_str!("js/std_project.js");
+
+/// The `$std` deep-freeze + global-lock epilogue — loaded from `src/js/std_freeze.js`. Runs strictly
+/// AFTER the determinism prune and BEFORE `handler(ctx)` so the pruned surface is what gets frozen.
+const STD_FREEZE: &str = include_str!("js/std_freeze.js");
+
 /// The `json()` bridge — loaded from `src/js/bridge.js` at compile time.
 const JSON_BRIDGE: &str = include_str!("js/bridge.js");
 
@@ -57,8 +71,8 @@ const MEMORY_MSG: &str = "memory limit exceeded";
 
 /// Determinism sanitizer — loaded from `src/js/determinism.js` at compile time. Run after
 /// `sanitize_globals` under [`Profile::Deterministic`] to neutralize nondeterministic
-/// surfaces (`Math.random`, `Date.now`, zero-arg `new Date()`, `datetime.now`,
-/// `$sys.crypto.uuid`).
+/// surfaces (`Math.random`, `Date.now`, zero-arg `new Date()`, `$std.datetime.now`,
+/// `$std.crypto.uuid`).
 const DETERMINISM_SANITIZER: &str = include_str!("js/determinism.js");
 
 /// The generic `io.call` egress wrapper — loaded from `src/js/io.js` at compile
@@ -82,7 +96,7 @@ pub enum Profile {
     Full,
     /// No I/O capabilities are injected (`db`/`http`/`mongo`/`mail`/`s3`/`redis`/`amq`/
     /// `auth` are all withheld) and nondeterminism is neutralized on top of the existing
-    /// `eval`/`Proxy` removal. Only the pure `$`/`$sys` helpers, `emit`, and a
+    /// `eval`/`Proxy` removal. Only the pure `$std` helpers (`$`, crypto, …), `emit`, and a
     /// consumer-supplied read-of-declared-dependencies hook are available. The
     /// in-transaction logic tier.
     Deterministic,
@@ -305,7 +319,7 @@ pub(crate) struct ExecParams<'a> {
     /// the driver-backed capabilities it still carries its config across the boundary.
     #[cfg(feature = "s3")]
     pub(crate) s3_config: Option<&'a S3Config>,
-    /// `$sys` env/secrets context (None = no env/secrets injected).
+    /// `$std` env/secrets context (None = no env/secrets injected).
     pub(crate) sys_config: Option<&'a SysConfig>,
     /// The composed capability registry (the mux's per-name routing table + the JS wrappers to
     /// inject). `None` = no registered capabilities. Under [`Profile::Deterministic`] the mux and
@@ -504,6 +518,8 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
     let mut s3_collector: Option<Collector<S3Metric>> = None;
 
     let js_result = ctx.with(|qctx| -> Result<ExecOutcome, EngineError> {
+        // D3 step 1 — bootstrap `$std` before any member is built onto it.
+        inject_std_bootstrap(&qctx).map_err(EngineError::internal)?;
         inject_bridge(&qctx).map_err(EngineError::internal)?;
         decimal::inject_decimal(&qctx).map_err(EngineError::internal)?;
         // `$` / `money` composes over `__decimal`, so it must follow the `Decimal` injection.
@@ -512,7 +528,7 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         sys::inject_sys(&qctx, params.sys_config).map_err(EngineError::internal)?;
         // `datetime` rides the `__sys` bridge's `datetime` domain, so it must follow `inject_sys`.
         // Pure (no I/O), always-on like `money`/`Decimal`; the deterministic profile later removes
-        // only its ambient-clock reader `datetime.now` (via `js/determinism.js`).
+        // only its ambient-clock reader `$std.datetime.now` (via `js/determinism.js`).
         datetime::inject_datetime(&qctx).map_err(EngineError::internal)?;
         // `text` is a pure string value-util (no bridge, no clock/randomness), so it is always-on
         // under both profiles like `Decimal`/`money`/`datetime` and the sanitizer removes nothing.
@@ -554,10 +570,18 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
             #[cfg(feature = "s3")]
             &mut s3_collector,
         )?;
+        // D3 step 3 — project the curated `$std` members onto `globalThis` before the user script
+        // evals, so it sees `$`/`json`/`log`/`emit`. `resolve_handler` then evals + hardens (D3
+        // steps 4–6: sanitize `eval`/`Proxy`, and under the deterministic profile prune the ambient
+        // authorities).
+        project_std_globals(&qctx).map_err(EngineError::internal)?;
         let handler = match resolve_handler(&qctx, params) {
             Ok(func) => func,
             Err(outcome) => return Ok(outcome),
         };
+        // D3 step 7 — deep-freeze `$std` and lock the projected globals, strictly after the prune
+        // and before `handler` runs, so the surface is tamper-proof for the invocation.
+        freeze_std(&qctx).map_err(EngineError::internal)?;
         invoke_handler(
             &qctx,
             &handler,
@@ -623,6 +647,32 @@ fn setup_timeout(runtime: &Runtime, timeout: Duration) -> Arc<AtomicBool> {
     timed_out
 }
 
+/// Bootstraps the `$std` namespace object and the `__stdExpose` projection list (D3 step 1). Must
+/// run first — every subsequent injector populates `$std`, and the projection/freeze epilogues read
+/// `__stdExpose`.
+fn inject_std_bootstrap(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
+    let boot: JsValue<'_> = qctx.eval(STD_BOOTSTRAP)?;
+    drop(boot);
+    Ok(())
+}
+
+/// Projects the curated `$std` members onto `globalThis` as identity-equal references (D3 step 3),
+/// before the user script evals. Only pure, both-profile members are on the list (D2).
+fn project_std_globals(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
+    let projected: JsValue<'_> = qctx.eval(STD_PROJECT)?;
+    drop(projected);
+    Ok(())
+}
+
+/// Deep-freezes `$std` and locks the projected globals non-writable/non-configurable (D3 step 7),
+/// after the determinism prune and before `handler` runs. Idempotent members that were pruned stay
+/// pruned; the whole surface becomes tamper-proof for the invocation.
+fn freeze_std(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
+    let frozen: JsValue<'_> = qctx.eval(STD_FREEZE)?;
+    drop(frozen);
+    Ok(())
+}
+
 /// Injects the always-present JS primitives: the `json(data, error)` bridge and the shared
 /// `__ffi` FFI unwrap (both egress wrappers depend on `__ffi`, which is why it lands here rather
 /// than in the independently-gated `io`/`s3` injection paths).
@@ -650,7 +700,7 @@ fn inject_apis(
 ) -> Result<(), EngineError> {
     // Profile enforcement: the deterministic tier gets **no** I/O capability, regardless of
     // what configs an `Invocation` carries — the boundary is enforced here, not trusted to
-    // the author (only `$`/`$sys`, `emit`, and the read-hook remain, injected elsewhere).
+    // the author (only the pure `$std` helpers, `emit`, and the read-hook remain, injected elsewhere).
     if params.profile != Profile::Full {
         return Ok(());
     }
@@ -690,7 +740,7 @@ fn eval_script(qctx: &Ctx<'_>, script: &str) -> Result<(), rquickjs::Error> {
 /// `AsyncFunction`/`GeneratorFunction` constructors still compile strings, and that is fine —
 /// the script is already arbitrary code, and the real boundary is `QuickJS` having no host
 /// access (no fs/net/process). `eval` is removed to trim a historically bug-prone surface and
-/// `Proxy` to deny exotic-object traps over the injected capability/`$sys` globals. Do not
+/// `Proxy` to deny exotic-object traps over the injected `$std` surface. Do not
 /// rely on their absence for any policy that depends on the script *not* generating code.
 fn sanitize_globals(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let globals = qctx.globals();
@@ -736,7 +786,7 @@ fn harden(qctx: &Ctx<'_>, profile: Profile) -> Result<(), rquickjs::Error> {
 }
 
 /// Neutralizes nondeterminism for [`Profile::Deterministic`]: removes `Math.random`,
-/// `Date.now`, zero-arg `new Date()`, `datetime.now`, and `$sys.crypto.uuid` (see
+/// `Date.now`, zero-arg `new Date()`, `$std.datetime.now`, and `$std.crypto.uuid` (see
 /// `js/determinism.js`). Runs after [`sanitize_globals`].
 fn sanitize_determinism(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let sanitized: JsValue<'_> = qctx.eval(DETERMINISM_SANITIZER)?;
@@ -781,9 +831,10 @@ fn inject_emit(
     .with_name("__emit")?;
     qctx.globals().set("__emit", emit_fn)?;
     // `emit(kind, v)` type-checks `kind`, stringifies `v`, and forwards both; a non-empty return
-    // is an error the wrapper throws (the native side re-checks non-empty + the length bound).
+    // is an error the wrapper throws (the native side re-checks non-empty + the length bound). It is
+    // defined on `$std` (like every built-in) and mirrored to the `emit` global by the projection.
     let wrapper: JsValue<'_> = qctx.eval(
-        "globalThis.emit = function (kind, value) { \
+        "$std.emit = function (kind, value) { \
            if (typeof kind !== 'string' || kind.length === 0) \
              throw new Error('emit(kind, value): kind must be a non-empty string'); \
            var err = __emit(kind, JSON.stringify(value === undefined ? null : value)); \
@@ -1648,10 +1699,10 @@ mod money_tests {
     fn decimal_is_exact_and_distinct_from_money() {
         let out = run_script(
             "function handler() { return json({ \
-               sum: Decimal('0.1').add('0.2').toString(), \
-               distinct: Decimal !== $, \
-               snake: Decimal('0').is_zero(), \
-               camel_gone: (typeof Decimal('0').isZero !== 'function') }); }",
+               sum: $std.decimal('0.1').add('0.2').toString(), \
+               distinct: $std.decimal !== $, \
+               snake: $std.decimal('0').is_zero(), \
+               camel_gone: (typeof $std.decimal('0').isZero !== 'function') }); }",
             None,
         );
         assert!(out.contains("\"sum\":\"0.3\""), "exact base-10: {out}");
@@ -1667,9 +1718,9 @@ mod money_tests {
     fn decimal_helpers_and_modes() {
         let out = run_script(
             "function handler() { return json({ \
-               clamp: Decimal('120').clamp(0, 100).toString(), \
-               bankers: Decimal('2.5').round(0, 'half_even').toString(), \
-               cash: Decimal('2.03').round_to('0.05').toString() }); }",
+               clamp: $std.decimal('120').clamp(0, 100).toString(), \
+               bankers: $std.decimal('2.5').round(0, 'half_even').toString(), \
+               cash: $std.decimal('2.03').round_to('0.05').toString() }); }",
             None,
         );
         assert!(out.contains("\"clamp\":\"100\""), "{out}");
@@ -1687,7 +1738,7 @@ mod money_tests {
             "function handler() { \
                const net = $('100.00', 'USD'); \
                const gross = net.add_pct(8.25); \
-               return json({ gross: gross.to_string(), alias: money === $, \
+               return json({ gross: gross.to_string(), alias: $std.money === $, \
                  minor: gross.to_minor(), fmt: gross.format() }); }",
             None,
         );
@@ -1863,15 +1914,15 @@ mod datetime_tests {
     fn parse_forms_and_components() {
         let out = run_script(
             "function handler() { \
-               const d = datetime.parse('2026-07-10T13:30:00Z'); \
+               const d = $std.datetime.parse('2026-07-10T13:30:00Z'); \
                return json({ \
                  year: d.year(), month: d.month(), day: d.day(), \
                  hour: d.hour(), minute: d.minute(), \
                  weekday: d.weekday(), quarter: d.quarter(), \
                  doy: d.day_of_year(), dim: d.days_in_month(), \
-                 dateOnly: datetime('2026-07-10').iso(), \
-                 fromMs: datetime.parse(d.epoch_ms()).eq(d), \
-                 passthrough: datetime(d).eq(d) }); }",
+                 dateOnly: $std.datetime('2026-07-10').iso(), \
+                 fromMs: $std.datetime.parse(d.epoch_ms()).eq(d), \
+                 passthrough: $std.datetime(d).eq(d) }); }",
         );
         assert!(out.contains("\"year\":2026"), "{out}");
         assert!(
@@ -1901,7 +1952,7 @@ mod datetime_tests {
     fn locale_strings_are_not_guessed() {
         let out = run_script(
             "function handler() { \
-               try { datetime.parse('07/10/2026'); return json(null, 'no throw'); } \
+               try { $std.datetime.parse('07/10/2026'); return json(null, 'no throw'); } \
                catch (e) { return json({ caught: true }); } }",
         );
         assert!(out.contains("\"caught\":true"), "{out}");
@@ -1912,7 +1963,7 @@ mod datetime_tests {
     fn value_is_immutable() {
         let out = run_script(
             "function handler() { \
-               const d = datetime.parse('2026-07-10T00:00:00Z'); \
+               const d = $std.datetime.parse('2026-07-10T00:00:00Z'); \
                const next = d.add({ days: 1 }); \
                return json({ before: d.day(), after: next.day(), same: d.eq(next) }); }",
         );
@@ -1926,8 +1977,8 @@ mod datetime_tests {
     fn serializes_as_rfc3339_utc() {
         let out = run_script(
             "function handler() { \
-               return json({ d: datetime.parse('2026-07-10T13:30:00Z'), \
-                 ms: datetime.parse('2026-07-10T13:30:00Z').epoch_ms() }); }",
+               return json({ d: $std.datetime.parse('2026-07-10T13:30:00Z'), \
+                 ms: $std.datetime.parse('2026-07-10T13:30:00Z').epoch_ms() }); }",
         );
         assert!(out.contains("\"d\":\"2026-07-10T13:30:00Z\""), "{out}");
         assert!(out.contains("\"ms\":1783690200000"), "{out}");
@@ -1938,7 +1989,7 @@ mod datetime_tests {
     fn month_arithmetic_clamps_end_of_month() {
         let out = run_script(
             "function handler() { \
-               const d = datetime.from({ year: 2026, month: 1, day: 31 }).add({ months: 1 }); \
+               const d = $std.datetime.from({ year: 2026, month: 1, day: 31 }).add({ months: 1 }); \
                return json({ month: d.month(), day: d.day() }); }",
         );
         assert!(
@@ -1952,7 +2003,7 @@ mod datetime_tests {
     fn overflow_throws() {
         let out = run_script(
             "function handler() { \
-               try { datetime.parse('2026-07-10T00:00:00Z').add({ years: 100000000000 }); \
+               try { $std.datetime.parse('2026-07-10T00:00:00Z').add({ years: 100000000000 }); \
                  return json(null, 'no throw'); } \
                catch (e) { return json({ caught: true }); } }",
         );
@@ -1964,7 +2015,7 @@ mod datetime_tests {
     fn period_boundaries() {
         let out = run_script(
             "function handler() { \
-               const d = datetime.parse('2026-07-15T12:00:00Z'); \
+               const d = $std.datetime.parse('2026-07-15T12:00:00Z'); \
                return json({ start: d.start_of('month').iso(), end: d.end_of('month').iso(), \
                  qstart: d.start_of('quarter').iso(), \
                  wstart_wd: d.start_of('week').weekday() }); }",
@@ -1986,9 +2037,9 @@ mod datetime_tests {
     fn business_day_helpers() {
         let out = run_script(
             "function handler() { \
-               const fri = datetime.parse('2026-07-10T00:00:00Z'); \
+               const fri = $std.datetime.parse('2026-07-10T00:00:00Z'); \
                const mon = fri.add_business_days(1); \
-               const sat = datetime.parse('2026-07-11T00:00:00Z'); \
+               const sat = $std.datetime.parse('2026-07-11T00:00:00Z'); \
                return json({ day: mon.day(), wd: mon.weekday(), \
                  satWeekend: sat.is_weekend(), friBusiness: fri.is_business_day() }); }",
         );
@@ -2005,8 +2056,8 @@ mod datetime_tests {
     fn difference() {
         let out = run_script(
             "function handler() { \
-               const a = datetime.parse('2026-07-10T00:00:00Z'); \
-               const b = datetime.parse('2026-07-08T00:00:00Z'); \
+               const a = $std.datetime.parse('2026-07-10T00:00:00Z'); \
+               const b = $std.datetime.parse('2026-07-08T00:00:00Z'); \
                return json({ days: a.diff(b).days, total: a.diff(b).total_ms, \
                  wholeFwd: a.diff_in(b, 'days'), wholeBack: b.diff_in(a, 'days') }); }",
         );
@@ -2024,7 +2075,7 @@ mod datetime_tests {
     fn timezone_view() {
         let out = run_script(
             "function handler() { \
-               const d = datetime.parse('2026-07-15T12:00:00Z'); \
+               const d = $std.datetime.parse('2026-07-15T12:00:00Z'); \
                const tokyo = d.in_zone('Asia/Tokyo'); \
                return json({ preserved: tokyo.epoch_ms() === d.epoch_ms(), \
                  hour: tokyo.hour(), day: tokyo.day(), \
@@ -2050,7 +2101,7 @@ mod datetime_tests {
     fn unknown_zone_throws() {
         let out = run_script(
             "function handler() { \
-               try { datetime.parse('2026-07-10T00:00:00Z').in_zone('Mars/Phobos'); \
+               try { $std.datetime.parse('2026-07-10T00:00:00Z').in_zone('Mars/Phobos'); \
                  return json(null, 'no throw'); } \
                catch (e) { return json({ caught: true }); } }",
         );
@@ -2062,7 +2113,7 @@ mod datetime_tests {
     fn numeric_formatting() {
         let out = run_script(
             "function handler() { \
-               return json({ f: datetime.parse('2026-07-10T13:30:05.250Z')\
+               return json({ f: $std.datetime.parse('2026-07-10T13:30:05.250Z')\
                  .format('YYYY-MM-DD HH:mm:ss.SSS') }); }",
         );
         assert!(out.contains("\"f\":\"2026-07-10 13:30:05.250\""), "{out}");
@@ -2074,7 +2125,7 @@ mod datetime_tests {
         // 2027-01-01 is a Friday → ISO week 53 of week-year 2026.
         let out = run_script(
             "function handler() { \
-               const w = datetime.parse('2027-01-01T00:00:00Z').iso_week(); \
+               const w = $std.datetime.parse('2027-01-01T00:00:00Z').iso_week(); \
                return json({ week: w.week, week_year: w.week_year }); }",
         );
         assert!(
@@ -2083,35 +2134,196 @@ mod datetime_tests {
         );
     }
 
-    /// Determinism: `datetime.now` is removed (not stubbed) under the deterministic profile, while
+    /// Determinism: `$std.datetime.now` is removed (not stubbed) under the deterministic profile, while
     /// parsing/components/arithmetic — pure given an explicit instant — still work.
     #[test]
     fn deterministic_profile_removes_only_now() {
         let out = run_profiled(
             "function handler() { \
-               return json({ noNow: typeof datetime.now === 'undefined', \
-                 stillParses: datetime.parse('2026-07-10T00:00:00Z').year(), \
-                 arithmetic: datetime.parse('2026-07-10T00:00:00Z').add({ days: 1 }).day() }); }",
+               return json({ noNow: typeof $std.datetime.now === 'undefined', \
+                 stillParses: $std.datetime.parse('2026-07-10T00:00:00Z').year(), \
+                 arithmetic: $std.datetime.parse('2026-07-10T00:00:00Z').add({ days: 1 }).day() }); }",
             Profile::Deterministic,
         );
         assert!(
             out.contains("\"noNow\":true"),
-            "datetime.now removed under deterministic profile: {out}"
+            "$std.datetime.now removed under deterministic profile: {out}"
         );
         assert!(out.contains("\"stillParses\":2026"), "{out}");
         assert!(out.contains("\"arithmetic\":11"), "{out}");
     }
 
-    /// Under the full profile `datetime.now` is present and returns a value.
+    /// Under the full profile `$std.datetime.now` is present and returns a value.
     #[test]
     fn full_profile_has_now() {
         let out = run_script(
             "function handler() { \
-               return json({ hasNow: typeof datetime.now === 'function', \
-                 positive: datetime.now().epoch_ms() > 0 }); }",
+               return json({ hasNow: typeof $std.datetime.now === 'function', \
+                 positive: $std.datetime.now().epoch_ms() > 0 }); }",
         );
         assert!(out.contains("\"hasNow\":true"), "{out}");
         assert!(out.contains("\"positive\":true"), "{out}");
+    }
+}
+
+/// The `$std` canonical namespace + its `globalThis` projection: every built-in is reachable
+/// through `$std`, the curated globals are identity-equal mirrors, the former bare util globals are
+/// gone, prunable authorities are unreachable via every path under the deterministic profile, and
+/// the surface is frozen/locked before the handler runs. Capability-free build (no `http`/`s3`/`io`
+/// fields on `ExecParams`), so this exercises the always-on utils + `$std.crypto`.
+#[cfg(test)]
+#[cfg(not(feature = "_io"))]
+mod std_namespace_tests {
+    use super::{ExecOutcome, ExecParams, Profile, run};
+    use rquickjs::Runtime;
+    use std::time::Duration;
+
+    /// Runs `script` under `profile` and returns the success `data`/`error` envelope JSON.
+    fn run_profiled(script: &str, profile: Profile) -> String {
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let params = ExecParams {
+            runtime: &runtime,
+            bytecode_cache: None,
+            cache_namespace: None,
+            script,
+            context_json: "{}",
+            timeout: Duration::from_secs(5),
+            profile,
+            sys_config: None,
+            registry: None,
+            enabled_io: &[],
+            egress: None,
+            default_currency: Some("USD"),
+            max_ops: 4096,
+            max_emit_kind_len: 64,
+            log_level: super::LogLevel::Info,
+            max_log_entries: 256,
+            max_log_entry_bytes: 256 * 1024,
+            max_log_total_bytes: 1024 * 1024,
+            max_output_size: 0,
+            allow_private_targets: false,
+        };
+        let result = run(&params).unwrap_or_else(|_err| unreachable!());
+        match result.outcome {
+            ExecOutcome::Success(json) => json,
+            ExecOutcome::Error(err) => format!("ERROR: {err:?}"),
+        }
+    }
+
+    /// Convenience: run under the full profile.
+    fn run_script(script: &str) -> String {
+        run_profiled(script, Profile::Full)
+    }
+
+    /// Every built-in is reachable through `$std` (the always-on subset in the capability-free build).
+    #[test]
+    fn every_builtin_reachable_through_std() {
+        let out = run_script(
+            "function handler() { return json({ \
+               present: ['money','decimal','text','datetime','list','dict', \
+                         'crypto','env','secrets','json','log','emit'] \
+                 .every(function (k) { return $std[k] !== undefined; }) }); }",
+        );
+        assert!(out.contains("\"present\":true"), "{out}");
+    }
+
+    /// The curated globals are the SAME object references as their `$std` members.
+    #[test]
+    fn exposed_globals_are_identity_equal() {
+        let out = run_script(
+            "function handler() { return json({ \
+               money: $ === $std.money, json: json === $std.json, \
+               log: log === $std.log, emit: emit === $std.emit }); }",
+        );
+        assert!(out.contains("\"money\":true"), "{out}");
+        assert!(out.contains("\"json\":true"), "{out}");
+        assert!(out.contains("\"log\":true"), "{out}");
+        assert!(out.contains("\"emit\":true"), "{out}");
+    }
+
+    /// The former bare util globals are removed — reachable only via `$std` (or `$` for money).
+    #[test]
+    fn former_bare_globals_are_absent() {
+        let out = run_script(
+            "function handler() { return json( \
+               ['money','Decimal','datetime','text','list','dict','io','http','s3'] \
+                 .map(function (k) { return typeof globalThis[k]; })); }",
+        );
+        // Nine `"undefined"` entries — no former bare util global survives.
+        assert_eq!(
+            out.matches("undefined").count(),
+            9,
+            "no former bare util global is defined: {out}"
+        );
+    }
+
+    /// Destructuring the namespace yields the same util objects as member access.
+    #[test]
+    fn destructuring_the_namespace_works() {
+        let out = run_script(
+            "function handler() { const { list, dict } = $std; \
+               return json({ list: list === $std.list, dict: dict === $std.dict, \
+                 works: list([3,1,2]).sort_by().to_array()[0] }); }",
+        );
+        assert!(
+            out.contains("\"list\":true") && out.contains("\"dict\":true"),
+            "{out}"
+        );
+        assert!(out.contains("\"works\":1"), "{out}");
+    }
+
+    /// Under `Profile::Deterministic` every prunable authority is unreachable via every path, and a
+    /// no-arg `Date()` throws — while the pure surface (parse/hash/list) still works (task 3.3).
+    #[test]
+    fn deterministic_profile_prunes_all_authorities() {
+        let out = run_profiled(
+            "function handler() { \
+               var dateThrows = false; \
+               try { new Date(); } catch (e) { dateThrows = true; } \
+               return json({ \
+                 now: typeof $std.datetime.now === 'undefined', \
+                 uuid: typeof $std.crypto.uuid === 'undefined', \
+                 random: typeof Math.random === 'undefined', \
+                 dateThrows: dateThrows, \
+                 stillHashes: $std.crypto.sha256('x').length === 64 }); }",
+            Profile::Deterministic,
+        );
+        assert!(out.contains("\"now\":true"), "datetime.now pruned: {out}");
+        assert!(out.contains("\"uuid\":true"), "crypto.uuid pruned: {out}");
+        assert!(out.contains("\"random\":true"), "Math.random pruned: {out}");
+        assert!(
+            out.contains("\"dateThrows\":true"),
+            "no-arg Date() throws: {out}"
+        );
+        assert!(
+            out.contains("\"stillHashes\":true"),
+            "pure crypto survives: {out}"
+        );
+    }
+
+    /// The frozen `$std` cannot be mutated/extended, and a locked global cannot be reassigned.
+    #[test]
+    fn std_is_frozen_and_globals_locked() {
+        let out = run_script(
+            "function handler() { \
+               var origLog = $std.log; \
+               try { $std.newThing = 1; } catch (e) {} \
+               try { $std.money = null; } catch (e) {} \
+               try { log = 5; } catch (e) {} \
+               return json({ \
+                 noAdd: $std.newThing === undefined, \
+                 moneyKept: typeof $std.money === 'function', \
+                 logKept: log === origLog }); }",
+        );
+        assert!(
+            out.contains("\"noAdd\":true"),
+            "frozen: no new member: {out}"
+        );
+        assert!(
+            out.contains("\"moneyKept\":true"),
+            "frozen: member unchanged: {out}"
+        );
+        assert!(out.contains("\"logKept\":true"), "global lock holds: {out}");
     }
 }
 
@@ -2272,7 +2484,7 @@ mod egress_tests {
     fn resource_call_returns_backend_json() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
         let script =
-            "function handler(ctx) { return json(io.call('orders', 'ping', { x: ctx.n })); }";
+            "function handler(ctx) { return json($std.io.call('orders', 'ping', { x: ctx.n })); }";
         let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
         let json = run_ok(&params(
             &runtime,
@@ -2296,7 +2508,7 @@ mod egress_tests {
     #[test]
     fn resource_error_classifies_as_capability() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
-        let script = "function handler(ctx) { return json(io.call('orders', 'fail', {})); }";
+        let script = "function handler(ctx) { return json($std.io.call('orders', 'fail', {})); }";
         let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
         let exec = run(&params(
             &runtime,
@@ -2317,7 +2529,7 @@ mod egress_tests {
     #[test]
     fn resource_withheld_under_deterministic_profile() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
-        let script = "function handler() { return json(typeof io); }";
+        let script = "function handler() { return json(typeof $std.io); }";
         let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
         let json = run_ok(&params(
             &runtime,
@@ -2363,8 +2575,7 @@ mod egress_tests {
     #[test]
     fn registered_wrapper_injected_only_when_enabled() {
         let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
-        let wrapper =
-            "globalThis.widget = { ping: function () { return io.call('widget', 'ping', {}); } };";
+        let wrapper = "globalThis.widget = { ping: function () { return $std.io.call('widget', 'ping', {}); } };";
         let def = CapabilityDef::new("widget", wrapper, "", Trust::OperatorSupplied);
         let egress: Arc<dyn Egress> = Arc::new(EchoEgress);
         let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
@@ -2397,7 +2608,7 @@ mod egress_tests {
             reply: "{}".to_owned(),
         });
         let script = "function handler() { \
-            try { io.call('secret', 'query', {}); return json('no throw'); } \
+            try { $std.io.call('secret', 'query', {}); return json('no throw'); } \
             catch (e) { return json(e.__runlet ? e.__runlet.code : 'untagged'); } }";
         // Allowlist enables only `orders`; the script asks for `secret`.
         let json = run_ok(&params(
@@ -2442,7 +2653,7 @@ mod egress_tests {
             .with_backend(backend);
         let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
         let script =
-            "function handler() { return json(io.call('db', 'get', { host: '10.0.0.1' })); }";
+            "function handler() { return json($std.io.call('db', 'get', { host: '10.0.0.1' })); }";
         let exec = run(&params(
             &runtime,
             script,
@@ -2473,8 +2684,7 @@ mod egress_tests {
         let def = CapabilityDef::new("db", "", "", Trust::ScriptControlled(host_policy()))
             .with_backend(backend);
         let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
-        let script =
-            "function handler() { return json(io.call('db', 'get', { host: '93.184.216.34' })); }";
+        let script = "function handler() { return json($std.io.call('db', 'get', { host: '93.184.216.34' })); }";
         let json = run_ok(&params(
             &runtime,
             script,
@@ -2506,7 +2716,7 @@ mod egress_tests {
         let def =
             CapabilityDef::new("db", "", "", Trust::ScriptControlled(policy)).with_backend(backend);
         let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
-        let script = "function handler() { return json(io.call('db', 'get', {})); }";
+        let script = "function handler() { return json($std.io.call('db', 'get', {})); }";
         let exec = run(&params(
             &runtime,
             script,
@@ -2540,7 +2750,7 @@ mod egress_tests {
         let def =
             CapabilityDef::new("db", "", "", Trust::ScriptControlled(policy)).with_backend(backend);
         let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
-        let script = "function handler() { return json(io.call('db', 'get', {})); }";
+        let script = "function handler() { return json($std.io.call('db', 'get', {})); }";
         let exec = run(&params(
             &runtime,
             script,
@@ -2577,8 +2787,8 @@ mod egress_tests {
             .unwrap_or_else(|_err| unreachable!());
         let fallback: Arc<dyn Egress> = Arc::new(EchoEgress);
         let script = "function handler() { return json({ \
-            a: io.call('orders', 'ping', {}), \
-            b: io.call('amq', 'publish', { m: 1 }) }); }";
+            a: $std.io.call('orders', 'ping', {}), \
+            b: $std.io.call('amq', 'publish', { m: 1 }) }); }";
         let json = run_ok(&params(
             &runtime,
             script,
@@ -2608,7 +2818,7 @@ mod egress_tests {
         let def = CapabilityDef::new("db", "", "", Trust::OperatorSupplied);
         let reg = CapabilityRegistry::build(vec![def], None).unwrap_or_else(|_err| unreachable!());
         let script = "function handler() { \
-            try { io.call('db', 'query', {}); return json('no throw'); } \
+            try { $std.io.call('db', 'query', {}); return json('no throw'); } \
             catch (e) { return json(e.__runlet ? e.__runlet.code : 'untagged'); } }";
         let json = run_ok(&params(
             &runtime,

@@ -85,7 +85,7 @@ pub struct CapabilitySet<'a> {
     /// still carries its config here unlike the driver-backed capabilities.
     #[cfg(feature = "s3")]
     pub s3: Option<&'a S3Config>,
-    /// `$sys` env/secrets context.
+    /// `$std` env/secrets context.
     pub sys: Option<&'a SysConfig>,
     /// Names of registered egress capabilities (from the host's builder registry) to enable for
     /// this request. A registered def's wrapper is injected only if its name appears here — the

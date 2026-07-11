@@ -27,7 +27,7 @@
     }
     return res;
   }
-  globalThis.http = {
+  $std.http = {
     get: function(url, params, headers) { return req('GET', buildUrl(url, params), null, headers); },
     post: function(url, body, headers) { return req('POST', url, body, headers); },
     put: function(url, body, headers) { return req('PUT', url, body, headers); },

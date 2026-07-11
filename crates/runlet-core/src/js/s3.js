@@ -13,7 +13,7 @@
       expires: opts.expires || 0
     });
   }
-  globalThis.s3 = {
+  $std.s3 = {
     // Sign a URL for any method (PUT/GET/HEAD/DELETE). Use the helpers below for the
     // common cases.
     sign_url: sign,

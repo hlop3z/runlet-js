@@ -9,8 +9,10 @@
 
 use crate::capability::CapabilityDef;
 
-/// The always-on base type surface: `json`/`Handler`/`Decimal`/`$`/`$sys`, the injectable
-/// `hasura/client` module, and the `meta.io` response typing. First in the generated file.
+/// The always-on base type surface. First in the generated file.
+///
+/// Carries the `Std` namespace interface + its derived globals (`$`/`json`/`log`/`emit`),
+/// `Handler`, the injectable `hasura/client` module, and the `meta.io` response typing.
 pub const BASE_TYPES_DTS: &str = include_str!("js/base.d.ts");
 /// The in-engine `http` capability's editor fragment (part of the enumerated mux-bypass surface).
 pub const HTTP_TYPES_DTS: &str = include_str!("js/http.d.ts");
@@ -44,8 +46,8 @@ pub fn def_fragments(defs: &[CapabilityDef]) -> Vec<&str> {
 mod tests {
     //! D11 drift guard (relocated from `runlet-caps` on the byo-capabilities change): the checked-in
     //! `container/types.d.ts` equals what the stock **three-primitive** surface generates — the base
-    //! fragment (which carries `json`/`$`/`Decimal`/`$sys`/`io`/`meta`) plus the in-engine `http` and
-    //! `s3` fragments. No driver-capability defs ship, so there are no `Db`/`Mongo`/… interfaces.
+    //! fragment (which carries the `Std` namespace + `$`/`json`/`log`/`emit`/`io`/`meta`) plus the
+    //! in-engine `http` and `s3` fragments. No driver-capability defs ship, so no `Db`/`Mongo`/… ifaces.
 
     use super::{HTTP_TYPES_DTS, S3_TYPES_DTS, generate_types_dts};
 

@@ -1,5 +1,10 @@
 (function () {
-  // One native bridge for every $sys domain: __sys(domain, op, payloadJson).
+  // The runtime standard library formerly grouped under `$sys`, now folded into `$std`: the crypto
+  // surface stays grouped at `$std.crypto`, and `env`/`secrets` are hoisted to `$std.env` /
+  // `$std.secrets`. Semantics are unchanged (opaque secret handles, HMAC-only sinks, config-gated
+  // population) — only the enclosing namespace moved.
+  //
+  // One native bridge for every domain: __sys(domain, op, payloadJson).
   function call(domain, op, payload) {
     var raw = __sys(domain, op, JSON.stringify(payload || {}));
     var res = JSON.parse(raw);
@@ -7,7 +12,7 @@
     return res.v;
   }
 
-  // ---- $sys.secrets : opaque handles -------------------------------------
+  // ---- $std.secrets : opaque handles -------------------------------------
   // A secret's plaintext lives ONLY in Rust. JS holds a frozen handle carrying the
   // secret's name; every coercion yields "[secret:NAME]" (never the value), and the
   // handle is accepted solely as an HMAC key. SECRET is a closure-private symbol, so
@@ -40,7 +45,7 @@
     }
   }
 
-  // Rust calls this with the configured secret names to populate $sys.secrets.
+  // Rust calls this with the configured secret names to populate $std.secrets.
   Object.defineProperty(globalThis, "__sysMakeSecrets", {
     value: function (names) {
       var out = {};
@@ -49,7 +54,7 @@
     },
   });
 
-  // ---- $sys.crypto -------------------------------------------------------
+  // ---- $std.crypto -------------------------------------------------------
   function c(op, payload) { return call("crypto", op, payload); }
 
   function codec(encOp, decOp) {
@@ -79,14 +84,14 @@
     url: codec("url_encode", "url_decode"),
   };
 
-  // NOTE: date/time is no longer under `$sys`. It is the first-class top-level `datetime`
-  // value-util (see `js/datetime.js`), which rides the same `__sys("datetime", …)` bridge.
+  // NOTE: date/time is not part of the crypto surface. It is the first-class top-level
+  // `$std.datetime` value-util (see `js/datetime.js`), which rides the same `__sys("datetime", …)`
+  // bridge.
 
-  globalThis.$sys = globalThis.$sys || {};
-  $sys.crypto = crypto;
+  $std.crypto = crypto;
   // env/secrets default to empty; Rust overwrites them when config.sys is sent.
   // env holds plain returnable values; secrets become opaque handles (plaintext
   // stays in Rust) — returning one yields "[secret:NAME]", never the value.
-  $sys.env = {};
-  $sys.secrets = {};
+  $std.env = {};
+  $std.secrets = {};
 })();

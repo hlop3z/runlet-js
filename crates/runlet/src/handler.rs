@@ -220,7 +220,7 @@ pub(crate) struct RequestConfig {
     /// S3 presigning config (omit to disable `s3` in JS). Stays in-engine (pure `SigV4` presign).
     #[serde(default)]
     pub(crate) s3: Option<S3Config>,
-    /// `$sys` env/secrets context (omit to leave `$sys.env`/`$sys.secrets` empty).
+    /// `$std` env/secrets context (omit to leave `$std.env`/`$std.secrets` empty).
     #[serde(default)]
     pub(crate) sys: Option<SysConfig>,
     /// Logical resources this invocation may reach — a plain allowlist of names (e.g.

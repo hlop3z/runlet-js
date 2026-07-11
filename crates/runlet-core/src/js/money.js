@@ -1,7 +1,7 @@
 (function () {
   // The exact-number engine (injected first). Money composes over it: every arithmetic op
   // runs through Decimal, and money ÷ money returns a bare Decimal ratio.
-  var D = globalThis.Decimal;
+  var D = $std.decimal;
   var DecCtor = D._Dec;
 
   // ---- ISO 4217 minor-unit exponents ------------------------------------
@@ -190,6 +190,5 @@
 
   // Expose the constructor so `list` can brand-check money values (mirrors Decimal._Dec).
   make._Money = Money;
-  globalThis.$ = make;
-  globalThis.money = make;
+  $std.money = make;
 })();

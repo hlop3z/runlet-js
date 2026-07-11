@@ -1,6 +1,6 @@
 //! The first-class `text` value-util for the `QuickJS` sandbox.
 //!
-//! `text` is the always-on string global beside `$`/`money`/`Decimal`/`datetime`: a callable
+//! `text` is the always-on string value-util at `$std.text` (beside `$`/`$std.decimal`/`$std.datetime`): a callable
 //! factory (`text(input)`) that wraps a value as an immutable string with chainable, `snake_case`
 //! methods. The method names are Python-flavored renames of native JS string operations; the
 //! semantics are JavaScript's (UTF-16 code units, Unicode-default casing). A small set of
@@ -19,7 +19,7 @@ use rquickjs::{Ctx, Value as JsValue};
 /// JS wrapper — loaded from `src/js/text.js` at compile time. Depends on no other injected global.
 const TEXT_WRAPPER: &str = include_str!("js/text.js");
 
-/// Injects the `text` global. Order-independent among the pure value-utils (no bridge dependency).
+/// Injects `$std.text`. Order-independent among the pure value-utils (no bridge dependency).
 ///
 /// # Errors
 ///
@@ -43,12 +43,23 @@ mod tests {
     /// The deterministic-profile sanitizer, evaled to prove `text` survives it untouched.
     const DETERMINISM: &str = include_str!("js/determinism.js");
 
+    /// Bootstraps `$std` (the wrapper now populates it, not `globalThis`), injects `text`, then
+    /// mirrors it back to a bare `text` global so these behavioral expressions read naturally. In
+    /// production the engine does the bootstrap + projection; here the harness stands in for it.
+    fn inject(qctx: &rquickjs::Ctx<'_>) {
+        qctx.eval::<(), _>("globalThis.$std = {};")
+            .expect("bootstrap std");
+        inject_text(qctx).expect("inject text");
+        qctx.eval::<(), _>("globalThis.text = $std.text;")
+            .expect("project text");
+    }
+
     /// Inject `text` and eval a JS expression that yields a string.
     fn run(expr: &str) -> String {
         let rt = Runtime::new().expect("runtime");
         let ctx = Context::full(&rt).expect("context");
         ctx.with(|qctx| {
-            inject_text(&qctx).expect("inject text");
+            inject(&qctx);
             qctx.eval::<String, _>(expr).expect("eval")
         })
     }
@@ -177,7 +188,7 @@ mod tests {
         let rt = Runtime::new().expect("runtime");
         let ctx = Context::full(&rt).expect("context");
         let out = ctx.with(|qctx| {
-            inject_text(&qctx).expect("inject text");
+            inject(&qctx);
             qctx.eval::<(), _>(DETERMINISM).expect("eval determinism");
             qctx.eval::<String, _>(
                 r#"text("  Héllo  ").strip().slugify().mask({keep:2}).value + "|" + String(typeof text)"#,

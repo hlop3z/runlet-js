@@ -7,7 +7,7 @@
   //
   // Pure — no clock, no randomness, no ambient state — so it is injected identically under every
   // profile and there is nothing for the determinism sanitizer to remove. `entries()`/`keys()`/
-  // `values()` return a `list` (resolved at call time), bridging dict → list.
+  // `values()` return a `list` (read off `$std` at call time), bridging dict → list.
 
   function Dct(obj) {
     this.obj = obj; // the underlying plain object (never mutated in place)
@@ -83,18 +83,18 @@
   };
 
   // ---- dict → list bridge -----------------------------------------------
-  Dct.prototype.keys = function () { return globalThis.list(Object.keys(this.obj)); };
+  Dct.prototype.keys = function () { return $std.list(Object.keys(this.obj)); };
   Dct.prototype.values = function () {
     var keys = Object.keys(this.obj);
     var out = [];
     for (var i = 0; i < keys.length; i++) out.push(this.obj[keys[i]]);
-    return globalThis.list(out);
+    return $std.list(out);
   };
   Dct.prototype.entries = function () {
     var keys = Object.keys(this.obj);
     var out = [];
     for (var i = 0; i < keys.length; i++) out.push([keys[i], this.obj[keys[i]]]);
-    return globalThis.list(out);
+    return $std.list(out);
   };
 
   // ---- factory ----------------------------------------------------------
@@ -108,5 +108,5 @@
     for (var i = 0; i < keys.length; i++) out[keys[i]] = src[keys[i]];
     return new Dct(out);
   }
-  globalThis.dict = make;
+  $std.dict = make;
 })();
