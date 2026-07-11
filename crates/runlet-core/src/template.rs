@@ -22,15 +22,17 @@ use serde_json::Value as JsonValue;
 
 use crate::sandbox;
 
-/// JS wrapper — loaded from `src/js/template.js` at compile time.
-const TEMPLATE_WRAPPER: &str = include_str!("js/template.js");
+/// JS wrapper — loaded from `src/js/template.js` at compile time. Built lazily on first
+/// `$std.template` access by the engine's lazy-`$std` path.
+pub(crate) const TEMPLATE_WRAPPER: &str = include_str!("js/template.js");
 
-/// Injects `$std.template` (the Jinja2 templating util). Always on — pure, no I/O, no config.
+/// Registers the eager `__template` FFI bridge (the cheap native half); the `$std.template` wrapper
+/// is built lazily by the engine on first access (D2).
 ///
 /// # Errors
 ///
-/// Returns an error if registration or JS eval fails.
-pub fn inject_template(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
+/// Returns an error if registration fails.
+pub(crate) fn register_native(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let template_fn = Function::new(
         qctx.clone(),
         |op: String, source: String, arg2: String, arg3: String| -> String {
@@ -43,7 +45,17 @@ pub fn inject_template(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync
     .with_name("__template")?;
 
     qctx.globals().set("__template", template_fn)?;
+    Ok(())
+}
 
+/// Injects `$std.template` eagerly (native bridge + wrapper). Retained for the module's own unit
+/// tests; the engine registers the native eagerly and builds the wrapper lazily instead.
+///
+/// # Errors
+///
+/// Returns an error if registration or JS eval fails.
+pub fn inject_template(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    register_native(qctx)?;
     let wrapper: JsValue<'_> = qctx.eval(TEMPLATE_WRAPPER)?;
     drop(wrapper);
     Ok(())

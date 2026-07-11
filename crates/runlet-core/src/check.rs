@@ -20,7 +20,7 @@ use rquickjs::{Ctx, Value as JsValue};
 
 /// JS wrapper — loaded from `src/js/check.js` at compile time. Depends on no other injected global
 /// besides the `$std` bootstrap object.
-const CHECK_WRAPPER: &str = include_str!("js/check.js");
+pub(crate) const CHECK_WRAPPER: &str = include_str!("js/check.js");
 
 /// Injects `$std.check`. Order-independent among the pure value-utils (no bridge dependency); only
 /// requires that the `$std` bootstrap object already exists.

@@ -56,7 +56,31 @@ present-but-gated authority gets un-gated by a later refactor. After the sanitiz
 function to re-reach. The one exception is `new Date()` (no args), which is a constructor path
 rather than a property; it is blocked by swapping in a constructor that throws on the zero-arg
 call, so the wall clock is still structurally unreachable (there is no residual property to
-reach). See `js/determinism.js` and `engine.rs`'s `deterministic_profile_removes_ambient_authority`.
+reach).
+
+The removal is **split by surface** (since the `lazy-std-injection` change): the JS builtins that
+are not `$std` members (`Math.random`, no-arg `Date()`) are still deleted by the post-eval
+`js/determinism.js` pass, but the prunable `$std` members (`$std.datetime.now`, `$std.crypto.uuid`)
+are pruned **inside the lazy builder** — under `Profile::Deterministic` the builder constructs the
+already-pruned variant on first access, so the post-hoc pass never has to *read* `$std.datetime`/
+`$std.crypto` (which would force-build a member the handler may never touch). See `js/determinism.js`,
+`engine.rs`'s `build_unit_sources` + `deterministic_build_omits_ambient_authorities`.
+
+### Lazy `$std` materialization (`lazy-std-injection`)
+
+The `$std` value-utils (`decimal`/`money`/`crypto`/`env`/`secrets`/`datetime`/`text`/`list`/`dict`/
+`template`/`check`) are **built lazily, on first access within a request**, not eagerly per request.
+Each is a non-configurable getter-only accessor on `$std` (`js/std_lazy.js`); the cheap native FFI
+bridges (`__decimal`/`__sys`/`__template`) stay eager, and only the expensive wrapper IIFE is
+deferred. On first read the native `__stdBuild(key)` parses+executes the wrapper into a fresh scratch
+realm (whose prototype is the real `$std`, so a wrapper's `$std.<dep>` read fires *that* member's
+getter — resolving inter-member deps on demand), the result is deep-frozen, memoized, and returned;
+an untouched member is never built. The projected `$` global funnels through the same accessor
+(`$ === $std.money`), and `Object.freeze($std)` locks the container without firing any getter. This
+is observationally identical to the old eager injection (identity, deep-freeze, determinism prune,
+gating all preserved) but makes the per-request bootstrap usage-weighted: a util-free handler dropped
+from ~5.0 ms to ~1.1 ms (~4.6×). It does **not** change the per-request isolation model — each request
+still runs in a fresh `Context`; laziness only changes *when* a member is built *within* a request.
 
 ## Two mechanics this change pinned down
 

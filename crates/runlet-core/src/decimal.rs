@@ -20,18 +20,18 @@ use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::sandbox;
 
-/// JS wrapper — loaded from `src/js/decimal.js` at compile time.
-const DECIMAL_WRAPPER: &str = include_str!("js/decimal.js");
+/// JS wrapper — loaded from `src/js/decimal.js` at compile time. Built lazily on first
+/// `$std.decimal` access by the engine's lazy-`$std` path (see `engine::inject_lazy_std`).
+pub(crate) const DECIMAL_WRAPPER: &str = include_str!("js/decimal.js");
 
-/// Injects `$std.decimal` (the exact-number engine). Always on — pure, no I/O, no config.
-///
-/// The currency-bound `$` / `money` global is injected separately (see `money.rs`) and composes
-/// over the same `__decimal` FFI.
+/// Registers the eager `__decimal` FFI bridge (the cheap native half). The expensive `$std.decimal`
+/// wrapper is built lazily by the engine on first access; this only installs the bridge the wrapper
+/// composes over, so it must be present up front (D2).
 ///
 /// # Errors
 ///
-/// Returns an error if registration or JS eval fails.
-pub fn inject_decimal(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
+/// Returns an error if registration fails.
+pub(crate) fn register_native(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let decimal_fn = Function::new(
         qctx.clone(),
         |op: String, lhs: String, rhs: String, aux: String| -> String {
@@ -44,7 +44,20 @@ pub fn inject_decimal(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>
     .with_name("__decimal")?;
 
     qctx.globals().set("__decimal", decimal_fn)?;
+    Ok(())
+}
 
+/// Injects `$std.decimal` eagerly (native bridge + wrapper). Retained for the module's own unit
+/// tests; the engine now registers the native eagerly and builds the wrapper lazily instead.
+///
+/// The currency-bound `$` / `money` global is injected separately (see `money.rs`) and composes
+/// over the same `__decimal` FFI.
+///
+/// # Errors
+///
+/// Returns an error if registration or JS eval fails.
+pub fn inject_decimal(qctx: &Ctx<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    register_native(qctx)?;
     let wrapper: JsValue<'_> = qctx.eval(DECIMAL_WRAPPER)?;
     drop(wrapper);
     Ok(())

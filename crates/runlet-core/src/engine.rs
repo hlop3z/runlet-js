@@ -11,6 +11,7 @@
 //! and the timeout signal (which JS cannot see) is folded in here. Out-of-memory is
 //! caught earlier, when an oversized context fails to parse.
 
+use std::error::Error as StdError;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,13 @@ const STD_PROJECT: &str = include_str!("js/std_project.js");
 /// AFTER the determinism prune and BEFORE `handler(ctx)` so the pruned surface is what gets frozen.
 const STD_FREEZE: &str = include_str!("js/std_freeze.js");
 
+/// The lazy-`$std` bootstrap — loaded from `src/js/std_lazy.js`. Installs the captured-intrinsic
+/// helpers (`__stdMake`/`__stdFreeze`) and the per-member getter-only accessors on `$std` that build
+/// their wrapper lazily via the native `__stdBuild` (see [`inject_lazy_std`]). Evaluated after the
+/// eager native FFI bridges are registered and before the projection, so a member is materialized
+/// only on first access within a request (D1/D2/D4).
+const STD_LAZY: &str = include_str!("js/std_lazy.js");
+
 /// The `json()` bridge — loaded from `src/js/bridge.js` at compile time.
 const JSON_BRIDGE: &str = include_str!("js/bridge.js");
 
@@ -72,9 +80,11 @@ const HANDLER_MISSING_MSG: &str = "script must define a `handler(context)` funct
 const MEMORY_MSG: &str = "memory limit exceeded";
 
 /// Determinism sanitizer — loaded from `src/js/determinism.js` at compile time. Run after
-/// `sanitize_globals` under [`Profile::Deterministic`] to neutralize nondeterministic
-/// surfaces (`Math.random`, `Date.now`, zero-arg `new Date()`, `$std.datetime.now`,
-/// `$std.crypto.uuid`).
+/// `sanitize_globals` under [`Profile::Deterministic`] to neutralize the nondeterministic JS
+/// **builtins** that are not `$std` members (`Math.random`, `Date.now`, zero-arg `new Date()`). The
+/// prunable `$std` members (`$std.datetime.now`, `$std.crypto.uuid`) are removed in the lazy builder
+/// instead (see `build_unit_sources`), so this pass never reads — and thus never force-builds — a
+/// lazy `$std` member.
 const DETERMINISM_SANITIZER: &str = include_str!("js/determinism.js");
 
 /// The generic `io.call` egress wrapper — loaded from `src/js/io.js` at compile
@@ -523,31 +533,12 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         // D3 step 1 — bootstrap `$std` before any member is built onto it.
         inject_std_bootstrap(&qctx).map_err(EngineError::internal)?;
         inject_bridge(&qctx).map_err(EngineError::internal)?;
-        decimal::inject_decimal(&qctx).map_err(EngineError::internal)?;
-        // `$` / `money` composes over `__decimal`, so it must follow the `Decimal` injection.
-        // Pure (no I/O), so injected under both profiles like `Decimal`.
-        money::inject_money(&qctx, params.default_currency).map_err(EngineError::internal)?;
-        sys::inject_sys(&qctx, params.sys_config).map_err(EngineError::internal)?;
-        // `datetime` rides the `__sys` bridge's `datetime` domain, so it must follow `inject_sys`.
-        // Pure (no I/O), always-on like `money`/`Decimal`; the deterministic profile later removes
-        // only its ambient-clock reader `$std.datetime.now` (via `js/determinism.js`).
-        datetime::inject_datetime(&qctx).map_err(EngineError::internal)?;
-        // `text` is a pure string value-util (no bridge, no clock/randomness), so it is always-on
-        // under both profiles like `Decimal`/`money`/`datetime` and the sanitizer removes nothing.
-        text::inject_text(&qctx).map_err(EngineError::internal)?;
-        // `list`/`dict` are pure collection value-utils; their column aggregates compose over the
-        // `Decimal` global, so they must follow `inject_decimal` (above). Always-on under both
-        // profiles — no clock/randomness — so the sanitizer removes nothing and neither exposes a
-        // random-order verb.
-        collections::inject_collections(&qctx).map_err(EngineError::internal)?;
-        // `template` is a pure Jinja2 templating value-util (no bridge on `__sys`, no clock/random —
-        // the minijinja env exposes no ambient builtins), so it is always-on under both profiles
-        // like `text`/`datetime` and the sanitizer removes nothing.
-        template::inject_template(&qctx).map_err(EngineError::internal)?;
-        // `check` is a pure checksum-verification value-util (no bridge, no clock/randomness, no
-        // dependency — just integer arithmetic), so it is always-on under both profiles like
-        // `text`/`template` and the sanitizer removes nothing.
-        check::inject_check(&qctx).map_err(EngineError::internal)?;
+        // D1/D2 — register the cheap eager native FFI bridges up front, then install the value-util
+        // members as lazy getter-only accessors. A member's (expensive) wrapper IIFE is parsed +
+        // executed only on first access within the request; an untouched member is never built. The
+        // deterministic prune of `$std.datetime.now`/`$std.crypto.uuid` is folded into the lazy
+        // builder (D4), so it never force-builds an untouched member.
+        inject_lazy_std(&qctx, params).map_err(EngineError::internal)?;
         inject_emit(&qctx, &effects, params.max_ops, params.max_emit_kind_len)
             .map_err(EngineError::internal)?;
         // `log.*` is injected under both profiles (D8) — logging a deterministic run is allowed;
@@ -694,6 +685,121 @@ fn inject_bridge(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     Ok(())
 }
 
+/// Registers the eager native FFI bridges and installs the lazy `$std` value-util accessors (D1/D2).
+///
+/// The bridges (`__decimal`/`__sys`/`__template`) plus the per-request `__default_currency` scalar
+/// are cheap and stay eager, so any member's wrapper can resolve its native dependency without
+/// forcing another member's build. The wrappers themselves are built lazily: [`register_std_builder`]
+/// wires the native `__stdBuild(key)`, and `js/std_lazy.js` installs the getter-only accessors that
+/// call it on first access, deep-freeze the result, and memoize it. The deterministic prune of the
+/// ambient authorities (`$std.datetime.now`, `$std.crypto.uuid`) is folded into the lazy builder
+/// (D4), so no un-pruned alias is ever materialized.
+fn inject_lazy_std(
+    qctx: &Ctx<'_>,
+    params: &ExecParams<'_>,
+) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    // The eager native halves (the cheap fraction — see the D2 validation in design.md).
+    decimal::register_native(qctx)?;
+    qctx.globals()
+        .set("__default_currency", params.default_currency.unwrap_or(""))?;
+    sys::register_native(qctx, params.sys_config)?;
+    template::register_native(qctx)?;
+
+    let deterministic = params.profile == Profile::Deterministic;
+    let sys_post = match params.sys_config {
+        Some(cfg) => sys::context_post_step(cfg)?,
+        None => String::new(),
+    };
+    register_std_builder(qctx, deterministic, &sys_post)?;
+
+    let boot: JsValue<'_> = qctx.eval(STD_LAZY)?;
+    drop(boot);
+    Ok(())
+}
+
+/// Registers the native `__stdBuild(key)` the lazy accessors dispatch on. Each precomputed unit
+/// source, when eval'd, parses+executes the unit's wrapper IIFE(s) into a fresh scratch realm
+/// (`__stdMake`) and stashes the produced members on `globalThis.__stdBuilt` for the JS getter to
+/// read, deep-freeze, and memoize. A build failure surfaces as a thrown exception out of the getter.
+fn register_std_builder(
+    qctx: &Ctx<'_>,
+    deterministic: bool,
+    sys_post: &str,
+) -> Result<(), rquickjs::Error> {
+    let sources = build_unit_sources(deterministic, sys_post);
+    let build = Function::new(
+        qctx.clone(),
+        move |bctx: Ctx<'_>, key: String| -> rquickjs::Result<()> {
+            if let Some((_, src)) = sources.iter().find(|(unit_key, _)| *unit_key == key) {
+                bctx.eval::<(), _>(src.as_str())?;
+            }
+            Ok(())
+        },
+    )?
+    .with_name("__stdBuild")?;
+    qctx.globals().set("__stdBuild", build)?;
+    Ok(())
+}
+
+/// Precomputes the shadow-eval source for every lazy build-unit, baking in the per-request sys
+/// context post-step and — under the deterministic profile — the ambient-authority prunes. Kept in
+/// lockstep with the unit table in `js/std_lazy.js`.
+fn build_unit_sources(deterministic: bool, sys_post: &str) -> Vec<(&'static str, String)> {
+    // Deterministic prunes, folded into the builder so a pruned member is what gets frozen (D4).
+    let det_datetime = if deterministic {
+        "if($std.datetime){delete $std.datetime.now;}"
+    } else {
+        ""
+    };
+    let det_crypto = if deterministic {
+        "if($std.crypto){delete $std.crypto.uuid;}"
+    } else {
+        ""
+    };
+    vec![
+        shadow_unit("decimal", &["decimal"], decimal::DECIMAL_WRAPPER),
+        shadow_unit("money", &["money"], money::MONEY_WRAPPER),
+        shadow_unit(
+            "sys",
+            &["crypto", "env", "secrets"],
+            &format!("{}{sys_post}{det_crypto}", sys::SYS_WRAPPER),
+        ),
+        shadow_unit(
+            "datetime",
+            &["datetime"],
+            &format!("{}{det_datetime}", datetime::DATETIME_WRAPPER),
+        ),
+        shadow_unit("text", &["text"], text::TEXT_WRAPPER),
+        shadow_unit("list", &["list"], collections::LIST_WRAPPER),
+        shadow_unit("dict", &["dict"], collections::DICT_WRAPPER),
+        shadow_unit("template", &["template"], template::TEMPLATE_WRAPPER),
+        shadow_unit("check", &["check"], check::CHECK_WRAPPER),
+    ]
+}
+
+/// Assembles the shadow-eval source for one build-unit: run `body` (the wrapper IIFE(s) + any
+/// post-step) with `$std` lexically rebound to a fresh scratch realm whose prototype is the real
+/// `$std` (so dependency reads fire other lazy getters) and whose `members` have own writable slots
+/// (so the wrapper's `$std.<name> = X` self-write lands locally), then stash the produced members
+/// on `globalThis.__stdBuilt`.
+fn shadow_unit(key: &'static str, members: &[&str], body: &str) -> (&'static str, String) {
+    let names = members
+        .iter()
+        .map(|member| format!("{member:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let returned = members
+        .iter()
+        .map(|member| format!("{member:?}:scratch[{member:?}]"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let src = format!(
+        "globalThis.__stdBuilt=(function(scratch){{(function($std){{{body}}})(scratch);\
+         return{{{returned}}};}})(__stdMake($std,[{names}]));"
+    );
+    (key, src)
+}
+
 /// Injects the in-engine capabilities `http`/`s3` (subject to the profile).
 ///
 /// These are the enumerated mux-bypass surface (D9): they carry their own in-engine code
@@ -795,9 +901,10 @@ fn harden(qctx: &Ctx<'_>, profile: Profile) -> Result<(), rquickjs::Error> {
     Ok(())
 }
 
-/// Neutralizes nondeterminism for [`Profile::Deterministic`]: removes `Math.random`,
-/// `Date.now`, zero-arg `new Date()`, `$std.datetime.now`, and `$std.crypto.uuid` (see
-/// `js/determinism.js`). Runs after [`sanitize_globals`].
+/// Neutralizes the nondeterministic JS builtins for [`Profile::Deterministic`]: removes
+/// `Math.random`, `Date.now`, and zero-arg `new Date()` (see `js/determinism.js`). The prunable
+/// `$std` members (`$std.datetime.now`, `$std.crypto.uuid`) are pruned in their lazy builder, not
+/// here. Runs after [`sanitize_globals`].
 fn sanitize_determinism(qctx: &Ctx<'_>) -> Result<(), rquickjs::Error> {
     let sanitized: JsValue<'_> = qctx.eval(DETERMINISM_SANITIZER)?;
     drop(sanitized);
@@ -1554,6 +1661,151 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "regex was not preempted promptly (interrupt did not fire during matching)"
+        );
+    }
+
+    /// Mechanism-level regression for the lazy-`$std` accessor (change `lazy-std-injection`), using
+    /// fake wrappers so it can assert what the end-to-end `LogicHost` tests cannot observe: (A)
+    /// `qctx.eval` works after the JS `eval` global is removed and (B) while *nested* inside a
+    /// running handler, so a native getter can lazily parse+build a member; (C) a JS accessor
+    /// calling a native `__build` memoizes+freezes; (D) `Object.create($std)` proto-delegation fires
+    /// inherited lazy getters (build-time dep resolve) while a pre-defined own writable slot captures
+    /// the wrapper's `$std.<name> = X` self-write; (E) the `$` global funnels to `$std.money`
+    /// (identity); (F) a member is built **at most once** and an **untouched member is never built**
+    /// (the build counters — unobservable through the public host API). Mirrors the real
+    /// `js/std_lazy.js` accessor logic.
+    #[test]
+    fn lazy_std_accessor_mechanism() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use rquickjs::{Ctx, Function};
+
+        // Fake wrapper sources — `decimal` has no dep; `money` reads `$std.decimal` at *build* time
+        // (top of the IIFE) exactly like the real `money.js`; `template` is the untouched member.
+        const DECIMAL_WRAPPER: &str =
+            "(function(){ $std.decimal = { tag: 'dec', add: function(a,b){ return a+b; } }; })()";
+        const MONEY_WRAPPER: &str = "(function(){ var D = $std.decimal; \
+             $std.money = { tag: 'money', dep: D.tag, plus: function(a,b){ return D.add(a,b); } }; })()";
+        const TEMPLATE_WRAPPER: &str = "(function(){ $std.template = { tag: 'tmpl' }; })()";
+
+        fn wrapper_for(name: &str) -> &'static str {
+            match name {
+                "decimal" => DECIMAL_WRAPPER,
+                "money" => MONEY_WRAPPER,
+                _template => TEMPLATE_WRAPPER,
+            }
+        }
+
+        // Shadow-eval source: captures the wrapper's `$std.<name> = X` self-write on a fresh own
+        // writable slot while dependency reads delegate to the real `$std` (firing other getters).
+        fn shadow_source(name: &str, wrapper: &str) -> String {
+            format!(
+                "globalThis.__built = (function(real){{ \
+                   var scratch = Object.create(real); \
+                   Object.defineProperty(scratch, '{name}', \
+                     {{ value: undefined, writable: true, configurable: true, enumerable: true }}); \
+                   (function($std){{ {wrapper} }})(scratch); \
+                   return scratch['{name}']; \
+                 }})($std);"
+            )
+        }
+
+        let runtime = Runtime::new().unwrap_or_else(|_err| unreachable!());
+        let ctx = Context::full(&runtime).unwrap_or_else(|_err| unreachable!());
+
+        let counts: Arc<[(&str, AtomicUsize); 3]> = Arc::new([
+            ("decimal", AtomicUsize::new(0)),
+            ("money", AtomicUsize::new(0)),
+            ("template", AtomicUsize::new(0)),
+        ]);
+
+        let result = ctx.with(|qctx| {
+            let boot: JsValue<'_> = qctx
+                .eval("globalThis.$std = {};")
+                .unwrap_or_else(|_err| unreachable!());
+            drop(boot);
+
+            let counts_ref = Arc::clone(&counts);
+            let build = Function::new(qctx.clone(), move |bctx: Ctx<'_>, name: String| {
+                for (n, c) in counts_ref.iter() {
+                    if *n == name {
+                        let _prev = c.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let src = shadow_source(&name, wrapper_for(&name));
+                bctx.eval::<(), _>(src)
+                    .unwrap_or_else(|_err| unreachable!());
+            })
+            .unwrap_or_else(|_err| unreachable!())
+            .with_name("__build")
+            .unwrap_or_else(|_err| unreachable!());
+            qctx.globals()
+                .set("__build", build)
+                .unwrap_or_else(|_err| unreachable!());
+
+            let bootstrap = "\
+                ['decimal','money','template'].forEach(function(name){ \
+                  var cache, built = false; \
+                  Object.defineProperty($std, name, { \
+                    get: function(){ if(!built){ __build(name); \
+                      cache = Object.freeze(globalThis.__built); globalThis.__built = undefined; \
+                      built = true; } return cache; }, \
+                    enumerable: true, configurable: false \
+                  }); \
+                }); \
+                Object.defineProperty(globalThis, '$', { \
+                  get: function(){ return $std.money; }, enumerable: true, configurable: true \
+                });";
+            let installed: JsValue<'_> = qctx.eval(bootstrap).unwrap_or_else(|_err| unreachable!());
+            drop(installed);
+
+            // Harden: remove the JS eval/Proxy globals, then lock the container.
+            let globals = qctx.globals();
+            globals.remove("eval").unwrap_or_else(|_err| unreachable!());
+            let _proxy = globals.remove("Proxy");
+            let frozen: JsValue<'_> = qctx
+                .eval("Object.freeze($std);")
+                .unwrap_or_else(|_err| unreachable!());
+            drop(frozen);
+
+            // The "handler": touch `$` (→ money → decimal), never touch `template`.
+            let handler = "(function(){ \
+                var out = {}; \
+                out.plus = $.plus(2, 3); \
+                out.identity = ($ === $std.money); \
+                out.dep = $std.money.dep; \
+                try { $std.money.tag = 'x'; } catch(e) {} \
+                out.frozen = ($std.money.tag === 'money'); \
+                try { $std.newthing = 1; } catch(e) {} \
+                out.locked = (typeof $std.newthing === 'undefined'); \
+                return JSON.stringify(out); \
+            })()";
+            qctx.eval::<String, _>(handler)
+                .unwrap_or_else(|_err| unreachable!())
+        });
+
+        runtime.set_interrupt_handler(None);
+
+        assert_eq!(
+            result, r#"{"plus":5,"identity":true,"dep":"dec","frozen":true,"locked":true}"#,
+            "lazy build must be transparent: identity holds, build-dep resolved, member frozen, \
+             container locked"
+        );
+        assert_eq!(
+            counts[0].1.load(Ordering::Relaxed),
+            1,
+            "decimal built exactly once (via money's build-time dep)"
+        );
+        assert_eq!(
+            counts[1].1.load(Ordering::Relaxed),
+            1,
+            "money built exactly once"
+        );
+        assert_eq!(
+            counts[2].1.load(Ordering::Relaxed),
+            0,
+            "untouched template member must never be built"
         );
     }
 }
@@ -3357,6 +3609,241 @@ mod log_tests {
         assert!(
             full.logs[0].offset_us.is_some(),
             "the full profile attaches a relative timing offset"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lazy_std_tests {
+    //! End-to-end tests of the lazy-`$std` path (change `lazy-std-injection`) driven through the
+    //! public [`crate::host::LogicHost::run`], exercising the full per-request injection: lazy
+    //! getter-only accessors, the `$` funnel + identity, per-member deep-freeze at materialization,
+    //! the locked container, reachability of every member on first access (incl. via destructuring),
+    //! and the determinism-aware builder (the pruned variant is what materializes).
+
+    use std::sync::Arc;
+
+    use serde_json::Value;
+
+    use super::{ExecOutcome, Profile};
+    use crate::config::EngineConfig;
+    use crate::host::{HostSettings, Invocation, LogicHost};
+    use crate::modules::ModuleRegistry;
+    use crate::pool::JsPool;
+    use crate::registry::ScriptRegistry;
+
+    /// Builds a minimal capability-free host (value-utils need no egress).
+    fn host() -> LogicHost {
+        let mut config = EngineConfig::default();
+        config
+            .resolve_limits()
+            .unwrap_or_else(|_err| unreachable!("default engine limits must resolve"));
+        let modules = Arc::new(ModuleRegistry::default());
+        let pool =
+            JsPool::new(config, modules).unwrap_or_else(|_err| unreachable!("pool must build"));
+        let settings = HostSettings {
+            limits: config,
+            allow_private_targets: false,
+        };
+        LogicHost::new(pool, Arc::new(ScriptRegistry::default()), settings)
+    }
+
+    /// Runs `script` under `profile` (default currency USD) and returns the success envelope's
+    /// `data`; panics with the classified error on the failure path so a broken build is loud.
+    fn run_data(host: &LogicHost, script: &str, profile: Profile) -> Value {
+        let inv = Invocation::inline(script, "{}")
+            .profile(profile)
+            .default_currency("USD");
+        let outcome = host
+            .run(inv)
+            .unwrap_or_else(|_err| unreachable!("invocation must run"));
+        match outcome.result {
+            ExecOutcome::Success(json) => {
+                let env: Value = serde_json::from_str(&json)
+                    .unwrap_or_else(|_err| unreachable!("success envelope must be JSON"));
+                env.get("data").cloned().unwrap_or(Value::Null)
+            }
+            ExecOutcome::Error(err) => panic!("handler errored: {err:?}"),
+        }
+    }
+
+    /// A touched member (`$`/money) builds and behaves identically to eager injection; identity
+    /// (`$ === $std.money`) holds; the built member is deep-frozen before the handler can mutate it;
+    /// and the container is locked (no add/delete/replace of a member).
+    #[test]
+    fn identity_freeze_and_container_lock() {
+        const SCRIPT: &str = "function handler(ctx){ \
+            var same = ($ === $std.money); \
+            var minor = $(10, 'USD').to_minor(); \
+            var before = $std.money; \
+            try { $std.money = 42; } catch(e){} \
+            var replaceNoop = ($std.money === before); \
+            try { delete $std.decimal; } catch(e){} \
+            var deleteNoop = (typeof $std.decimal === 'function'); \
+            try { $std.newthing = 1; } catch(e){} \
+            var addNoop = (typeof $std.newthing === 'undefined'); \
+            try { $std.money.__x = 1; } catch(e){} \
+            var frozen = Object.isFrozen($std.money) && (typeof $std.money.__x === 'undefined'); \
+            return json({ same: same, minor: String(minor), frozen: frozen, \
+              replaceNoop: replaceNoop, deleteNoop: deleteNoop, addNoop: addNoop }); \
+        }";
+        let data = run_data(&host(), SCRIPT, Profile::Full);
+        assert_eq!(data["same"], Value::Bool(true), "$ === $std.money");
+        assert_eq!(data["frozen"], Value::Bool(true), "member deep-frozen");
+        assert_eq!(
+            data["replaceNoop"],
+            Value::Bool(true),
+            "member not replaceable"
+        );
+        assert_eq!(
+            data["deleteNoop"],
+            Value::Bool(true),
+            "member not deletable"
+        );
+        assert_eq!(
+            data["addNoop"],
+            Value::Bool(true),
+            "container not extensible"
+        );
+        assert_eq!(
+            data["minor"],
+            Value::String("1000".to_owned()),
+            "money math intact"
+        );
+    }
+
+    /// Every value-util member is reachable on first access (lazy build on demand), including via
+    /// destructuring (a read that forces the build), and behaves as before.
+    #[test]
+    fn all_members_reachable_and_destructuring_builds() {
+        const SCRIPT: &str = "function handler(ctx){ \
+            var kinds = { \
+              decimal: typeof $std.decimal, money: typeof $std.money, \
+              datetime: typeof $std.datetime, text: typeof $std.text, \
+              list: typeof $std.list, dict: typeof $std.dict, \
+              template: typeof $std.template, check: typeof $std.check, \
+              crypto: typeof $std.crypto, env: typeof $std.env, secrets: typeof $std.secrets }; \
+            var d = $std.decimal(3).add($std.decimal(4)).toString(); \
+            var t = $std.text('Hi').lower().value; \
+            var tmpl = typeof $std.template.text; \
+            var forced = (function(){ var { money, list } = $std; \
+              return typeof money === 'function' && typeof list === 'function'; })(); \
+            return json({ kinds: kinds, d: d, t: t, tmpl: tmpl, forced: forced }); \
+        }";
+        let data = run_data(&host(), SCRIPT, Profile::Full);
+        let kinds = &data["kinds"];
+        for member in [
+            "decimal", "money", "datetime", "text", "list", "dict", "check",
+        ] {
+            assert_eq!(
+                kinds[member],
+                Value::String("function".to_owned()),
+                "{member} callable"
+            );
+        }
+        for member in ["template", "crypto", "env", "secrets"] {
+            assert_eq!(
+                kinds[member],
+                Value::String("object".to_owned()),
+                "{member} object"
+            );
+        }
+        assert_eq!(
+            data["d"],
+            Value::String("7".to_owned()),
+            "decimal math intact"
+        );
+        assert_eq!(
+            data["t"],
+            Value::String("hi".to_owned()),
+            "text util intact"
+        );
+        assert_eq!(
+            data["tmpl"],
+            Value::String("function".to_owned()),
+            "template namespace intact"
+        );
+        assert_eq!(
+            data["forced"],
+            Value::Bool(true),
+            "destructuring forces the build"
+        );
+    }
+
+    /// Under the deterministic profile the lazy build materializes the already-pruned variant:
+    /// `$std.datetime.now` and `$std.crypto.uuid` are absent, and the JS-builtin sanitizer still
+    /// neutralizes `Math.random` and no-arg `new Date()`.
+    #[test]
+    fn deterministic_build_omits_ambient_authorities() {
+        const SCRIPT: &str = "function handler(ctx){ \
+            return json({ \
+              now: typeof $std.datetime.now, \
+              uuid: typeof $std.crypto.uuid, \
+              rand: typeof Math.random, \
+              date: (function(){ try { new Date(); return 'ok'; } catch(e){ return 'blocked'; } })() \
+            }); \
+        }";
+        let data = run_data(&host(), SCRIPT, Profile::Deterministic);
+        assert_eq!(
+            data["now"],
+            Value::String("undefined".to_owned()),
+            "no datetime.now"
+        );
+        assert_eq!(
+            data["uuid"],
+            Value::String("undefined".to_owned()),
+            "no crypto.uuid"
+        );
+        assert_eq!(
+            data["rand"],
+            Value::String("undefined".to_owned()),
+            "no Math.random"
+        );
+        assert_eq!(
+            data["date"],
+            Value::String("blocked".to_owned()),
+            "no wall-clock new Date()"
+        );
+    }
+
+    /// Under the full profile the same members keep their ambient authorities — proving the prune is
+    /// gated on the profile, not unconditional.
+    #[test]
+    fn full_build_keeps_ambient_authorities() {
+        const SCRIPT: &str = "function handler(ctx){ \
+            return json({ now: typeof $std.datetime.now, uuid: typeof $std.crypto.uuid }); \
+        }";
+        let data = run_data(&host(), SCRIPT, Profile::Full);
+        assert_eq!(
+            data["now"],
+            Value::String("function".to_owned()),
+            "datetime.now present"
+        );
+        assert_eq!(
+            data["uuid"],
+            Value::String("function".to_owned()),
+            "crypto.uuid present"
+        );
+    }
+
+    /// A handler that reassigns an exposed global (`log = 5`) does not change the injected binding.
+    #[test]
+    fn exposed_globals_cannot_be_reassigned() {
+        const SCRIPT: &str = "function handler(ctx){ \
+            try { log = 5; } catch(e){} \
+            try { json = 5; } catch(e){} \
+            return json({ log: typeof log, json: typeof json }); \
+        }";
+        let data = run_data(&host(), SCRIPT, Profile::Full);
+        assert_eq!(
+            data["log"],
+            Value::String("object".to_owned()),
+            "log stays the leveled-logger object (reassignment rejected)"
+        );
+        assert_eq!(
+            data["json"],
+            Value::String("function".to_owned()),
+            "json stays the bridge (reassignment rejected)"
         );
     }
 }

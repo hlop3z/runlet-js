@@ -8,9 +8,9 @@
 //!
 //! Pure JS (`js/datetime.js`) over the shared `__sys` bridge's `datetime` domain (`sys.rs`) — the
 //! calendar/timezone math is Rust (chrono + chrono-tz), so this injector only evals the wrapper.
-//! It **must** run after [`crate::sys::inject_sys`] registers `__sys`. Injected under both profiles;
-//! `js/determinism.js` deletes only the ambient-clock reader `datetime.now` under
-//! [`crate::engine::Profile::Deterministic`].
+//! It **must** run after `__sys` is registered. Injected (lazily) under both profiles; under
+//! [`crate::engine::Profile::Deterministic`] the lazy builder constructs the variant with only the
+//! ambient-clock reader `datetime.now` removed (see `engine::build_unit_sources`).
 
 use std::error::Error;
 
@@ -18,7 +18,7 @@ use rquickjs::{Ctx, Value as JsValue};
 
 /// JS wrapper — loaded from `src/js/datetime.js` at compile time. Depends on the `__sys` bridge
 /// (registered by [`crate::sys::inject_sys`]) being present.
-const DATETIME_WRAPPER: &str = include_str!("js/datetime.js");
+pub(crate) const DATETIME_WRAPPER: &str = include_str!("js/datetime.js");
 
 /// Injects the `datetime` global. Must run after [`crate::sys::inject_sys`].
 ///

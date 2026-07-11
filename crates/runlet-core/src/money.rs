@@ -16,7 +16,7 @@ use rquickjs::{Ctx, Value as JsValue};
 
 /// JS wrapper — loaded from `src/js/money.js` at compile time. Depends on `Decimal` already being
 /// injected (it reads `$std.decimal`).
-const MONEY_WRAPPER: &str = include_str!("js/money.js");
+pub(crate) const MONEY_WRAPPER: &str = include_str!("js/money.js");
 
 /// Injects `$std.money` (mirrored to the `$` global). Must run after [`crate::decimal::inject_decimal`].
 ///
