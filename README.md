@@ -792,6 +792,10 @@ function handler(ctx) {
 }
 ```
 
+**Backtick gotcha:** in a JS template literal, `${{ x }}` collides with JS interpolation (`${…}`) —
+escape a `$` that directly precedes `{{` as `\$` (`` `Total: \${{ total }}` ``), or let the template
+emit it (`{{ "$" ~ total }}`). A `{{ x }}` with no leading `$` needs nothing.
+
 See [`docs/14-template.md`](docs/14-template.md).
 
 **Secrets are use-not-extract** (the multi-tenant guarantee). With
