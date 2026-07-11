@@ -1,0 +1,24 @@
+[package]
+name = "tauri-embed"
+description = "Worked example: embed runlet-core in a Tauri desktop app. Run: cargo run -p tauri-embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The whole embed surface is runlet-core's public API: LogicHost (the HTTP-free callable port),
+# Invocation, Profile, ExecOutcome. `default-features = false` drops the `http`/`s3` features and
+# with them `reqwest`/`aws-lc-rs` — a deterministic desktop embed links no TLS/network stack and
+# needs no C toolchain beyond the one QuickJS already uses (MSVC on Windows, which Tauri requires
+# anyway). The value-utils ($ money, $std.datetime, …) live in the always-on core, so they work
+# with zero extra features.
+runlet-core = { path = "../../crates/runlet-core", default-features = false }
+# Only to read the returned {data, error} envelope in main(). A real Tauri command hands the raw
+# JSON string straight back to the webview, which parses it — so a shipped app may not need this.
+serde_json.workspace = true
+
+# Intentionally NOT `[lints] workspace = true`: this is a fork-me example, not shipped code — a
+# Tauri app author writes their own crate with their own (normal) lints and never inherits
+# runlet-core's internal restriction gauntlet. Matches examples/kv-capability.
