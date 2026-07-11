@@ -114,6 +114,11 @@ reqwest = { version = "0.13", default-features = false, features = [
 # Plain decimal math for the `$`/Decimal global (decimal.rs). The Postgres NUMERIC decode
 # (rust_decimal's `db-tokio-postgres` feature) lives with the drivers in the fabricd repo.
 rust_decimal = "1"
+# Jinja2 templating for the `$std.template` value-util (template.rs). Pure Rust, single required
+# dependency (`serde`, already in-tree), no C toolchain and no second crypto stack. Default features
+# only — the `speedups` feature (which would pull `v_htmlescape`) stays OFF. See the ADR in
+# `openspec/changes/std-template-util/design.md`.
+minijinja = "2"
 
 # ──────────────────────────────────────────────────────────────
 # Rustc lints — deny everything allowed-by-default that matters

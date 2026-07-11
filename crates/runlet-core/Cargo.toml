@@ -35,6 +35,10 @@ hmac.workspace = true
 sha2.workspace = true
 percent-encoding.workspace = true
 rust_decimal.workspace = true
+# Jinja2 templating engine backing the always-on `$std.template` value-util (template.rs). Pure
+# Rust (single required dep: `serde`), no C, no `ring` — stays in the deterministic-only
+# `--no-default-features` core (rendering `(source, context)` is pure). `speedups` feature OFF.
+minijinja.workspace = true
 # Backs the always-on compiled-bytecode cache (bytecode.rs). Pure-Rust, no I/O — so it stays in
 # the deterministic-only `--no-default-features` core without pulling any network driver.
 moka.workspace = true

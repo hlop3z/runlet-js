@@ -763,6 +763,37 @@ function handler(ctx) {
 
 See [`docs/13-lists-and-dicts.md`](docs/13-lists-and-dicts.md).
 
+### template — deterministic Jinja2 string templating
+
+`template` is an **always-on** value-util (no config, like `$`/`Decimal`/`datetime`/`text`), backed by
+the pure-Rust `minijinja` crate (Jinja2 syntax: `{{ expr }}` / `{% stmt %}`). It has **two explicit
+escaping modes, no ambiguous default**: `$std.template.html(src)` auto-escapes interpolated values
+(invoices, HTML email) and `$std.template.text(src)` emits them verbatim (plain email, SMS, receipts).
+Each returns an immutable **compiled template** with `.render(context)`, `.missing(placeholder)`, and
+`.fields()`. Undefined merge tags render **empty** by default (rendering never fails on an absent tag);
+`.missing("—")` sets a placeholder. The environment carries **no clock/random builtins**, so
+`render(source, context)` is pure — injected identically under the deterministic profile. A malformed
+template throws a catchable `Error` at construction, never panicking the runtime.
+
+```js
+function handler(ctx) {
+  // html mode auto-escapes — a customer named "<b>&co" can't break the page:
+  $std.template.html("<h1>Invoice for {{ customer }}</h1><p>Total: {{ total }}</p>")
+    .render({ customer: ctx.customer, total: "100.00" });
+
+  // text mode is verbatim — for plain email / SMS / receipts, with an invoice-line loop:
+  $std.template.text("{% for line in lines %}- {{ line }}\n{% endfor %}").render({ lines: ctx.lines });
+
+  // lenient missing tags + a placeholder, and merge-tag introspection:
+  $std.template.text("Hi {{ name }}").missing("customer").render({});     // "Hi customer"
+  $std.template.text("{{ first }} {{ last }}").fields();                  // ["first", "last"]
+
+  return json({ ok: true }, null);
+}
+```
+
+See [`docs/14-template.md`](docs/14-template.md).
+
 **Secrets are use-not-extract** (the multi-tenant guarantee). With
 `config.sys = { "env": { "REGION": "us-east-1" }, "secrets": { "SIGNING_KEY": "sk_live_…" } }`:
 

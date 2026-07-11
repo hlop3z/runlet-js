@@ -622,6 +622,39 @@ interface TextFactory {
 /** Immutable string value-util (Pythonic names, JS semantics). Always available. */
 
 // ─────────────────────────────────────────────────────────────────────────────
+// `template` — Jinja2 string templating (always available, both profiles)
+// Deterministic: no clock/random builtins; rendering is a pure function of (source, context).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A compiled template. Re-usable across contexts; render it with a plain object of merge-tag
+ * values. Undefined merge tags render empty by default — set a placeholder with {@link missing}.
+ *
+ * @example
+ * $std.template.html("<p>Hi {{ name }}</p>").render({ name: "Ada" });   // "<p>Hi Ada</p>"
+ */
+interface CompiledTemplate {
+  /** Render the template against a context object, returning the produced string. */
+  render(context: Record<string, unknown>): string;
+  /** A new template whose undefined merge tags render as `placeholder` (e.g. `"—"`). Immutable. */
+  missing(placeholder: string): CompiledTemplate;
+  /** The top-level merge tags this template references (sorted) — "what data does it need?". */
+  fields(): string[];
+}
+
+/**
+ * Jinja2 string templating (`{{ expr }}` / `{% stmt %}`). Two explicit escaping modes, no ambiguous
+ * default: {@link html} auto-escapes interpolated values (invoices, HTML email); {@link text} emits
+ * them verbatim (plain email, SMS, receipts). Deterministic — available under both profiles.
+ */
+interface TemplateFactory {
+  /** Compile with HTML auto-escaping ON. For anything shown in a browser or HTML email. */
+  html(source: string): CompiledTemplate;
+  /** Compile with NO escaping. For plain email, SMS, receipts. */
+  text(source: string): CompiledTemplate;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // `list` — a table of records · `dict` — one record (always available)
 // Field-name-first, callback-free collection shaping (SQL / Shopify-Liquid names).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -941,6 +974,8 @@ interface Std {
   list: ListFactory;
   /** Field-name-first immutable record value-util. See {@link DictFactory}. */
   dict: DictFactory;
+  /** Deterministic Jinja2 string templating (html/text modes). See {@link TemplateFactory}. */
+  template: TemplateFactory;
   /** Operator-named logical egress. Present only when `config.io` lists a name. See {@link Io}. */
   io: Io;
   /** SSRF-guarded HTTP client. Present only when `config.allowed_hosts` is set. See {@link HttpClient}. */
