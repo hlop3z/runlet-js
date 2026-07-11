@@ -17,7 +17,7 @@ use std::error::Error;
 use rquickjs::{Ctx, Value as JsValue};
 
 /// JS wrapper — loaded from `src/js/text.js` at compile time. Depends on no other injected global.
-const TEXT_WRAPPER: &str = include_str!("js/text.js");
+pub(crate) const TEXT_WRAPPER: &str = include_str!("js/text.js");
 
 /// Injects `$std.text`. Order-independent among the pure value-utils (no bridge dependency).
 ///

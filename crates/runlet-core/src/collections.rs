@@ -21,10 +21,10 @@ use rquickjs::{Ctx, Value as JsValue};
 
 /// `list` JS wrapper — loaded from `src/js/list.js` at compile time. Reads `$std.decimal` at
 /// call time (for aggregates) and `$std.dict` (for `group_by`).
-const LIST_WRAPPER: &str = include_str!("js/list.js");
+pub(crate) const LIST_WRAPPER: &str = include_str!("js/list.js");
 /// `dict` JS wrapper — loaded from `src/js/dict.js` at compile time. Reads `$std.list` at call
 /// time (for `keys`/`values`/`entries`).
-const DICT_WRAPPER: &str = include_str!("js/dict.js");
+pub(crate) const DICT_WRAPPER: &str = include_str!("js/dict.js");
 
 /// Injects the `list` and `dict` globals.
 ///

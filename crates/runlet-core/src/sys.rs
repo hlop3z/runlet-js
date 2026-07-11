@@ -101,7 +101,7 @@ impl SysConfig {
 type SecretStore = HashMap<String, String>;
 
 /// JS wrapper — loaded from `src/js/sys.js` at compile time.
-const SYS_WRAPPER: &str = include_str!("js/sys.js");
+pub(crate) const SYS_WRAPPER: &str = include_str!("js/sys.js");
 
 /// Milliseconds in one second.
 const MILLIS_PER_SECOND: i64 = 1000;
@@ -112,20 +112,18 @@ const SECONDS_PER_HOUR: u64 = 3600;
 /// Seconds in one day.
 const SECONDS_PER_DAY: u64 = 86_400;
 
-/// Injects the runtime stdlib under `$std`. Requires the `$std` bootstrap to have run first.
-///
-/// Populates `$std.crypto` (always on, pure), plus `$std.env`/`$std.secrets` only when
-/// `sys_config` is present (opt-in).
+/// Registers the eager `__sys` FFI bridge (the cheap native half), capturing the secret plaintext
+/// store. The `$std.crypto`/`env`/`secrets` wrapper is built lazily by the engine on first access;
+/// this only installs the bridge those members ride (D2). The secret plaintext lives in the closure
+/// here and is resolved only by HMAC — it never crosses into JS (see module docs).
 ///
 /// # Errors
 ///
-/// Returns an error if registration or JS eval fails.
-pub fn inject_sys(
+/// Returns an error if registration fails.
+pub(crate) fn register_native(
     qctx: &Ctx<'_>,
     sys_config: Option<&SysConfig>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // The secret plaintext lives here, captured by the native closure, and is
-    // resolved only by HMAC — it never crosses into JS (see module docs).
     let secrets = sys_config.map(SysConfig::secret_store).unwrap_or_default();
 
     let sys_fn = Function::new(
@@ -140,6 +138,40 @@ pub fn inject_sys(
     .with_name("__sys")?;
 
     qctx.globals().set("__sys", sys_fn)?;
+    Ok(())
+}
+
+/// Builds the JS post-step that populates `$std.env`/`$std.secrets` from `cfg`, to run **inside**
+/// the lazy sys build (after `SYS_WRAPPER` defines `__sysMakeSecrets`, with `$std` bound to the
+/// build scratch). `env` is embedded as its JSON literal (trusted operator config); `secrets` is
+/// built from names only via the wrapper's handle factory (no plaintext crosses into JS). Returns
+/// the empty string when there is no config (the wrapper's `{}` defaults then stand).
+///
+/// # Errors
+///
+/// Returns an error if serializing the env map / secret names fails.
+pub(crate) fn context_post_step(cfg: &SysConfig) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let env_json = serde_json::to_string(&cfg.env)?;
+    let names_json = serde_json::to_string(&cfg.secret_names())?;
+    Ok(format!(
+        "$std.env = {env_json}; $std.secrets = globalThis.__sysMakeSecrets({names_json});"
+    ))
+}
+
+/// Injects the runtime stdlib under `$std` eagerly (native bridge + wrapper + context).
+///
+/// Retained for the module's own unit tests; the engine registers the native eagerly and builds the
+/// wrapper lazily instead. Populates `$std.crypto` (always on, pure), plus `$std.env`/`$std.secrets`
+/// only when `sys_config` is present (opt-in).
+///
+/// # Errors
+///
+/// Returns an error if registration or JS eval fails.
+pub fn inject_sys(
+    qctx: &Ctx<'_>,
+    sys_config: Option<&SysConfig>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    register_native(qctx, sys_config)?;
 
     let wrapper: JsValue<'_> = qctx.eval(SYS_WRAPPER)?;
     drop(wrapper);
@@ -366,7 +398,8 @@ fn datetime_dispatch(op: &str, payload: &Value) -> Result<Value, String> {
 }
 
 /// Current wall-clock instant as epoch milliseconds. The **only** ambient-clock reader in this
-/// domain — removed (not stubbed) under `Profile::Deterministic` by deleting `datetime.now` in JS.
+/// domain — removed (not stubbed) under `Profile::Deterministic`: the lazy `datetime` builder
+/// constructs the variant with `datetime.now` deleted (see `engine::build_unit_sources`).
 fn now_millis() -> Result<i64, String> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -4,11 +4,17 @@
   // eval/Proxy removal.
   //
   // D9 (WASI lesson): the ambient authorities are *removed*, not stubbed. A present-but-gated
-  // authority is one refactor away from being un-gated, so `Math.random`/`Date.now`/`$std.datetime.now`
-  // + `$std.crypto.uuid` are `delete`d outright — the property is simply gone (`typeof x === "undefined"`),
-  // with no closure left holding the real function to re-reach. `new Date()` (no args) is the one
-  // surface that cannot be a property deletion: it is blocked by replacing the constructor, so the
-  // wall clock is still structurally unreachable (there is no residual property to reach).
+  // authority is one refactor away from being un-gated, so `Math.random`/`Date.now` are `delete`d
+  // outright — the property is simply gone (`typeof x === "undefined"`), with no closure left holding
+  // the real function to re-reach. `new Date()` (no args) is the one surface that cannot be a property
+  // deletion: it is blocked by replacing the constructor, so the wall clock is still structurally
+  // unreachable (there is no residual property to reach).
+  //
+  // This pass sanitizes only the JS BUILTINS that are not `$std` members. The prunable `$std` members
+  // (`$std.datetime.now`, `$std.crypto.uuid`) are NOT touched here: under lazy materialization those
+  // members may not be built yet, and reading them would force their build. Their prune is folded
+  // into the per-member lazy builder instead (D4), which constructs the already-pruned variant on
+  // first access — so no un-pruned alias is ever materialized or frozen.
 
   if (typeof Math !== "undefined") {
     delete Math.random;
@@ -40,16 +46,5 @@
     // `SafeDate.now` is intentionally never copied over — `Date.now` is thus absent (removed),
     // not a throwing stub.
     globalThis.Date = SafeDate;
-  }
-
-  // The prunable ambient authorities live only under `$std` (never mirrored to a bare global, D2),
-  // so deleting them here leaves no surviving alias.
-  //
-  // `$std.datetime.now` is the sole ambient-clock reader on the `datetime` value-util — delete it
-  // (removed, not stubbed). Everything else on `datetime` (parse/from/components/arithmetic/
-  // comparison/formatting) is pure given an explicit instant and stays available.
-  if (typeof $std !== "undefined") {
-    if ($std.datetime) delete $std.datetime.now;
-    if ($std.crypto) delete $std.crypto.uuid;
   }
 })();
