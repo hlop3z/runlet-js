@@ -12,5 +12,5 @@
   function channel(name) {
     return function(action, payload) { return call(name, action, payload); };
   }
-  globalThis.io = { call: call, channel: channel };
+  $std.io = { call: call, channel: channel };
 })();

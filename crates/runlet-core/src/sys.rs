@@ -1,13 +1,13 @@
-//! `$sys` — the always-on runtime standard library for the sandbox.
+//! The always-on runtime standard library for the sandbox, under `$std`.
 //!
-//! One `$`-prefixed global grouping pure, zero-I/O helpers: `$sys.crypto`
-//! (hashing, HMAC, UUID, encoding). Pure like `$`/Decimal — always injected, no
-//! config, no per-op metering.
+//! Pure, zero-I/O helpers grouped at `$std.crypto` (hashing, HMAC, UUID, encoding), plus the
+//! operator surfaces `$std.env` / `$std.secrets`. Pure like `$`/`$std.decimal` — crypto is always
+//! injected, no config, no per-op metering.
 //!
-//! Date/time is **not** here: it lives in the first-class top-level `datetime`
+//! Date/time is **not** here: it lives in the first-class top-level `$std.datetime`
 //! value-util (`js/datetime.js`), whose calendar/timezone math is served by the
 //! `datetime` domain in this same `__sys` bridge (see the `-- datetime` section
-//! below). `$sys` keeps only the crypto surface.
+//! below). The crypto surface is grouped under `$std.crypto`.
 //!
 //! FFI: every op crosses the boundary as `__sys(domain, op, payload_json)` and
 //! returns `{"v": <result>}` on success or `{"error": <message>}` on failure
@@ -61,16 +61,16 @@ use uuid::Uuid;
 
 use crate::sandbox;
 
-/// Per-request `$sys` context: operator-supplied env + secrets (both opt-in).
+/// Per-request runtime-stdlib context: operator-supplied env + secrets (both opt-in).
 ///
 /// `env` values are returnable plain config; `secrets` plaintext never reaches JS —
 /// it stays Rust-side in the [`SecretStore`] and surfaces only as opaque handles.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SysConfig {
-    /// Plain config values, exposed (and returnable) at `$sys.env`.
+    /// Plain config values, exposed (and returnable) at `$std.env`.
     #[serde(default)]
     pub env: Map<String, Value>,
-    /// Secret values: plaintext kept Rust-side; `$sys.secrets` exposes opaque handles.
+    /// Secret values: plaintext kept Rust-side; `$std.secrets` exposes opaque handles.
     #[serde(default)]
     pub secrets: Map<String, Value>,
 }
@@ -112,8 +112,10 @@ const SECONDS_PER_HOUR: u64 = 3600;
 /// Seconds in one day.
 const SECONDS_PER_DAY: u64 = 86_400;
 
-/// Injects the `$sys` global. The pure helper (`crypto`) is always on; the
-/// `env`/`secrets` context is populated only when `sys_config` is present (opt-in).
+/// Injects the runtime stdlib under `$std`. Requires the `$std` bootstrap to have run first.
+///
+/// Populates `$std.crypto` (always on, pure), plus `$std.env`/`$std.secrets` only when
+/// `sys_config` is present (opt-in).
 ///
 /// # Errors
 ///
@@ -148,19 +150,19 @@ pub fn inject_sys(
     Ok(())
 }
 
-/// Populates `$sys.env` (plain, returnable values) and `$sys.secrets` (opaque
+/// Populates `$std.env` (plain, returnable values) and `$std.secrets` (opaque
 /// handles) from operator config. Crucially, **no secret plaintext is set on any
 /// JS value** — only the secret *names* are sent, and the JS wrapper turns each
 /// into a frozen handle whose plaintext is reachable solely via Rust-side HMAC.
 fn inject_context(qctx: &Ctx<'_>, cfg: &SysConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let sys_obj: Object<'_> = qctx.globals().get("$sys")?;
+    let std_obj: Object<'_> = qctx.globals().get("$std")?;
     let env_val: JsValue<'_> = qctx.json_parse(serde_json::to_string(&cfg.env)?)?;
-    sys_obj.set("env", env_val)?;
+    std_obj.set("env", env_val)?;
 
     // Build the handle map from names only — `__sysMakeSecrets` is defined by the
     // wrapper and returns a frozen object of opaque handles (no plaintext).
     let names_json = serde_json::to_string(&cfg.secret_names())?;
-    let snippet = format!("$sys.secrets = globalThis.__sysMakeSecrets({names_json});");
+    let snippet = format!("$std.secrets = globalThis.__sysMakeSecrets({names_json});");
     let built: JsValue<'_> = qctx.eval(snippet)?;
     drop(built);
     Ok(())
@@ -207,7 +209,7 @@ fn field_i64(payload: &Value, key: &str) -> Result<i64, String> {
 
 // -- crypto -----------------------------------------------------------------
 
-/// Routes a `$sys.crypto` op.
+/// Routes a `$std.crypto` op.
 fn crypto_dispatch(op: &str, payload: &Value, secrets: &SecretStore) -> Result<Value, String> {
     match op {
         "sha256" => Ok(Value::String(sha256_hex(field_str(payload, "data")?))),

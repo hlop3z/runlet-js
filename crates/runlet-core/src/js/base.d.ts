@@ -16,21 +16,28 @@
  * (No `/// <reference>` or `// @ts-check` needed; the tsconfig wires it up.)
  *
  * @remarks
- * **Capabilities are opt-in.** The box ships three built-ins. `io` (logical
+ * **One namespace, `$std`.** Every built-in lives on the single {@link Std} namespace object —
+ * value-utils (`$std.money`, `$std.decimal`, `$std.text`, `$std.datetime`, `$std.list`,
+ * `$std.dict`), capabilities (`$std.io`, `$std.http`, `$std.s3`), the runtime stdlib
+ * (`$std.crypto`, `$std.env`, `$std.secrets`), and the channels (`$std.json`, `$std.log`,
+ * `$std.emit`). A curated few are also mirrored to bare globals for the highest-frequency calls:
+ * `$` (= `$std.money`), `json`, `log`, and `emit` — each the *same object* as its `$std` member.
+ *
+ * **Capabilities are opt-in.** The box ships three built-ins. `$std.io` (logical
  * egress) exists when the request lists a resource name in `config.io` — a
  * **flat allowlist** of logical names, e.g. `"io": ["orders", "cache"]`; call a
- * named resource with `io.call(name, action, payload)`. Each name is an
+ * named resource with `$std.io.call(name, action, payload)`. Each name is an
  * operator-defined resource resolved box-direct or by a broker — the request
  * never carries endpoints or credentials. The in-engine capabilities keep their
- * own config: `api` exists when `config.allowed_hosts` is non-empty, `s3` when
- * `config.s3` is present. Otherwise the global is `undefined` (e.g.
- * `typeof s3 === "undefined"`). They are declared here as
+ * own config: `$std.http` exists when `config.allowed_hosts` is non-empty, `$std.s3` when
+ * `config.s3` is present. Otherwise the member is `undefined` (e.g.
+ * `typeof $std.s3 === "undefined"`). They are typed here as
  * always-present for convenient autocomplete; guard with `typeof` if a
  * capability is optional.
- * `json`, `$`, `Decimal`, `datetime`, and `$sys.crypto` are pure and **always**
- * available; `$sys.env` / `$sys.secrets` populate only when `config.sys` is set.
+ * `$std.json`, `$std.money`, `$std.decimal`, `$std.datetime`, and `$std.crypto` are pure and
+ * **always** available; `$std.env` / `$std.secrets` populate only when `config.sys` is set.
  *
- * `eval` and `Proxy` are removed before your `handler` runs.
+ * `eval` and `Proxy` are removed before your `handler` runs, and `$std` is frozen.
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,7 +58,7 @@
  * @example
  * return json(null, { message: "bad input" }); // failure
  */
-declare function json(data: unknown, error?: unknown): string;
+type JsonFn = (data: unknown, error?: unknown) => string;
 
 /**
  * Proposes a **tagged effect** — a structured thing your handler wants the platform to record or
@@ -69,7 +76,7 @@ declare function json(data: unknown, error?: unknown): string;
  * @example
  * for (const m of mismatches) emit("finding", m); // itemized findings, kept even on a later throw
  */
-declare function emit(kind: string, value: unknown): void;
+type EmitFn = (kind: string, value: unknown) => void;
 
 /**
  * A structured, leveled diagnostic logger — **diagnostics, not billing; lossy by design**. Unlike
@@ -105,12 +112,6 @@ interface Logger {
    */
   with(fields: Record<string, unknown>): Logger;
 }
-
-/**
- * The diagnostic logger (always available). Below-floor levels are discarded cheaply; captured
- * entries are lossy and routed by platform policy. See {@link Logger}.
- */
-declare const log: Logger;
 
 /**
  * The function the sandbox calls. Define `function handler(ctx) { ... }` in your
@@ -149,7 +150,7 @@ type RoundingMode = "half_up" | "half_even" | "up" | "down" | "ceil" | "floor";
  * precision loss. For currency use {@link Money} (`$`), which is currency-safe.
  *
  * @example
- * const total = Decimal("0.1").add("0.2");   // exact 0.3, not 0.30000000000000004
+ * const total = $std.decimal("0.1").add("0.2");   // exact 0.3, not 0.30000000000000004
  * total.to_string();                         // "0.3"
  */
 interface Decimal {
@@ -169,7 +170,7 @@ interface Decimal {
   round(places?: number, mode?: RoundingMode): Decimal;
   /**
    * Rounds to the nearest multiple of `step` using `mode` (default `"half_up"`).
-   * @example Decimal("2.03").round_to("0.05");   // 2.05  (cash rounding)
+   * @example $std.decimal("2.03").round_to("0.05");   // 2.05  (cash rounding)
    */
   round_to(step: DecimalInput, mode?: RoundingMode): Decimal;
   /** `p` percent of the value: `this * p / 100`. */
@@ -212,7 +213,6 @@ interface DecimalFactory {
 }
 
 /** Exact-number factory (non-money). Always available. Distinct from `$` (money). */
-declare const Decimal: DecimalFactory;
 
 /** An ISO 4217 currency code (e.g. `"USD"`, `"EUR"`, `"JPY"`). */
 type CurrencyCode = string;
@@ -321,9 +321,7 @@ interface MoneyFactory {
 }
 
 /** Money factory (currency-bound). Always available. Same as {@link money}. */
-declare const $: MoneyFactory;
 /** Money factory (currency-bound). Always available. Same as {@link $}. */
-declare const money: MoneyFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // `datetime` — immutable UTC instant + timezone-aware views (always available)
@@ -397,7 +395,7 @@ interface IsoWeek {
  * UTC (`Z`) string inside {@link json} / `JSON.stringify`.
  *
  * @example
- * const due = datetime.parse(ctx.invoiced).add({ months: 1 }).end_of("month");
+ * const due = $std.datetime.parse(ctx.invoiced).add({ months: 1 }).end_of("month");
  * due.in_zone("America/New_York").format("YYYY-MM-DD HH:mm"); // month-end in the customer's zone
  */
 interface DateTime {
@@ -482,13 +480,13 @@ interface DateTime {
 }
 
 /**
- * The `datetime` factory (always available). Callable as `datetime(input)` (≡ {@link parse}) plus
+ * The `datetime` factory (always available). Callable as `$std.datetime(input)` (≡ {@link parse}) plus
  * named constructors. Parsing normalizes to a UTC instant; ambiguous locale strings like
  * `"07/10/2026"` are **not** guessed — they throw.
  *
  * @example
- * datetime("2026-07-10T13:30:00Z");        // parse RFC 3339
- * datetime.from({ year: 2026, month: 7, day: 10 }, "Asia/Tokyo"); // parts in a zone
+ * $std.datetime("2026-07-10T13:30:00Z");        // parse RFC 3339
+* $std.datetime.from({ year: 2026, month: 7, day: 10 }, "Asia/Tokyo"); // parts in a zone
  */
 interface DateTimeFactory {
   (input: DateTimeInput): DateTime;
@@ -501,7 +499,6 @@ interface DateTimeFactory {
 }
 
 /** Date-time factory (immutable UTC instants + zoned views). Always available. */
-declare const datetime: DateTimeFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // text — immutable string value-util (Pythonic names, JS semantics). Always on.
@@ -617,13 +614,12 @@ interface Text {
   toJSON(): string;
 }
 
-/** String value-util factory. `text(input)` wraps any value as an immutable string. Always available. */
+/** String value-util factory. `$std.text(input)` wraps any value as an immutable string. Always available. */
 interface TextFactory {
   (input: unknown): Text;
 }
 
 /** Immutable string value-util (Pythonic names, JS semantics). Always available. */
-declare const text: TextFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // `list` — a table of records · `dict` — one record (always available)
@@ -638,7 +634,7 @@ declare const text: TextFactory;
  * `.at(i)` (not `[i]`); iterate with `for..of` / spread.
  *
  * @example
- * list(orders).where({ status: "paid" }).sort_by("date").sum("total");   // exact Decimal
+ * $std.list(orders).where({ status: "paid" }).sort_by("date").sum("total");   // exact Decimal
  */
 interface List {
   // filtering / ordering / selection (no callbacks)
@@ -656,7 +652,7 @@ interface List {
   group_by(field: string): Dict;
 
   // exact aggregates over a named column (blanks/non-numeric skipped)
-  /** Exact sum of a column → a {@link Money} (currency-preserving) for a money column, else a {@link Decimal} (empty → `Decimal(0)`). Mixed currencies throw. */
+  /** Exact sum of a column → a {@link Money} (currency-preserving) for a money column, else a {@link Decimal} (empty → `$std.decimal(0)`). Mixed currencies throw. */
   sum(field?: string): Decimal | Money;
   /** Exact average of a column → {@link Money} for a money column, else {@link Decimal}; `null` when empty. Mixed currencies throw. */
   avg(field?: string): Decimal | Money | null;
@@ -686,13 +682,12 @@ interface List {
   [Symbol.iterator](): Iterator<unknown>;
 }
 
-/** Collection value-util factory. `list(input)` wraps an array (non-array → single/empty). Always available. */
+/** Collection value-util factory. `$std.list(input)` wraps an array (non-array → single/empty). Always available. */
 interface ListFactory {
   (input?: unknown): List;
 }
 
 /** Immutable table-of-records value-util (field-name-first, callback-free). Always available. */
-declare const list: ListFactory;
 
 /**
  * Immutable record value-util over one plain object (string keys). Safe nested reads and key/value
@@ -700,7 +695,7 @@ declare const list: ListFactory;
  * `.to_object()`; it also serializes as a plain object via `toJSON`.
  *
  * @example
- * dict(customer).get("address.city", "—");   // safe nested read with a default
+ * $std.dict(customer).get("address.city", "—");   // safe nested read with a default
  */
 interface Dict {
   /** Read a dotted path (`"a.b.c"`), returning the value or `def` (else `undefined`) on any miss. */
@@ -726,13 +721,12 @@ interface Dict {
   valueOf(): Record<string, unknown>;
 }
 
-/** Record value-util factory. `dict(input)` wraps a plain object (non-object → empty). Always available. */
+/** Record value-util factory. `$std.dict(input)` wraps a plain object (non-object → empty). Always available. */
 interface DictFactory {
   (input?: unknown): Dict;
 }
 
 /** Immutable one-record value-util (field-name-first, callback-free). Always available. */
-declare const dict: DictFactory;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Response `meta` — per-capability op metrics keyed by name (`meta.io.<name>`)
@@ -825,7 +819,7 @@ interface BatchResponse {
   meta: BatchMeta;
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// `$sys` — runtime stdlib: crypto (always on); env/secrets when config.sys set
+// `$std.crypto` / `$std.env` / `$std.secrets` — runtime stdlib (crypto always on)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** HMAC hash algorithm. */
@@ -855,7 +849,7 @@ interface SysCrypto {
   /**
    * HMAC of `msg` under `key`, `encoding`-encoded (default `"hex"`). `key` may be a
    * {@link SysSecret} handle — it is resolved server-side; the plaintext never enters JS.
-   * @example $sys.crypto.hmac("sha256", $sys.secrets.SIGNING_KEY, body);
+   * @example $std.crypto.hmac("sha256", $std.secrets.SIGNING_KEY, body);
    */
   hmac(
     algo: SysHmacAlgo,
@@ -888,30 +882,99 @@ interface SysSecret {
 }
 
 /**
- * The `$sys` runtime standard library. `crypto` is pure and **always** available; `env` and
- * `secrets` are populated only when `config.sys` is supplied (otherwise they are empty objects).
- * Date/time lives in the top-level {@link datetime} value-util, not here.
+ * Plain, returnable operator config values from `config.sys.env`, at `$std.env`. Typed as
+ * possibly `undefined` so you can probe optional keys (`$std.env.FLAG === undefined`); a key you
+ * know is set can be used directly.
  */
-interface Sys {
-  /** Pure crypto + encoding (always available). */
-  crypto: SysCrypto;
+type SysEnv = { readonly [key: string]: string | undefined };
+
+/**
+ * Opaque secret handles from `config.sys.secrets` (see {@link SysSecret}), at `$std.secrets`. Typed
+ * as always-present (you reference the keys you provisioned) so a handle drops straight into
+ * {@link SysCrypto.hmac} without a null check; an unprovisioned key is `undefined` at runtime.
+ */
+type SysSecrets = { readonly [key: string]: SysSecret };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `$std.io` — operator-named logical egress (present when `config.io` lists a name)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Logical egress: call an operator-named resource (a nickname from the `config.io` allowlist) by
+ * `name`. The box is kind-blind — the script never sees an endpoint or a credential; the broker (or
+ * a box-direct binding) resolves the name. Present only when `config.io` is non-empty.
+ */
+interface Io {
   /**
-   * Plain, returnable operator config values from `config.sys.env`. Typed as possibly
-   * `undefined` so you can probe optional keys (`$sys.env.FLAG === undefined`); a key
-   * you know is set can be used directly.
+   * Invokes `action` on the resource `name` with an (optional) JSON `payload`, returning the
+   * backend's JSON response. A name not in `config.io` throws `RESOURCE_NOT_FOUND`.
+   * @example $std.io.call("orders", "get", { id: 42 });
    */
-  env: { readonly [key: string]: string | undefined };
-  /**
-   * Opaque secret handles from `config.sys.secrets` (see {@link SysSecret}). Typed as
-   * always-present (you reference the keys you provisioned) so a handle drops straight
-   * into {@link SysCrypto.hmac} without a null check; an unprovisioned key is `undefined`
-   * at runtime.
-   */
-  secrets: { readonly [key: string]: SysSecret };
+  call(name: string, action: string, payload?: unknown): any;
+  /** Binds `name` once, returning a caller `(action, payload?) => any` for that resource. */
+  channel(name: string): (action: string, payload?: unknown) => any;
 }
 
-/** Runtime stdlib. `$sys.crypto` always available; `env` / `secrets` need `config.sys`. */
-declare const $sys: Sys;
+// ─────────────────────────────────────────────────────────────────────────────
+// `$std` — the canonical namespace of every built-in (globals are a projection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The single namespace object holding **every** built-in the sandbox provides. Each member is
+ * defined once here; the bare globals `$`, `json`, `log`, and `emit` are a thin projection of the
+ * curated subset (identity-equal references). `$std` is deep-frozen before your `handler` runs.
+ *
+ * Value-utils and `crypto` are always available; `env`/`secrets` populate only with `config.sys`;
+ * `io`/`http`/`s3` exist only when configured (guard with `typeof` if optional). Under the
+ * deterministic profile `$std.datetime.now` and `$std.crypto.uuid` are removed.
+ */
+interface Std {
+  /** Currency-safe money — also the `$` global. See {@link MoneyFactory}. */
+  money: MoneyFactory;
+  /** Exact, arbitrary-precision non-money numbers. See {@link DecimalFactory}. */
+  decimal: DecimalFactory;
+  /** Immutable, Python-flavored string value-util. See {@link TextFactory}. */
+  text: TextFactory;
+  /** Immutable UTC-instant date/time value-util. See {@link DateTimeFactory}. */
+  datetime: DateTimeFactory;
+  /** Field-name-first immutable list value-util. See {@link ListFactory}. */
+  list: ListFactory;
+  /** Field-name-first immutable record value-util. See {@link DictFactory}. */
+  dict: DictFactory;
+  /** Operator-named logical egress. Present only when `config.io` lists a name. See {@link Io}. */
+  io: Io;
+  /** SSRF-guarded HTTP client. Present only when `config.allowed_hosts` is set. See {@link HttpClient}. */
+  http: HttpClient;
+  /** S3-compatible storage helper. Present only when `config.s3` is set. See {@link S3}. */
+  s3: S3;
+  /** Pure crypto + encoding helpers (always available). See {@link SysCrypto}. */
+  crypto: SysCrypto;
+  /** Plain operator config values from `config.sys.env`. See {@link SysEnv}. */
+  env: SysEnv;
+  /** Opaque secret handles from `config.sys.secrets`. See {@link SysSecrets}. */
+  secrets: SysSecrets;
+  /** Builds the `{ data, error }` response envelope — also the `json` global. See {@link JsonFn}. */
+  json: JsonFn;
+  /** Structured, leveled diagnostic logger — also the `log` global. See {@link Logger}. */
+  log: Logger;
+  /** Proposes a tagged effect — also the `emit` global. See {@link EmitFn}. */
+  emit: EmitFn;
+}
+
+/** The canonical namespace of every built-in. Globals below are a projection of it. */
+declare const $std: Std;
+
+// The curated bare globals — each DERIVED from {@link Std} (indexed-access types) so they can never
+// drift from the namespace, and each the same object reference as its `$std` member at runtime.
+
+/** Currency-safe money construction. The same object as {@link Std.money} (`$ === $std.money`). */
+declare const $: Std["money"];
+/** Builds the `{ data, error }` response envelope. The same object as {@link Std.json}. */
+declare const json: Std["json"];
+/** The diagnostic logger. The same object as {@link Std.log}. */
+declare const log: Std["log"];
+/** Proposes a tagged effect. The same object as {@link Std.emit}. */
+declare const emit: Std["emit"];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // `hasura/client` — injectable module: GraphQL client over `api` (not a global)
@@ -926,11 +989,11 @@ declare const $sys: Sys;
 declare module "hasura/client" {
   /** Options for {@link hasura}. */
   interface HasuraOptions {
-    /** Base URL; defaults to `$sys.env.HASURA_ENDPOINT`. */
+    /** Base URL; defaults to `$std.env.HASURA_ENDPOINT`. */
     endpoint?: string;
     /** End-user JWT → `Authorization: Bearer`, so Hasura enforces row-level permissions. */
     token?: string;
-    /** Admin secret; defaults to `$sys.env.HASURA_ADMIN_SECRET`. Ignored when `token` is set. */
+    /** Admin secret; defaults to `$std.env.HASURA_ADMIN_SECRET`. Ignored when `token` is set. */
     adminSecret?: string;
     /** Sent as `x-hasura-role` to select a permission role. */
     role?: string;
@@ -974,7 +1037,7 @@ declare module "hasura/client" {
     ): HasuraEnvelope<T>;
   }
 
-  /** Creates a {@link HasuraClient}. Reads `$sys.env` for defaults when options are omitted. */
+  /** Creates a {@link HasuraClient}. Reads `$std.env` for defaults when options are omitted. */
   export function hasura(opts?: HasuraOptions): HasuraClient;
   export default hasura;
 }

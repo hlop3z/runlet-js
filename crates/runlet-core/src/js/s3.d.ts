@@ -101,16 +101,16 @@ interface S3 {
    * Totals the bytes and object count under a key prefix by listing the bucket.
    * No native "folder size" exists in S3, so this walks every object under the
    * prefix; each 1000-object page counts against `max_ops`.
-   * @example const u = s3.usage({ prefix: "user-a/" }); // { prefix, bytes, objects }
+   * @example const u = $std.s3.usage({ prefix: "user-a/" }); // { prefix, bytes, objects }
    */
   usage(opts?: S3UsageOptions): S3UsageResult;
   /**
    * Deletes one object. **Destructive and opt-in** — throws unless the operator
    * set `config.s3.allow_delete = true`, even when `s3` is otherwise configured.
-   * @example const d = s3.delete({ key: "user-a/old.jpg" }); // { key, deleted: true }
+   * @example const d = $std.s3.delete({ key: "user-a/old.jpg" }); // { key, deleted: true }
    */
   delete(opts: S3DeleteOptions): S3DeleteResult;
 }
 
-/** S3 storage helper. Present only when `config.s3` is supplied. */
-declare const s3: S3;
+// The S3 helper is reached as `$std.s3` (see the {@link Std} namespace); it has no bare global.
+// Present only when `config.s3` is supplied — guard with `typeof $std.s3`.

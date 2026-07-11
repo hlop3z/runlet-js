@@ -183,5 +183,5 @@
   make.now = now;
   make.parse = parse;
   make.from = from;
-  globalThis.datetime = make;
+  $std.datetime = make;
 })();

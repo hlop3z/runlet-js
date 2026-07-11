@@ -62,5 +62,5 @@
     };
   }
 
-  globalThis.log = make(null);
+  $std.log = make(null);
 })();

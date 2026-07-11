@@ -228,5 +228,5 @@
     if (isText(input)) return input;
     return new Text(String(input === undefined || input === null ? "" : input));
   }
-  globalThis.text = make;
+  $std.text = make;
 })();

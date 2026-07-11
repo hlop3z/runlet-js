@@ -66,5 +66,5 @@
 
   // Expose the constructor + a marker so money.js can build ratio Decimals and detect them.
   make._Dec = Dec;
-  globalThis.Decimal = make;
+  $std.decimal = make;
 })();

@@ -1,13 +1,13 @@
 //! The first-class `list` and `dict` collection value-utils for the `QuickJS` sandbox.
 //!
 //! `list` (a table of records) and `dict` (one record) are the always-on collection globals beside
-//! `$`/`money`/`Decimal`/`datetime`/`text`: callable factories (`list(input)` / `dict(input)`) that
+//! `$`/`$std.decimal`/`$std.datetime`/`$std.text`: callable factories (`list(input)` / `dict(input)`) that
 //! wrap a value as an immutable collection with chainable, `snake_case`, **field-name-first** methods
 //! (no callbacks). The names are the SQL / Shopify-Liquid vocabulary the ERP / e-commerce audience
 //! already half-knows.
 //!
 //! Pure JS (`js/list.js` + `js/dict.js`) — no `__sys` bridge and no new Rust math: the only value
-//! they reach past `Array`/`Object` is the already-injected `Decimal` global, which `list`'s column
+//! they reach past `Array`/`Object` is the already-injected `$std.decimal` util, which `list`'s column
 //! aggregates (`sum`/`avg`/`min`/`max`) use so a currency column is summed EXACTLY, never as a float.
 //! Both are injected under **both** profiles: they touch no clock, no randomness, and no ambient
 //! authority, so the deterministic sanitizer (`js/determinism.js`) removes nothing from them (which
@@ -19,16 +19,16 @@ use std::error::Error;
 
 use rquickjs::{Ctx, Value as JsValue};
 
-/// `list` JS wrapper — loaded from `src/js/list.js` at compile time. Reads the `Decimal` global at
-/// call time (for aggregates) and the `dict` global (for `group_by`).
+/// `list` JS wrapper — loaded from `src/js/list.js` at compile time. Reads `$std.decimal` at
+/// call time (for aggregates) and `$std.dict` (for `group_by`).
 const LIST_WRAPPER: &str = include_str!("js/list.js");
-/// `dict` JS wrapper — loaded from `src/js/dict.js` at compile time. Reads the `list` global at call
+/// `dict` JS wrapper — loaded from `src/js/dict.js` at compile time. Reads `$std.list` at call
 /// time (for `keys`/`values`/`entries`).
 const DICT_WRAPPER: &str = include_str!("js/dict.js");
 
 /// Injects the `list` and `dict` globals.
 ///
-/// Must run after the `Decimal` global is present (list aggregates compose over it); order between
+/// Must run after `$std.decimal` is present (list aggregates compose over it); order between
 /// `list` and `dict` is free (each resolves the other at call time).
 ///
 /// # Errors
@@ -57,13 +57,37 @@ mod tests {
     /// The deterministic-profile sanitizer, evaled to prove the collections survive it untouched.
     const DETERMINISM: &str = include_str!("js/determinism.js");
 
+    /// Bootstraps `$std` (the wrappers now populate it, not `globalThis`), injects `decimal` + the
+    /// collections, then mirrors `decimal`/`list`/`dict` back to bare globals so these behavioral
+    /// expressions read naturally. In production the engine does the bootstrap + projection; here
+    /// the harness stands in for it. When `money` is `true`, `$`/`money` are injected + projected too.
+    fn inject(qctx: &rquickjs::Ctx<'_>, money: bool) {
+        qctx.eval::<(), _>("globalThis.$std = {};")
+            .expect("bootstrap std");
+        inject_decimal(qctx).expect("inject decimal");
+        if money {
+            crate::money::inject_money(qctx, None).expect("inject money");
+        }
+        inject_collections(qctx).expect("inject collections");
+        // Mirror the utils these tests reference by bare name; `Decimal` keeps its historical global
+        // spelling here even though the canonical namespace path is `$std.decimal`.
+        qctx.eval::<(), _>(
+            "globalThis.Decimal = $std.decimal; globalThis.list = $std.list; \
+             globalThis.dict = $std.dict;",
+        )
+        .expect("project collections");
+        if money {
+            qctx.eval::<(), _>("globalThis.$ = $std.money; globalThis.money = $std.money;")
+                .expect("project money");
+        }
+    }
+
     /// Inject `Decimal` + the collections and eval a JS expression that yields a string.
     fn run(expr: &str) -> String {
         let rt = Runtime::new().expect("runtime");
         let ctx = Context::full(&rt).expect("context");
         ctx.with(|qctx| {
-            inject_decimal(&qctx).expect("inject decimal");
-            inject_collections(&qctx).expect("inject collections");
+            inject(&qctx, false);
             qctx.eval::<String, _>(expr).expect("eval")
         })
     }
@@ -74,9 +98,7 @@ mod tests {
         let rt = Runtime::new().expect("runtime");
         let ctx = Context::full(&rt).expect("context");
         ctx.with(|qctx| {
-            inject_decimal(&qctx).expect("inject decimal");
-            crate::money::inject_money(&qctx, None).expect("inject money");
-            inject_collections(&qctx).expect("inject collections");
+            inject(&qctx, true);
             qctx.eval::<String, _>(expr).expect("eval")
         })
     }
@@ -361,8 +383,7 @@ mod tests {
         let rt = Runtime::new().expect("runtime");
         let ctx = Context::full(&rt).expect("context");
         let out = ctx.with(|qctx| {
-            inject_decimal(&qctx).expect("inject decimal");
-            inject_collections(&qctx).expect("inject collections");
+            inject(&qctx, false);
             qctx.eval::<(), _>(DETERMINISM).expect("eval determinism");
             qctx.eval::<String, _>(
                 r#"list([{t:"0.1"},{t:"0.2"}]).sum("t").toString() + "|" + dict({a:{b:5}}).get("a.b") + "|" + String(typeof list) + String(typeof dict)"#,

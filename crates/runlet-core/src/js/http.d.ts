@@ -7,7 +7,7 @@ interface HttpHeaders {
   [name: string]: string;
 }
 
-/** Query-string parameters for `http.get` (values are stringified). */
+/** Query-string parameters for `$std.http.get` (values are stringified). */
 interface QueryParams {
   [name: string]: string | number | boolean;
 }
@@ -47,7 +47,7 @@ interface ApiTransportError {
 interface HttpClient {
   /**
    * `GET url`, with optional query params appended.
-   * @example http.get("https://api.example.com/items", { page: 2 });
+   * @example $std.http.get("https://api.example.com/items", { page: 2 });
    */
   get<T = any>(
     url: string,
@@ -76,5 +76,5 @@ interface HttpClient {
   delete<T = any>(url: string, headers?: HttpHeaders): ApiResponse<T>;
 }
 
-/** HTTP client. Present only when `config.allowed_hosts` is non-empty. */
-declare const http: HttpClient;
+// The HTTP client is reached as `$std.http` (see the {@link Std} namespace); it has no bare global.
+// Present only when `config.allowed_hosts` is non-empty — guard with `typeof $std.http`.

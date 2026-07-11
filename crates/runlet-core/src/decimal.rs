@@ -23,7 +23,7 @@ use crate::sandbox;
 /// JS wrapper — loaded from `src/js/decimal.js` at compile time.
 const DECIMAL_WRAPPER: &str = include_str!("js/decimal.js");
 
-/// Injects the `Decimal` global (the exact-number engine). Always on — pure, no I/O, no config.
+/// Injects `$std.decimal` (the exact-number engine). Always on — pure, no I/O, no config.
 ///
 /// The currency-bound `$` / `money` global is injected separately (see `money.rs`) and composes
 /// over the same `__decimal` FFI.

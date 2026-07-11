@@ -255,12 +255,12 @@ def test_functionality(t: Runner):
 def test_money(t: Runner):
     t.section("Money & Decimal value-utils")
     # Decimal — exact non-money math, snake_case surface, distinct from $.
-    t.test("Decimal exact add",        h("return json(Decimal('0.1').add('0.2').toString(), null);"), data_eq("0.3"))
-    t.test("Decimal distinct from $",  h("return json(Decimal !== $, null);"), data_eq(True))
-    t.test("Decimal round half_even",  h("return json(Decimal('2.5').round(0, 'half_even').toString(), null);"), data_eq("2"))
-    t.test("Decimal round_to cash",    h("return json(Decimal('2.03').round_to('0.05').toString(), null);"), data_eq("2.05"))
-    t.test("Decimal clamp",            h("return json(Decimal('120').clamp(0, 100).toString(), null);"), data_eq("100"))
-    t.test("removed isZero alias gone", h("return json(typeof Decimal('0').isZero !== 'function', null);"), data_eq(True))
+    t.test("Decimal exact add",        h("return json($std.decimal('0.1').add('0.2').toString(), null);"), data_eq("0.3"))
+    t.test("Decimal distinct from $",  h("return json($std.decimal !== $, null);"), data_eq(True))
+    t.test("Decimal round half_even",  h("return json($std.decimal('2.5').round(0, 'half_even').toString(), null);"), data_eq("2"))
+    t.test("Decimal round_to cash",    h("return json($std.decimal('2.03').round_to('0.05').toString(), null);"), data_eq("2.05"))
+    t.test("Decimal clamp",            h("return json($std.decimal('120').clamp(0, 100).toString(), null);"), data_eq("100"))
+    t.test("removed isZero alias gone", h("return json(typeof $std.decimal('0').isZero !== 'function', null);"), data_eq(True))
     # Money — an invoice with tax, end to end through /execute.
     t.test("invoice with tax",
            h("var gross = $('100.00','USD').add_pct(8.25); return json({total: gross.to_string(), cents: gross.to_minor(), fmt: gross.format()}, null);"),
@@ -299,26 +299,26 @@ def test_datetime(t: Runner):
     t.section("datetime value-util")
     # Parsing + components, resolved in UTC by default.
     t.test("parse + components",
-           h("var d = datetime.parse('2026-07-10T13:30:00Z'); return json({y:d.year(), mo:d.month(), da:d.day(), wd:d.weekday(), q:d.quarter()}, null);"),
+           h("var d = $std.datetime.parse('2026-07-10T13:30:00Z'); return json({y:d.year(), mo:d.month(), da:d.day(), wd:d.weekday(), q:d.quarter()}, null);"),
            lambda r: r["data"] == {"y": 2026, "mo": 7, "da": 10, "wd": 5, "q": 3})
     # Immutability — add() returns a new value; the receiver is unchanged.
     t.test("immutable add",
-           h("var d = datetime.parse('2026-07-10T00:00:00Z'); var n = d.add({days:1}); return json({before:d.day(), after:n.day()}, null);"),
+           h("var d = $std.datetime.parse('2026-07-10T00:00:00Z'); var n = d.add({days:1}); return json({before:d.day(), after:n.day()}, null);"),
            lambda r: r["data"] == {"before": 10, "after": 11})
     # ISO serialization — a value renders as its RFC 3339 UTC (Z) string in json(...).
     t.test("serializes RFC 3339 UTC",
-           h("return json({d: datetime.parse('2026-07-10T13:30:00Z')}, null);"),
+           h("return json({d: $std.datetime.parse('2026-07-10T13:30:00Z')}, null);"),
            lambda r: r["data"]["d"] == "2026-07-10T13:30:00Z")
     # Calendar month clamping — Jan 31 + 1 month -> Feb 28 (2026 non-leap).
     t.test("month add clamps end-of-month",
-           h("var d = datetime.from({year:2026,month:1,day:31}).add({months:1}); return json({mo:d.month(), da:d.day()}, null);"),
+           h("var d = $std.datetime.from({year:2026,month:1,day:31}).add({months:1}); return json({mo:d.month(), da:d.day()}, null);"),
            lambda r: r["data"] == {"mo": 2, "da": 28})
     # Timezone view — the boundary is computed in Tokyo; the canonical instant is preserved.
     t.test("timezone boundary in zone",
-           h("var d = datetime.parse('2026-07-15T12:00:00Z'); var tk = d.in_zone('Asia/Tokyo'); return json({preserved: tk.epoch_ms()===d.epoch_ms(), hour: tk.hour(), start: tk.start_of('month').iso()}, null);"),
+           h("var d = $std.datetime.parse('2026-07-15T12:00:00Z'); var tk = d.in_zone('Asia/Tokyo'); return json({preserved: tk.epoch_ms()===d.epoch_ms(), hour: tk.hour(), start: tk.start_of('month').iso()}, null);"),
            lambda r: r["data"]["preserved"] is True and r["data"]["hour"] == 21 and r["data"]["start"] == "2026-07-01T00:00:00+09:00")
     t.test("unknown zone throws",
-           h("try { datetime.parse('2026-07-10T00:00:00Z').in_zone('Mars/Phobos'); return json(null,'no throw'); } catch(e){ return json({caught:true}, null); }"),
+           h("try { $std.datetime.parse('2026-07-10T00:00:00Z').in_zone('Mars/Phobos'); return json(null,'no throw'); } catch(e){ return json({caught:true}, null); }"),
            lambda r: r["data"] == {"caught": True})
 
 
@@ -326,31 +326,31 @@ def test_list_interop(t: Runner):
     t.section("list value-util interop (money / datetime wrappers)")
     # A money column sums to a money value (currency preserved), not a bare Decimal, and never 0.
     t.test("sum of a money column returns money",
-           h("var rows=[{price:$('0.10','USD')},{price:$('0.20','USD')}]; var s=list(rows).sum('price'); return json({fmt:s.format(), cur:s.currency()}, null);"),
+           h("var rows=[{price:$('0.10','USD')},{price:$('0.20','USD')}]; var s=$std.list(rows).sum('price'); return json({fmt:s.format(), cur:s.currency()}, null);"),
            lambda r: r["data"] == {"fmt": "$0.30", "cur": "USD"})
     # Mixing currencies in a summed column throws (no silent conversion).
     t.test("mixed-currency sum throws",
-           h("try { list([{p:$('1','USD')},{p:$('1','EUR')}]).sum('p'); return json(null,'no throw'); } catch(e){ return json({caught:true}, null); }"),
+           h("try { $std.list([{p:$('1','USD')},{p:$('1','EUR')}]).sum('p'); return json(null,'no throw'); } catch(e){ return json({caught:true}, null); }"),
            lambda r: r["data"] == {"caught": True})
     # sort_by orders money numerically, not lexically ("100.00" would sort before "19.99" as a string).
     t.test("sort_by money is numeric not lexical",
-           h("var rows=[{t:$('100.00','USD')},{t:$('19.99','USD')},{t:$('5.00','USD')}]; return json(list(rows).sort_by('t').column('t').to_array().map(function(m){return m.to_string();}), null);"),
+           h("var rows=[{t:$('100.00','USD')},{t:$('19.99','USD')},{t:$('5.00','USD')}]; return json($std.list(rows).sort_by('t').column('t').to_array().map(function(m){return m.to_string();}), null);"),
            lambda r: r["data"] == ["5.00", "19.99", "100.00"])
     # group_by keeps currency distinct — USD 19.99 and EUR 19.99 are separate groups.
     t.test("group_by keeps currency distinct",
-           h("return json(list([{p:$('19.99','USD')},{p:$('19.99','EUR')}]).group_by('p').keys().len(), null);"),
+           h("return json($std.list([{p:$('19.99','USD')},{p:$('19.99','EUR')}]).group_by('p').keys().len(), null);"),
            data_eq(2))
     # unique dedupes equal money by amount+currency; a differing currency survives.
     t.test("unique dedupes equal money",
-           h("return json(list([$('1','USD'),$('1','USD'),$('1','EUR')]).unique().len(), null);"),
+           h("return json($std.list([$('1','USD'),$('1','USD'),$('1','EUR')]).unique().len(), null);"),
            data_eq(2))
     # min/max over a money column return money values (currency kept).
     t.test("min/max over money return money",
-           h("var rows=[{t:$('5','USD')},{t:$('2','USD')}]; var mn=list(rows).min('t'); var mx=list(rows).max('t'); return json({mn:mn.to_string()+' '+mn.currency(), mx:mx.to_string()+' '+mx.currency()}, null);"),
+           h("var rows=[{t:$('5','USD')},{t:$('2','USD')}]; var mn=$std.list(rows).min('t'); var mx=$std.list(rows).max('t'); return json({mn:mn.to_string()+' '+mn.currency(), mx:mx.to_string()+' '+mx.currency()}, null);"),
            lambda r: r["data"] == {"mn": "2 USD", "mx": "5 USD"})
     # datetime columns sort chronologically, not by string.
     t.test("sort_by datetime is chronological",
-           h("var rows=[{d:datetime.parse('2026-03-01T00:00:00Z')},{d:datetime.parse('2026-01-15T00:00:00Z')},{d:datetime.parse('2026-02-20T00:00:00Z')}]; return json(list(rows).sort_by('d').column('d').to_array().map(function(x){return x.month();}), null);"),
+           h("var rows=[{d:$std.datetime.parse('2026-03-01T00:00:00Z')},{d:$std.datetime.parse('2026-01-15T00:00:00Z')},{d:$std.datetime.parse('2026-02-20T00:00:00Z')}]; return json($std.list(rows).sort_by('d').column('d').to_array().map(function(x){return x.month();}), null);"),
            lambda r: r["data"] == [1, 2, 3])
 
 
@@ -471,10 +471,10 @@ def test_http_api(t: Runner):
     url = HTTPBIN_URL
 
     t.test("disabled when no config",
-           h("return json(typeof http, null);"),
+           h("return json(typeof $std.http, null);"),
            data_eq("undefined"))
     t.test("available with wildcard",
-           h("return json(typeof http, null);", config=wildcard),
+           h("return json(typeof $std.http, null);", config=wildcard),
            data_eq("object"))
     # A `*` wildcard host is intentionally INERT in SSRF-relaxed debug mode. The box runs with
     # debug:true so these api tests can reach the private-IP httpbin; under that relaxation `*`
@@ -482,46 +482,46 @@ def test_http_api(t: Runner):
     # (host.rs: `allow_wildcard_hosts && !allow_private`). The request is blocked in-band â†’ the
     # private host is unreachable via `*` (status 0), even though a specific-host config reaches it.
     t.test("wildcard host inert under debug (private-IP relax) -> blocked",
-           h(f"var r = http.get('{url}/get', {{foo:'bar'}}); return json({{status:r.status}}, null);", config=wildcard),
+           h(f"var r = $std.http.get('{url}/get', {{foo:'bar'}}); return json({{status:r.status}}, null);", config=wildcard),
            lambda r: r["data"]["status"] == 0)
     t.test("get with specific host",
-           h(f"var r = http.get('{url}/get'); return json(r.status, null);", config=httpbin),
+           h(f"var r = $std.http.get('{url}/get'); return json(r.status, null);", config=httpbin),
            data_eq(200))
     t.test("get blocked by host",
-           h(f"var r = http.get('{url}/get'); return json(r, null);", config=blocked),
+           h(f"var r = $std.http.get('{url}/get'); return json(r, null);", config=blocked),
            lambda r: r["data"]["status"] == 0)
     t.test("post with body",
-           h(f'var r = http.post("{url}/post", {{hello:"world"}}); return json(r.status, null);', config=httpbin),
+           h(f'var r = $std.http.post("{url}/post", {{hello:"world"}}); return json(r.status, null);', config=httpbin),
            data_eq(200))
     t.test("delete works",
-           h(f"var r = http.delete('{url}/delete'); return json(r.status, null);", config=httpbin),
+           h(f"var r = $std.http.delete('{url}/delete'); return json(r.status, null);", config=httpbin),
            data_eq(200))
 
     # Headers (go-httpbin echoes header values as arrays of strings)
     t.test("get with auth header",
-           h(f"var r = http.get('{url}/get', null, {{'Authorization': 'Bearer test123'}}); return json(r.data.headers.Authorization[0], null);", config=httpbin),
+           h(f"var r = $std.http.get('{url}/get', null, {{'Authorization': 'Bearer test123'}}); return json(r.data.headers.Authorization[0], null);", config=httpbin),
            data_eq("Bearer test123"))
     t.test("post with custom header",
-           h(f'var r = http.post("{url}/post", {{a:1}}, {{"X-Custom": "foo"}}); return json(r.data.headers["X-Custom"][0], null);', config=httpbin),
+           h(f'var r = $std.http.post("{url}/post", {{a:1}}, {{"X-Custom": "foo"}}); return json(r.data.headers["X-Custom"][0], null);', config=httpbin),
            data_eq("foo"))
     t.test("content-type cannot be overridden",
-           h(f'var r = http.post("{url}/post", {{a:1}}, {{"Content-Type": "text/plain"}}); return json(r.data.headers["Content-Type"][0], null);', config=httpbin),
+           h(f'var r = $std.http.post("{url}/post", {{a:1}}, {{"Content-Type": "text/plain"}}); return json(r.data.headers["Content-Type"][0], null);', config=httpbin),
            data_eq("application/json"))
     t.test("delete with header",
-           h(f"var r = http.delete('{url}/delete', {{'X-Req-Id': '42'}}); return json(r.data.headers['X-Req-Id'][0], null);", config=httpbin),
+           h(f"var r = $std.http.delete('{url}/delete', {{'X-Req-Id': '42'}}); return json(r.data.headers['X-Req-Id'][0], null);", config=httpbin),
            data_eq("42"))
 
     # SSRF scheme allowlist: a non-http(s) URL is refused up front with HTTP_SSRF_BLOCKED,
     # before any host/IP check and independent of the client's supported-scheme set.
     t.test("non-http scheme blocked up front",
-           h(f"var r = http.get('file:///etc/passwd'); return json({{status:r.status, code:r.error && r.error.code}}, null);", config=httpbin),
+           h(f"var r = $std.http.get('file:///etc/passwd'); return json({{status:r.status, code:r.error && r.error.code}}, null);", config=httpbin),
            lambda r: r["data"]["status"] == 0 and r["data"]["code"] == "HTTP_SSRF_BLOCKED")
     # The scheme allowlist is re-checked on every redirect hop: a redirect to a non-http(s)
     # target (host allowed, scheme not) is not followed, so the 302 is returned unfollowed
     # rather than the client dereferencing the cross-protocol Location.
     redirect_target = f"gopher://{HTTPBIN_HOST}/"
     t.test("cross-protocol redirect not followed",
-           h(f"var r = http.get('{url}/redirect-to?url=' + encodeURIComponent('{redirect_target}') + '&status_code=302'); return json(r.status, null);", config=httpbin),
+           h(f"var r = $std.http.get('{url}/redirect-to?url=' + encodeURIComponent('{redirect_target}') + '&status_code=302'); return json(r.status, null);", config=httpbin),
            data_eq(302))
 
 
@@ -1124,7 +1124,7 @@ def test_hasura(t: Runner):
                "}"),
            data_eq({"envCode": "HTTP_CONNECT", "threw": "HTTP_CONNECT"}))
 
-    # No endpoint anywhere (no opts, no $sys.env) â†’ a clear, actionable throw.
+    # No endpoint anywhere (no opts, no $std.env) â†’ a clear, actionable throw.
     t.test("missing endpoint throws a helpful error",
            h_raw(
                "import { hasura } from 'hasura/client';\n"
@@ -1311,7 +1311,7 @@ def test_box_direct_local(t: Runner):
             return
         try:
             # The script addresses the logical name only; it never sees the endpoint.
-            script = h("var r = io.call('echo', 'ping', {x: 1}); "
+            script = h("var r = $std.io.call('echo', 'ping', {x: 1}); "
                        "return json({action: r.action, payload: r.payload}, null);",
                        config={"io": ["echo"]})
             st, r = _post_status(url, script)
@@ -1322,7 +1322,7 @@ def test_box_direct_local(t: Runner):
                     r is not None and isinstance(r.get("meta", {}).get("io", {}).get("echo"), list))
 
             # An unlisted name is rejected by the allowlist gate before any egress.
-            _st2, r2 = _post_status(url, h("io.call('nope', 'ping', {}); return json('x', null);",
+            _st2, r2 = _post_status(url, h("$std.io.call('nope', 'ping', {}); return json('x', null);",
                                            config={"io": ["echo"]}))
             t.check("unlisted io name is rejected (RESOURCE_NOT_FOUND)",
                     r2 is not None and r2.get("data") is None and r2.get("error") is not None)

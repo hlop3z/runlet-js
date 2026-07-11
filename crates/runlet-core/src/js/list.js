@@ -7,9 +7,9 @@
   //
   // Pure — no clock, no randomness, no ambient state — so it is injected identically under every
   // profile and there is nothing for the determinism sanitizer to remove (which is also why it
-  // exposes no random-order verb like shuffle/sample). Column aggregates compose over the injected
-  // `Decimal` global so a currency column is summed EXACTLY, never as a float. `group_by` returns a
-  // `dict`; both globals are resolved at call time so injection order is flexible.
+  // exposes no random-order verb like shuffle/sample). Column aggregates compose over the sibling
+  // `$std.decimal` util so a currency column is summed EXACTLY, never as a float. `group_by` returns
+  // a `dict`; both siblings are read off `$std` at call time so injection order is flexible.
 
   // Caller-controlled length is capped before allocation so a single call cannot OOM the isolate —
   // the same fail-closed spirit as the engine's `max_*_bytes` limits and `text.js`'s MAX_OUTPUT.
@@ -38,10 +38,10 @@
 
   // ---- Decimal-backed numeric coercion for aggregates -------------------
   // Returns a Decimal for a numeric value, or null to SKIP (absent/non-numeric), so blanks never
-  // corrupt a sum. Reads the `Decimal` global at call time.
+  // corrupt a sum. Reads the `$std.decimal` util at call time.
   function num_of(v) {
     if (v === null || v === undefined) return null;
-    var Decimal = globalThis.Decimal;
+    var Decimal = $std.decimal;
     if (Decimal && Decimal._Dec && v instanceof Decimal._Dec) return v;
     if (typeof v === "number") return isFinite(v) ? Decimal(v) : null;
     if (typeof v === "string") {
@@ -60,7 +60,7 @@
 
   // A money value (branded via money._Money, mirroring Decimal._Dec), or null.
   function money_of(v) {
-    var M = globalThis.money;
+    var M = $std.money;
     var Ctor = M && M._Money;
     return Ctor && v instanceof Ctor ? v : null;
   }
@@ -74,7 +74,7 @@
   // Compare two ordering keys; Decimal keys compare exactly, everything else natively.
   function cmp_order(a, b) {
     var oa = order_of(a), ob = order_of(b);
-    var Decimal = globalThis.Decimal;
+    var Decimal = $std.decimal;
     if (Decimal && Decimal._Dec && oa instanceof Decimal._Dec && ob instanceof Decimal._Dec) {
       return oa.cmp(ob);
     }
@@ -194,7 +194,7 @@
     }
     var out = {};
     for (var j = 0; j < order.length; j++) out[order[j]] = wrap(groups[order[j]]);
-    return globalThis.dict(out);
+    return $std.dict(out);
   };
 
   // ---- exact aggregates over a named column -----------------------------
@@ -204,7 +204,7 @@
   // values are then skipped. Non-aggregatable values (blanks/non-numeric) are always skipped.
   Lst.prototype.sum = function (field) {
     var money_total = null;
-    var dec_total = globalThis.Decimal(0);
+    var dec_total = $std.decimal(0);
     for (var i = 0; i < this.arr.length; i++) {
       var v = field_of(this.arr[i], field);
       var m = money_of(v);
@@ -217,7 +217,7 @@
   };
   Lst.prototype.avg = function (field) {
     var money_total = null, money_n = 0;
-    var dec_total = globalThis.Decimal(0), dec_n = 0;
+    var dec_total = $std.decimal(0), dec_n = 0;
     for (var i = 0; i < this.arr.length; i++) {
       var v = field_of(this.arr[i], field);
       var m = money_of(v);
@@ -260,5 +260,5 @@
     if (input === null || input === undefined) return new Lst([]);
     return new Lst([input]);
   }
-  globalThis.list = make;
+  $std.list = make;
 })();
