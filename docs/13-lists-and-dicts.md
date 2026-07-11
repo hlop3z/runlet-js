@@ -24,7 +24,7 @@ var orders = [
 ];
 
 // Only paid orders, newest field order, just the totals:
-list(orders).where({ status: "paid" }).column("total").to_array();
+$std.list(orders).where({ status: "paid" }).column("total").to_array();
 // ["19.99", "12.50"]
 ```
 
@@ -33,7 +33,7 @@ list(orders).where({ status: "paid" }).column("total").to_array();
 Give it an example and it keeps the rows that match **all** of it — no `if`, no arrow function:
 
 ```js
-list(orders).where({ status: "paid", region: "US" }).count(); // 1
+$std.list(orders).where({ status: "paid", region: "US" }).count(); // 1
 ```
 
 ### Sort rows: `sort_by`
@@ -41,8 +41,8 @@ list(orders).where({ status: "paid", region: "US" }).count(); // 1
 Name the field. Add `"desc"` to flip it:
 
 ```js
-list(orders).sort_by("total").column("id").to_array();          // cheapest first
-list(orders).sort_by("total", "desc").first();                  // the biggest order
+$std.list(orders).sort_by("total").column("id").to_array();          // cheapest first
+$std.list(orders).sort_by("total", "desc").first();                  // the biggest order
 ```
 
 Money, decimals, and dates sort **by their real value**, not alphabetically — so `$100.00` sorts
@@ -52,7 +52,7 @@ time order.
 ### Grab one column: `column`
 
 ```js
-list(orders).column("region").unique().to_array(); // ["US", "EU"]
+$std.list(orders).column("region").unique().to_array(); // ["US", "EU"]
 ```
 
 `unique()` removes duplicate scalars; `unique_by("field")` keeps the first row per field value. Both
@@ -64,7 +64,7 @@ compare by real value, so two equal `money` or `datetime` values count as the sa
 This hands you back a **`dict`** (see below) — one key per group, each holding a little `list`:
 
 ```js
-var byRegion = list(orders).group_by("region");
+var byRegion = $std.list(orders).group_by("region");
 byRegion.get("US").count(); // 2
 byRegion.get("EU").sum("total").toString(); // "12.5"
 ```
@@ -75,7 +75,7 @@ These are the important ones for money — and they're **exact**. Adding `0.1 + 
 JavaScript famously gives `0.30000000000000004`. Here you get an exact answer, so cents never drift:
 
 ```js
-list(orders).where({ status: "paid" }).sum("total").toString(); // "32.49"  (exact!)
+$std.list(orders).where({ status: "paid" }).sum("total").toString(); // "32.49"  (exact!)
 ```
 
 The result type follows the column:
@@ -88,10 +88,10 @@ The result type follows the column:
 
 ```js
 var cart = [{ price: $("0.10", "USD") }, { price: $("0.20", "USD") }];
-list(cart).sum("price").format(); // "$0.30"  — a money value, not a bare number
+$std.list(cart).sum("price").format(); // "$0.30"  — a money value, not a bare number
 ```
 
-- `sum` → a `Decimal` or `money` (empty column → `Decimal(0)`)
+- `sum` → a `Decimal` or `money` (empty column → `$std.decimal(0)`)
 - `avg` / `min` / `max` → a `Decimal` or `money`, or `null` if there's nothing to measure
 - `count()` → a plain number (it's a tally, not money)
 
@@ -104,11 +104,11 @@ Because the robot keeps lists safe, you read an item with `.get(i)` (or `.at(-1)
 one) — **not** square brackets `[i]`:
 
 ```js
-list(["a", "b", "c"]).get(0);  // "a"
-list(["a", "b", "c"]).at(-1);  // "c"
-list(orders).first();          // the first order (or null if empty)
-list(orders).last();           // the last order  (or null if empty)
-list(orders).len();            // 3
+$std.list(["a", "b", "c"]).get(0);  // "a"
+$std.list(["a", "b", "c"]).at(-1);  // "c"
+$std.list(orders).first();          // the first order (or null if empty)
+$std.list(orders).last();           // the last order  (or null if empty)
+$std.list(orders).len();            // 3
 ```
 
 You can also loop with `for..of` or spread with `[...]` — those work like normal.
@@ -131,23 +131,23 @@ The everyday hero. Reach deep with a dotted path, and give a fallback so a missi
 crashes your script:
 
 ```js
-dict(customer).get("address.city");          // "London"
-dict(customer).get("address.country", "—");  // "—"  (missing → your fallback)
-dict(customer).get("billing.card.last4");    // undefined (no crash)
+$std.dict(customer).get("address.city");          // "London"
+$std.dict(customer).get("address.country", "—");  // "—"  (missing → your fallback)
+$std.dict(customer).get("billing.card.last4");    // undefined (no crash)
 ```
 
 ### Keep or drop fields: `pick` / `omit`
 
 ```js
-dict(customer).pick("name", "vip").to_object();  // { name: "Ada", vip: true }
-dict(customer).omit("address").to_object();      // { name: "Ada", vip: true }
+$std.dict(customer).pick("name", "vip").to_object();  // { name: "Ada", vip: true }
+$std.dict(customer).omit("address").to_object();      // { name: "Ada", vip: true }
 ```
 
 ### Check and combine: `has` / `merge`
 
 ```js
-dict(customer).has("vip");                       // true
-dict(customer).merge({ vip: false, tier: "gold" }).to_object();
+$std.dict(customer).has("vip");                       // true
+$std.dict(customer).merge({ vip: false, tier: "gold" }).to_object();
 // { name:"Ada", address:{…}, vip:false, tier:"gold" }   (last value wins)
 ```
 
@@ -156,9 +156,9 @@ dict(customer).merge({ vip: false, tier: "gold" }).to_object();
 These bridge back to `list`, so you can keep chaining:
 
 ```js
-dict({ a: 1, b: 2 }).keys().to_array();    // ["a", "b"]
-dict({ a: 1, b: 2 }).values().to_array();  // [1, 2]
-dict({ a: 1, b: 2 }).entries().to_array(); // [["a",1], ["b",2]]
+$std.dict({ a: 1, b: 2 }).keys().to_array();    // ["a", "b"]
+$std.dict({ a: 1, b: 2 }).values().to_array();  // [1, 2]
+$std.dict({ a: 1, b: 2 }).entries().to_array(); // [["a",1], ["b",2]]
 ```
 
 ## They never change 🔒
@@ -167,15 +167,15 @@ Like every other value-util, `list` and `dict` are **immutable**: every method h
 value and leaves the original alone. Chain freely without worrying about clobbering your data.
 
 ```js
-var l = list([3, 1, 2]);
+var l = $std.list([3, 1, 2]);
 l.sort_by().to_array(); // [1, 2, 3]
 l.to_array();           // [3, 1, 2]  (unchanged!)
 ```
 
 ## Get the plain data back
 
-- `list(...).to_array()` → a normal array
-- `dict(...).to_object()` → a normal object
+- `$std.list(...).to_array()` → a normal array
+- `$std.dict(...).to_object()` → a normal object
 - Returning or `emit`-ing one just works — it serializes as plain JSON automatically.
 
 ## Good to know

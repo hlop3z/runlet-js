@@ -7,7 +7,7 @@ more, built for **money**.
 
 jsbox gives you two always-on helpers:
 
-- **`$`** (you can also write `money`) — a **money** value that knows its currency. It rounds
+- **`$`** (you can also write `$std.money`) — a **money** value that knows its currency. It rounds
   to the right number of cents by itself, refuses to mix currencies, and splits without losing
   a penny. Perfect for prices, tax, and refunds. 🎉
 - **`Decimal`** — an **exact number** for everything that _isn't_ money: quantities, weights,
@@ -131,10 +131,10 @@ Methods: `.eq .lt .lte .gt .gte`, `.cmp` (gives `-1`/`0`/`1`), and `.is_zero .is
 For quantities, weights, rates, and percentages, use `Decimal`. Same method style, no currency:
 
 ```js
-Decimal("0.1").add("0.2").to_string(); // "0.3"  (no float mistakes)
-Decimal("120").clamp(0, 100).to_string(); // "100"
-Decimal("2.03").round_to("0.05").to_string(); // "2.05"  (round to the nearest 5¢)
-Decimal("200").pct(15).to_string(); // "30"   (15% of 200)
+$std.decimal("0.1").add("0.2").to_string(); // "0.3"  (no float mistakes)
+$std.decimal("120").clamp(0, 100).to_string(); // "100"
+$std.decimal("2.03").round_to("0.05").to_string(); // "2.05"  (round to the nearest 5¢)
+$std.decimal("200").pct(15).to_string(); // "30"   (15% of 200)
 ```
 
 `Decimal` does the same arithmetic as money — `.add .sub .mul .div`, plus `.neg()` (flip the sign)
@@ -167,7 +167,7 @@ function handler(ctx) {
 
 ## Good to know
 
-- **Always on** — no `config` needed to use them. `$` and `money` are the same thing; `Decimal`
+- **Always on** — no `config` needed to use them. `$` and `$std.money` are the same thing; `Decimal`
   is separate (numbers, not money).
 - Money math stays **exact** until you `.round()` — so round when you're ready to show or store.
 - Holds about **28–29 digits** — plenty for money and counting. (Not for giant science numbers.)
@@ -176,7 +176,7 @@ function handler(ctx) {
 
 ## Cheat sheet 📝
 
-- `$("19.99", "USD")` makes money; `Decimal("2.5")` makes a plain exact number.
+- `$("19.99", "USD")` makes money; `$std.decimal("2.5")` makes a plain exact number.
 - Use **methods** (`.add .sub .mul .div .add_pct .allocate_to`), **not** `+ - * /`.
 - `.round("half_even")` for a ledger; `.to_minor()` for a payment API; `.format()` to show it.
 - In `json(...)`, money becomes `{ amount, currency, minor_units }` for free.
@@ -191,7 +191,7 @@ function handler(ctx) {
 
 | Old (decimal `$`)          | New                                             |
 | -------------------------- | ----------------------------------------------- |
-| `$("19.99")` (not money)   | `Decimal("19.99")`                              |
+| `$("19.99")` (not money)   | `$std.decimal("19.99")`                         |
 | `$("19.99").toCents()`     | `$("19.99", "USD").to_minor()`                  |
 | `$("1000").toCents(0)`     | `$("1000", "JPY").to_minor()` (currency sets 0) |
 | `$(1999).fromCents()`      | build money from minor units at construction    |

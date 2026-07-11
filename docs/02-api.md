@@ -27,11 +27,11 @@ If your script tries a website that isn't on the list, the robot says no. 🚫
 
 | Call                            | When you use it          |
 | ------------------------------- | ------------------------ |
-| `http.get(url, params, headers)` | Ask for something / read |
-| `http.post(url, body, headers)`  | Create something new     |
-| `http.put(url, body, headers)`   | Replace something        |
-| `http.patch(url, body, headers)` | Change part of something |
-| `http.delete(url, headers)`      | Remove something         |
+| `$std.http.get(url, params, headers)` | Ask for something / read |
+| `$std.http.post(url, body, headers)`  | Create something new     |
+| `$std.http.put(url, body, headers)`   | Replace something        |
+| `$std.http.patch(url, body, headers)` | Change part of something |
+| `$std.http.delete(url, headers)`      | Remove something         |
 
 `params`, `body`, and `headers` are all optional.
 
@@ -39,7 +39,7 @@ If your script tries a website that isn't on the list, the robot says no. 🚫
 
 ```js
 function handler(ctx) {
-  var res = http.get("https://api.example.com/users", { page: 1 });
+  var res = $std.http.get("https://api.example.com/users", { page: 1 });
   // res looks like: { status: 200, data: [ ...users... ] }
   return json(res.data, null);
 }
@@ -56,7 +56,7 @@ The `{ page: 1 }` becomes `?page=1` on the end of the web address.
 
 ```js
 function handler(ctx) {
-  var created = http.post("https://api.example.com/users", { name: ctx.name });
+  var created = $std.http.post("https://api.example.com/users", { name: ctx.name });
   return json(created.data, null);
 }
 ```
@@ -69,7 +69,7 @@ Some websites need a password called a "token". You add it as **headers** (the l
 
 ```js
 function handler(ctx) {
-  var me = http.get("https://api.example.com/me", null, {
+  var me = $std.http.get("https://api.example.com/me", null, {
     Authorization: "Bearer " + ctx.token,
   });
   return json(me.data, null);
@@ -100,4 +100,4 @@ capability a developer marks *script-controlled* gets it automatically, for free
 Every call you make is listed in `meta.io.http` in the answer, so you can see
 what happened (which website, how long it took, the status). Handy for checking your work!
 
-**Next:** [Build your own capability (`io.call`) →](03-capabilities.md)
+**Next:** [Build your own capability (`$std.io.call`) →](03-capabilities.md)

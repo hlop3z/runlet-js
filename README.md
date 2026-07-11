@@ -56,7 +56,7 @@ POST /execute
 
 The box ships **three in-engine built-ins** — `http` (script-controlled URL, SSRF-guarded), `s3`
 (pure signing), and `io` (operator-named logical egress). Any other capability (a database, cache,
-queue, mail relay, …) is reached through the one primitive `io.call(name, action, payload)` and is
+queue, mail relay, …) is reached through the one primitive `$std.io.call(name, action, payload)` and is
 **user-composed** — see the guide [Build your own capability](docs/03-capabilities.md). `config.io`
 is a **flat allowlist of logical names** (`["orders","cache"]`); the box is kind-blind and forwards
 only the names. Each name resolves either **box-direct** to an operator-declared co-located loopback
@@ -69,10 +69,10 @@ holds the credentials — the runlet server holds no remote endpoint or password
 | `script`               | one of   | JS source defining a `handler(ctx)` function                             |
 | `key`                  | one of   | Registered-script key (see [Registered scripts](#registered-scripts))    |
 | `context`              | no       | JSON object passed as `ctx` to the handler                               |
-| `config.allowed_hosts` | no       | Hosts the script can reach via `http.*` (`["*"]` = any, `[]` = disabled). A `host:port` entry (e.g. `localhost:8000`) lifts the private-IP block for that exact target only — the production-safe way to reach a co-located service |
+| `config.allowed_hosts` | no       | Hosts the script can reach via `$std.http.*` (`["*"]` = any, `[]` = disabled). A `host:port` entry (e.g. `localhost:8000`) lifts the private-IP block for that exact target only — the production-safe way to reach a co-located service |
 | `config.io`            | no       | Flat allowlist of logical resource names, e.g. `["orders","cache"]` — resolved operator-side (box-direct or broker), no creds. A name not listed is rejected `RESOURCE_NOT_FOUND` |
-| `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (in-engine; omit to disable `s3.*`) |
-| `config.sys`           | no       | `$sys.env` / `$sys.secrets` context                                      |
+| `config.s3`            | no       | S3/R2/MinIO connection for presigned URLs (in-engine; omit to disable `$std.s3.*`) |
+| `config.sys`           | no       | `$std.env` / `$std.secrets` context                                      |
 
 ### Response
 
@@ -95,7 +95,7 @@ holds the credentials — the runlet server holds no remote endpoint or password
 
 Always `{data, error, meta}`. The handler controls `data` and `error` via the `json()`
 bridge. `meta.io` carries one entry per capability the request actually used — `http`, `s3`,
-or a logical `io.call` nickname — each an array of that capability's per-operation metrics;
+or a logical `$std.io.call` nickname — each an array of that capability's per-operation metrics;
 capabilities that made no calls are omitted (so `io` is `{}` for a pure-compute run). On a **system-generated** failure, `error` is a structured envelope —
 `{ type, source, code, message, retryable, owner, details?, debug? }` — that a client can
 branch on without parsing strings; `meta.trace_id` correlates it with server logs. See
@@ -230,13 +230,13 @@ instead of waiting on the connect timeout; `0` = off, cool-down default 5000 ms)
 The runlet server config carries only the sidecar **transport**: `fabricd_socket` (local
 Unix socket, the default deployment) or `fabricd_quic` (remote `fabricd` over QUIC) — see
 [Configuration](#configuration). A request then lists, as a **flat allowlist of logical
-names**, the resources it may use, and reaches them with `io.call(name, action, payload)`:
+names**, the resources it may use, and reaches them with `$std.io.call(name, action, payload)`:
 
 ```json
 { "config": { "io": ["orders", "cache"] } }
 ```
 
-The name gates egress: `io.call("orders", …)` is allowed only if `"orders"` is in the
+The name gates egress: `$std.io.call("orders", …)` is allowed only if `"orders"` is in the
 allowlist, else the call is rejected `RESOURCE_NOT_FOUND` before any I/O. A listed name
 resolves either **box-direct** — when the operator bound it to a co-located loopback endpoint
 in the box's global `local_resources` map — or through the **broker** (`fabricd`), which
@@ -404,7 +404,7 @@ Both always available (no config), backed by the same `rust_decimal` engine that
 `NUMERIC` columns, so in-script math matches the database exactly. JavaScript has no
 operator overloading, so use **methods**, not `+ - * /`. Method names are snake_case.
 
-**`$` / `money`** is a currency-bound value: precision follows the currency's ISO 4217 minor
+**`$` / `$std.money`** is a currency-bound value: precision follows the currency's ISO 4217 minor
 unit, arithmetic never mixes currencies (no implicit FX), and splitting is penny-safe. The
 currency resolves through a cascade — explicit arg → per-request `config.currency` → operator
 `default_currency`:
@@ -424,26 +424,26 @@ function handler(ctx) {
 
 **`Decimal`** is for non-money numbers (quantities, rates, ratios): `add sub mul div neg abs`,
 `round(places, mode)`, `round_to(step, mode)`, `pct(p)`, `clamp(lo, hi)`, `min max`, the same
-compares, `to_string()` / `to_number()`. `Decimal("0.1").add("0.2")` is exactly `0.3`.
+compares, `to_string()` / `to_number()`. `$std.decimal("0.1").add("0.2")` is exactly `0.3`.
 
 Holds ~28–29 significant digits. Divide-by-zero, currency mismatch, unknown currency, and
 overflow throw. **`$` is no longer a bare decimal** — that's `Decimal` now; `.toCents()` →
 money `.to_minor()`. The old camelCase names (`isZero`/`isNegative`/`toNumber`) have been
 **removed** — use `is_zero`/`is_negative`/`to_number`. See [`docs/05-decimal.md`](docs/05-decimal.md).
 
-### http.get / post / put / patch / delete
+### $std.http.get / post / put / patch / delete
 
 HTTP client (requires `config.allowed_hosts`):
 
 ```js
 function handler(ctx) {
-  var users = http.get("https://api.example.com/users", { page: 1 });
+  var users = $std.http.get("https://api.example.com/users", { page: 1 });
   // users = { status: 200, data: [...] }
 
-  var created = http.post("https://api.example.com/users", { name: ctx.name });
+  var created = $std.http.post("https://api.example.com/users", { name: ctx.name });
 
   // Optional headers (last arg) — cannot override Content-Type
-  var auth = http.get("https://api.example.com/me", null, {
+  var auth = $std.http.get("https://api.example.com/me", null, {
     Authorization: "Bearer " + ctx.token,
   });
 
@@ -461,9 +461,9 @@ add-on. The in-engine guard is the first line; a **network-layer egress control*
 netns / egress proxy) is the recommended independent second line at deploy time (see
 `docs/security-hardening.md`) — defense in depth, not a replacement.
 
-### io.call(name, action, payload) — logical egress
+### $std.io.call(name, action, payload) — logical egress
 
-`io.call` is the **one primitive** for reaching a database, cache, queue, mail relay, or any
+`$std.io.call` is the **one primitive** for reaching a database, cache, queue, mail relay, or any
 service. `name` is a logical resource nickname the request lists in its `config.io` allowlist;
 `action` and `payload` are opaque to the box and forwarded verbatim. It returns the parsed JSON
 the resource answers, or **throws** a `__runlet`-tagged error (`RESOURCE_NOT_FOUND` for a
@@ -472,14 +472,14 @@ nickname absent from the allowlist; a capability code otherwise — see `docs/99
 ```js
 function handler(ctx) {
   // A database served by the reference broker: the broker maps "orders" to Postgres.
-  var users = io.call("orders", "query", {
+  var users = $std.io.call("orders", "query", {
     sql: "SELECT id, name FROM users WHERE active = $1",
     params: [true],
   });
   // users = { columns: [...], rows: [...], row_count: 1, truncated: false }
 
   // A cache served box-direct from a co-located loopback service.
-  io.call("cache", "set", { key: "u:" + ctx.user_id, value: "1", ttl: 60 });
+  $std.io.call("cache", "set", { key: "u:" + ctx.user_id, value: "1", ttl: 60 });
 
   return json(users.rows, null);
 }
@@ -499,20 +499,20 @@ in the box — compose your own `CapabilityDef`, run the reference broker, or re
 box-direct. The three extension paths + the box-direct shortcut are the whole story in
 [`docs/03-capabilities.md`](docs/03-capabilities.md).
 
-### s3.upload_url / s3.download_url / s3.upload_form / s3.sign_url
+### $std.s3.upload_url / $std.s3.download_url / $std.s3.upload_form / $std.s3.sign_url
 
 Presigned-URL generator for direct browser uploads/downloads (requires `config.s3`):
 
 ```js
 function handler(ctx) {
   // Sign a URL the browser uses to PUT the file straight to the bucket.
-  var put = s3.upload_url({ key: "uploads/" + ctx.filename, expires: 300 });
+  var put = $std.s3.upload_url({ key: "uploads/" + ctx.filename, expires: 300 });
   // put = { url: "https://...&X-Amz-Signature=...", method: "PUT", expires: 300 }
 
   // Sign a short-lived download link.
-  var get = s3.download_url({ key: "uploads/" + ctx.filename });
+  var get = $std.s3.download_url({ key: "uploads/" + ctx.filename });
 
-  // s3.sign_url({ method, key, expires }) is the general form (PUT/GET/HEAD/DELETE).
+  // $std.s3.sign_url({ method, key, expires }) is the general form (PUT/GET/HEAD/DELETE).
   return json({ upload: put.url, download: get.url }, null);
 }
 ```
@@ -564,9 +564,9 @@ MinIO, Backblaze B2, DigitalOcean Spaces:
 | `expires`         | `900`      | Default link lifetime in seconds                                      |
 | `max_expires`     | `604800`   | Hard cap on link lifetime (SigV4 max, 7 days)                         |
 | `max_upload_size` | (unset)    | **`upload_form` only** — max object bytes, human-readable (`"25mb"`)  |
-| `allow_delete`    | `false`    | Enable `s3.delete` + presigning `DELETE` URLs (destructive — opt-in)  |
+| `allow_delete`    | `false`    | Enable `$std.s3.delete` + presigning `DELETE` URLs (destructive — opt-in)  |
 
-#### s3.upload_form — size-enforced browser uploads
+#### $std.s3.upload_form — size-enforced browser uploads
 
 `upload_url` does not cap the body size. `upload_form` returns a **POST policy** whose
 `content-length-range` the object store **enforces** — it rejects an upload larger than
@@ -577,7 +577,7 @@ primitive for storage quotas.
 ```js
 function handler(ctx) {
   // max size comes from config.s3.max_upload_size — NOT from ctx.
-  var up = s3.upload_form({
+  var up = $std.s3.upload_form({
     key: "customers/" + ctx.id + "/" + ctx.filename,
     expires: 300,
   });
@@ -600,11 +600,11 @@ await fetch(up.url, { method: "POST", body: form }); // 204 ok · 400 if > max_b
 `config.s3.max_upload_size` is required for `upload_form` (human-readable like
 `"25mb"`/`"50gb"`, or bytes). Without it, `upload_form` errors.
 
-#### s3.usage — total bytes/objects under a prefix
+#### $std.s3.usage — total bytes/objects under a prefix
 
 ```js
 function handler(ctx) {
-  var u = s3.usage({ prefix: "user-a/" }); // omit prefix → whole bucket
+  var u = $std.s3.usage({ prefix: "user-a/" }); // omit prefix → whole bucket
   // u = { prefix: "user-a/", bytes: 5242880, objects: 137 }
   return json(u, null);
 }
@@ -620,11 +620,11 @@ op against `max_ops`, so an oversized prefix fails with the op-limit error inste
 running unbounded; for very large prefixes maintain your own counter (via `db`) and use
 `usage` to reconcile. `bytes`/`objects` are returned as JSON numbers (exact below 2⁵³).
 
-#### s3.delete — remove an object (opt-in)
+#### $std.s3.delete — remove an object (opt-in)
 
 ```js
 function handler(ctx) {
-  var d = s3.delete({ key: "customers/" + ctx.id + "/photo.jpg" });
+  var d = $std.s3.delete({ key: "customers/" + ctx.id + "/photo.jpg" });
   // d = { key: "customers/1/photo.jpg", deleted: true }
   return json(d, null);
 }
@@ -634,24 +634,24 @@ Like `usage`, this **connects to the store** (trusted/operator-config, SSRF-guar
 It signs and sends a short-lived `DELETE /{bucket}/{key}`. S3 delete is **idempotent** — a
 missing key still returns `deleted: true` (HTTP 204). Because deletion is destructive, it
 is **gated behind `config.s3.allow_delete`** (default `false`): even with `s3` otherwise
-configured, `s3.delete(...)` — and presigning a `DELETE` URL via `s3.sign_url({ method:
+configured, `$std.s3.delete(...)` — and presigning a `DELETE` URL via `$std.s3.sign_url({ method:
 "DELETE" })` — throws unless the operator sets `allow_delete: true`. Counts as one op
 against `max_ops`.
 
-### $sys — runtime stdlib (crypto, env, secrets)
+### $std — runtime stdlib (crypto, env, secrets)
 
-The `$sys` umbrella groups pure, zero-I/O helpers. `$sys.crypto` is **always on** (no config,
-like `$`); `$sys.env` / `$sys.secrets` populate only from `config.sys`. Nothing here does
+The `$std` umbrella groups pure, zero-I/O helpers. `$std.crypto` is **always on** (no config,
+like `$`); `$std.env` / `$std.secrets` populate only from `config.sys`. Nothing here does
 network I/O or counts against `max_ops`. (Date/time moved to the always-on top-level
 [`datetime`](#datetime--immutable-utc-instants--timezone-aware-views) value-util.)
 
 ```js
 function handler(ctx) {
   // crypto: one-way hashing/signing, IDs, reversible encoders
-  $sys.crypto.sha256("hello"); // hex
-  $sys.crypto.hmac("sha256", "key", "msg", "base64"); // hex (default) | base64 | base64url
-  $sys.crypto.uuid(); // v7 (time-ordered)
-  $sys.crypto.base64.encode("hi"); // also .base64url / .hex / .url, each .encode/.decode
+  $std.crypto.sha256("hello"); // hex
+  $std.crypto.hmac("sha256", "key", "msg", "base64"); // hex (default) | base64 | base64url
+  $std.crypto.uuid(); // v7 (time-ordered)
+  $std.crypto.base64.encode("hi"); // also .base64url / .hex / .url, each .encode/.decode
 
   return json({ ok: true }, null);
 }
@@ -660,16 +660,16 @@ function handler(ctx) {
 ### datetime — immutable UTC instants + timezone-aware views
 
 `datetime` is an **always-on** value-util (no config, like `$`/`Decimal`): a callable factory
-(`datetime(input)` ≡ `datetime.parse`) plus `datetime.now()` / `datetime.parse(x)` /
-`datetime.from(parts, zone?)`. A value is an immutable **canonical UTC instant** with chainable,
+(`$std.datetime(input)` ≡ `$std.datetime.parse`) plus `$std.datetime.now()` / `$std.datetime.parse(x)` /
+`$std.datetime.from(parts, zone?)`. A value is an immutable **canonical UTC instant** with chainable,
 snake_case methods; a zoned *view* (`in_zone`) re-interprets components/boundaries/formatting in
-an IANA timezone without moving the instant. Pure, unmetered. `datetime.now()` is *removed* (not
+an IANA timezone without moving the instant. Pure, unmetered. `$std.datetime.now()` is *removed* (not
 stubbed) under the deterministic profile.
 
 ```js
 function handler(ctx) {
   // parse (ISO/RFC3339, YYYY-MM-DD, epoch ms, or a datetime → UTC); locale strings are NOT guessed
-  var d = datetime.parse(ctx.when);
+  var d = $std.datetime.parse(ctx.when);
 
   // components (year/month/day/hour/… weekday ISO 1=Mon, quarter, iso_week, days_in_month)
   d.year(); d.weekday(); d.quarter(); d.iso_week(); // { week, week_year }
@@ -691,32 +691,32 @@ function handler(ctx) {
 ### text — immutable string value-util (Pythonic names, JS semantics)
 
 `text` is an **always-on** value-util (no config, like `$`/`Decimal`/`datetime`): a callable
-factory `text(input)` returning an immutable string value with chainable, snake_case methods. The
+factory `$std.text(input)` returning an immutable string value with chainable, snake_case methods. The
 method **names** are Python-flavored renames of native JS string ops; the **semantics** are
 JavaScript's (UTF-16 code units for counting/width; Unicode-default, locale-independent casing).
 Pure and unmetered — injected identically under the deterministic profile (nothing to remove). It
-does human-readable *shaping* (distinct from `$sys.crypto`/codec, which is reversible byte
+does human-readable *shaping* (distinct from `$std.crypto`/codec, which is reversible byte
 encoding/hashing) and stops short of semantic-domain validation (a future `valid` util owns
 `is_email`/`is_phone`; only character-class predicates like `is_digit` live here).
 
 ```js
 function handler(ctx) {
   // rename passthroughs (Python names, JS behavior):
-  text("  Ac-Me  ").strip().lower().value;          // "ac-me"
-  text("SKU-0042").removeprefix("SKU-").value;       // "0042"
-  text("a.b.c").replace(".", "-").value;             // "a-b-c"  (replaces ALL, like Python)
-  text("a,b,c").split(",");                          // ["a","b","c"]  (plain strings)
-  text("0042").is_digit();                           // true  (character-class predicate)
+  $std.text("  Ac-Me  ").strip().lower().value;          // "ac-me"
+  $std.text("SKU-0042").removeprefix("SKU-").value;       // "0042"
+  $std.text("a.b.c").replace(".", "-").value;             // "a-b-c"  (replaces ALL, like Python)
+  $std.text("a,b,c").split(",");                          // ["a","b","c"]  (plain strings)
+  $std.text("0042").is_digit();                           // true  (character-class predicate)
 
   // padding — width is CAPPED (oversize throws, no unbounded alloc):
-  text("42").zfill(6).value;                         // "000042"  (sign-aware: "-42".zfill(6) → "-00042")
-  text("x").rjust(5).value; text("hi").center(6, "-").value;
+  $std.text("42").zfill(6).value;                         // "000042"  (sign-aware: "-42".zfill(6) → "-00042")
+  $std.text("x").rjust(5).value; $std.text("hi").center(6, "-").value;
 
   // ERP shaping verbs:
-  text("Café Málaga #2").slugify().value;            // "cafe-malaga-2"  (NFD-folds accents; drops non-latin)
-  text("4111111111111234").mask().value;             // "************1234"  (lossy DISPLAY, not encoding)
-  text("too   many\t spaces").collapse().value;      // "too many spaces"
-  text("a very long description").truncate(10).value; // "a very lo…"
+  $std.text("Café Málaga #2").slugify().value;            // "cafe-malaga-2"  (NFD-folds accents; drops non-latin)
+  $std.text("4111111111111234").mask().value;             // "************1234"  (lossy DISPLAY, not encoding)
+  $std.text("too   many\t spaces").collapse().value;      // "too many spaces"
+  $std.text("a very long description").truncate(10).value; // "a very lo…"
 
   return json({ ok: true }, null);                   // json()/toString → the plain string
 }
@@ -725,7 +725,7 @@ function handler(ctx) {
 ### list / dict — field-name-first collection value-utils
 
 `list` (a table of records) and `dict` (one record) are **always-on** value-utils (no config, like
-`$`/`Decimal`/`datetime`/`text`): callable factories `list(input)` / `dict(input)` returning
+`$`/`Decimal`/`datetime`/`text`): callable factories `$std.list(input)` / `$std.dict(input)` returning
 immutable, chainable collections. The surface is **field-name-first with no callbacks** — every verb
 takes a field-name string or a match-by-example object — using the SQL / Shopify-Liquid vocabulary
 (`where`/`sort_by`/`group_by`/`column`/`unique`/`sum`, `get`/`pick`/`omit`/`merge`). Pure and
@@ -743,19 +743,19 @@ function handler(ctx) {
   var orders = ctx.orders; // [{ id, status, region, total }, …]
 
   // filter → sort → select, all by field name (no arrow functions):
-  list(orders).where({ status: "paid" }).sort_by("total", "desc").column("id").to_array();
+  $std.list(orders).where({ status: "paid" }).sort_by("total", "desc").column("id").to_array();
 
   // exact-money aggregate — 0.1 + 0.2 is exactly 0.3, never 0.30000000000000004:
-  list(orders).where({ status: "paid" }).sum("total").toString(); // exact Decimal string
+  $std.list(orders).where({ status: "paid" }).sum("total").toString(); // exact Decimal string
 
   // group_by bridges to a dict of lists:
-  var byRegion = list(orders).group_by("region");
+  var byRegion = $std.list(orders).group_by("region");
   byRegion.get("US").count(); byRegion.get("EU").sum("total");
 
   // dict — safe nested read with a fallback, plus reshaping:
-  dict(ctx.customer).get("address.city", "—");
-  dict(ctx.customer).pick("name", "email").to_object();
-  dict(ctx.customer).merge({ tier: "gold" }).to_object(); // last-wins
+  $std.dict(ctx.customer).get("address.city", "—");
+  $std.dict(ctx.customer).pick("name", "email").to_object();
+  $std.dict(ctx.customer).merge({ tier: "gold" }).to_object(); // last-wins
 
   return json({ ok: true }, null); // json()/toString → plain array / object
 }
@@ -767,10 +767,10 @@ See [`docs/13-lists-and-dicts.md`](docs/13-lists-and-dicts.md).
 `config.sys = { "env": { "REGION": "us-east-1" }, "secrets": { "SIGNING_KEY": "sk_live_…" } }`:
 
 ```js
-$sys.env.REGION; // "us-east-1"  (plain, returnable)
-var sig = $sys.crypto.hmac("sha256", $sys.secrets.SIGNING_KEY, body); // ✅ handle → one-way sign
-String($sys.secrets.SIGNING_KEY); // "[secret:SIGNING_KEY]"  (never the plaintext)
-$sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws — secrets can't be encoded
+$std.env.REGION; // "us-east-1"  (plain, returnable)
+var sig = $std.crypto.hmac("sha256", $std.secrets.SIGNING_KEY, body); // ✅ handle → one-way sign
+String($std.secrets.SIGNING_KEY); // "[secret:SIGNING_KEY]"  (never the plaintext)
+$std.crypto.base64.encode($std.secrets.SIGNING_KEY); // ❌ throws — secrets can't be encoded
 ```
 
 The plaintext never enters JS — it stays Rust-side and is resolved only by the one-way HMAC
@@ -877,10 +877,10 @@ HTTP request
       -> acquire pooled QuickJS runtime
         -> fresh Context per request
           -> inject json() bridge
-          -> inject http.* (if allowed_hosts)
-          -> inject io.call (if config.io names any resource; gated by the allowlist,
+          -> inject $std.http.* (if allowed_hosts)
+          -> inject $std.io.call (if config.io names any resource; gated by the allowlist,
              resolved box-direct or via the broker Egress port)
-          -> inject s3.* (if config.s3)
+          -> inject $std.s3.* (if config.s3)
           -> eval user script
           -> remove eval/Proxy
           -> call handler(context)

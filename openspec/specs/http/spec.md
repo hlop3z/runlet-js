@@ -3,7 +3,7 @@
 ## Purpose
 
 The `http` capability gives a sandboxed handler a controlled outbound HTTP client
-(`http.get/post/put/patch/delete`) for calling other services. Because the request URL is
+(`$std.http.get/post/put/patch/delete`) for calling other services. Because the request URL is
 **script-controlled**, `http` follows the SSRF-guarded trust model: every target is checked
 against an operator-supplied `allowed_hosts` allowlist and against private/internal IP
 blocking. It is opt-in per request, never throws on HTTP/transport failures (errors come back
@@ -25,7 +25,7 @@ non-empty; otherwise the `http` global SHALL NOT exist in the handler scope.
 #### Scenario: Capability present with config
 
 - **WHEN** a request supplies a non-empty `config.allowed_hosts`
-- **THEN** the handler can call `http.get/post/put/patch/delete`
+- **THEN** the handler can call `$std.http.get/post/put/patch/delete`
 
 ### Requirement: HTTP method surface
 
@@ -35,12 +35,12 @@ The `http` global SHALL expose `get(url, params, headers)`, `post(url, body, hea
 
 #### Scenario: GET serializes params into the query string
 
-- **WHEN** a handler calls `http.get(url, { page: 1 })`
+- **WHEN** a handler calls `$std.http.get(url, { page: 1 })`
 - **THEN** the request URL has `?page=1` appended (URL-encoded), and additional params are joined with `&`
 
 #### Scenario: Body-bearing methods send a JSON body
 
-- **WHEN** a handler calls `http.post(url, body)` with a non-null body
+- **WHEN** a handler calls `$std.http.post(url, body)` with a non-null body
 - **THEN** the body is JSON-serialized and sent with `Content-Type: application/json`
 
 ### Requirement: Host allowlist enforcement

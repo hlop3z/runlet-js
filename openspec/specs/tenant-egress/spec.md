@@ -21,12 +21,12 @@ from `config.io` SHALL be rejected.
 
 #### Scenario: Script addresses a logical name only
 
-- **WHEN** a script calls `io.call("orders", "query", payload)` and `"orders"` is in `config.io`
+- **WHEN** a script calls `$std.io.call("orders", "query", payload)` and `"orders"` is in `config.io`
 - **THEN** the box forwards the name `"orders"` to the broker, which resolves its kind/endpoint/creds
 
 #### Scenario: Unlisted name is rejected
 
-- **WHEN** a script calls `io.call("secret", …)` and `"secret"` is not in `config.io`
+- **WHEN** a script calls `$std.io.call("secret", …)` and `"secret"` is not in `config.io`
 - **THEN** the call is rejected (`RESOURCE_NOT_FOUND`) before any egress
 
 #### Scenario: Handshake carries a flat name list
@@ -129,13 +129,13 @@ service can be moved between box-direct and broker resolution with no change to 
 #### Scenario: Operator-declared local name resolves box-direct
 
 - **WHEN** the global config binds `"pricing"` to a loopback endpoint and a request lists `"pricing"`
-  in `config.io` and calls `io.call("pricing", action, payload)`
+  in `config.io` and calls `$std.io.call("pricing", action, payload)`
 - **THEN** the box POSTs `{action, payload}` to the configured local endpoint directly, opening no
   broker session, and the script never sees the endpoint
 
 #### Scenario: Undeclared name falls through to the broker
 
-- **WHEN** a request calls `io.call("orders", …)` and `"orders"` is not in the global local map
+- **WHEN** a request calls `$std.io.call("orders", …)` and `"orders"` is not in the global local map
 - **THEN** the box forwards the name to the broker over uds/quic
 
 #### Scenario: Remote target is not allowed box-direct
@@ -146,14 +146,14 @@ service can be moved between box-direct and broker resolution with no change to 
 #### Scenario: Multiple local services under distinct names
 
 - **WHEN** the global config binds `"api1" → http://localhost:8080` and `"api2" → http://localhost:9000`
-- **AND** a request lists both in `config.io` and calls `io.call("api1", …)` then `io.call("api2", …)`
+- **AND** a request lists both in `config.io` and calls `$std.io.call("api1", …)` then `$std.io.call("api2", …)`
 - **THEN** each resolves box-direct to its own endpoint, both carrying the same `{action, payload}`
   envelope a broker call would use
 
 #### Scenario: Promote a local service to a broker without touching scripts
 
 - **WHEN** `"api1"` is moved from a box-direct global binding to a broker-resolved name
-- **THEN** a script calling `io.call("api1", action, payload)` is unchanged and continues to work
+- **THEN** a script calling `$std.io.call("api1", action, payload)` is unchanged and continues to work
 
 ### Requirement: Fail-closed when no egress backend can serve a logical name
 

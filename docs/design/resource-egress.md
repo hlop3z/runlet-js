@@ -12,7 +12,7 @@ Companion to [resilience.md](resilience.md) and [network-fabric.md](network-fabr
 > **Update — byo-capabilities (framework, not service).** The box now ships **exactly three
 > in-engine built-ins** — `http` (script-controlled URL, SSRF-guarded), `s3` (pure signing), and
 > `io` (operator-named logical egress). The six *shipped* driver-cap wrappers were deleted (they
-> were sugar over `io.call(name, action, payload)`); `mongo` (and its `mongocrypt` tail) is dropped
+> were sugar over `$std.io.call(name, action, payload)`); `mongo` (and its `mongocrypt` tail) is dropped
 > entirely. Driver-backed capabilities are now **user-composed** `CapabilityDef`s or serviced by the
 > (demoted-to-optional) reference broker. The wire/config flattened: `config.io` is a **plain
 > allowlist of logical names** (`["orders","cache"]`) and the session handshake carries

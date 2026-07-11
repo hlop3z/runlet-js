@@ -14,7 +14,7 @@ the **attack** it closes, and the **control**. Status is tracked here as work la
 2. **Script → host process** — QuickJS sandbox (mem/stack/timeout/op caps; `eval`/`Proxy`
    removed). Design is trending toward *untrusted, customer-authored* scripts.
 3. **Script-chosen target → outside world** — `http`/`s3` SSRF-guarded (script picks URL);
-   `io.call` targets are operator-controlled (the script names a logical nickname, never a host),
+   `$std.io.call` targets are operator-controlled (the script names a logical nickname, never a host),
    so they carry no SSRF surface — the box resolves the name box-direct (loopback-only) or via the
    broker.
 

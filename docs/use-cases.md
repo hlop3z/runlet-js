@@ -38,9 +38,9 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
                       +-> db (auth, rate limits, config)
 ```
 
-- **Auth & token validation** — Decode JWTs, validate API keys, check permissions against `io.call` — reject before hitting upstream.
-- **Request transformation** — Reshape incoming payloads, inject headers, normalize formats before proxying via `http.post`.
-- **Response aggregation** — Fan out to multiple upstreams with `http.get`, merge into one response, return to client.
+- **Auth & token validation** — Decode JWTs, validate API keys, check permissions against `$std.io.call` — reject before hitting upstream.
+- **Request transformation** — Reshape incoming payloads, inject headers, normalize formats before proxying via `$std.http.post`.
+- **Response aggregation** — Fan out to multiple upstreams with `$std.http.get`, merge into one response, return to client.
 - **Rate limiting** — Query a counter in DB, increment it, reject if over quota. Custom rules per tenant, endpoint, or plan tier.
 - **Routing logic** — Script decides which upstream to call based on path, headers, tenant config, or A/B test assignment.
 - **Request validation** — Validate body schema, required fields, content types before forwarding. Return structured errors.
@@ -76,9 +76,9 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 ## DAM — Digital Asset Management
 
 - **Upload processing** — On asset upload, script generates metadata: extracts dimensions from context, assigns tags, sets expiration dates.
-- **Access control rules** — Script evaluates who can download what: check user role, asset license type, region restrictions via `io.call`.
-- **Auto-tagging & classification** — Call an external AI tagging API via `http.post`, write results back to DB. Per-tenant tagging rules.
-- **Asset transformation requests** — Script composes a transformation order (resize, watermark, format) and dispatches to a processing service via `http.post`.
+- **Access control rules** — Script evaluates who can download what: check user role, asset license type, region restrictions via `$std.io.call`.
+- **Auto-tagging & classification** — Call an external AI tagging API via `$std.http.post`, write results back to DB. Per-tenant tagging rules.
+- **Asset transformation requests** — Script composes a transformation order (resize, watermark, format) and dispatches to a processing service via `$std.http.post`.
 - **Expiration & lifecycle** — Scheduled script queries DB for assets past retention date, flags for archival or deletion.
 
 ## CMS — Content Management
@@ -92,14 +92,14 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 ## CRM — Customer Relationship Management
 
 - **Lead scoring** — Script evaluates lead attributes (company size, engagement, source) and computes a score. Rules update without deploys.
-- **Contact enrichment** — On new contact, script calls enrichment APIs (`http.get` to Clearbit, etc.) and writes results to DB.
+- **Contact enrichment** — On new contact, script calls enrichment APIs (`$std.http.get` to Clearbit, etc.) and writes results to DB.
 - **Assignment rules** — Script routes leads to sales reps based on territory, deal size, product interest, or round-robin from DB state.
 - **Lifecycle triggers** — When a contact moves stages, script fires actions: send email via API, create task in project tool, update forecast in DB.
 - **Duplicate detection** — Script queries DB for fuzzy matches on email/phone/company, returns merge candidates with confidence scores.
 
 ## ERP — Enterprise Resource Planning
 
-- **Order validation** — Script checks inventory levels, credit limits, and shipping restrictions before order confirmation via `io.call`.
+- **Order validation** — Script checks inventory levels, credit limits, and shipping restrictions before order confirmation via `$std.io.call`.
 - **Invoice computation** — Calculate line items, taxes, currency conversion, and discounts. Each business unit gets its own tax script.
 - **Approval workflows** — Script evaluates approval rules: purchase over $10k needs VP sign-off, cross-department transfers need finance review.
 - **Inter-system sync** — Script bridges ERP and external systems: push orders to fulfillment API, pull tracking numbers back, update DB.
@@ -113,7 +113,7 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 - **Seller automation** — Marketplace sellers define inventory sync, repricing, or order routing scripts.
 - **Loyalty & rewards** — Compute points, tiers, and rewards based on program rules that change without deploys.
 - **Receipt customization** — Script generates receipt data: applies store-specific formatting, promo messages, return policy text.
-- **Inventory sync** — On sale, script decrements stock in DB and pushes update to e-commerce channel via `http.put`.
+- **Inventory sync** — On sale, script decrements stock in DB and pushes update to e-commerce channel via `$std.http.put`.
 - **Multi-location pricing** — Script resolves price by store location, currency, and local tax rules from DB lookups.
 - **Return & refund rules** — Script evaluates return eligibility: time window, item condition, customer history — returns approval or denial with reason.
 
@@ -121,7 +121,7 @@ Client -> Nginx -> jsbox /execute -> upstream APIs
 
 - **Input validation** — Server-side validation rules as JS. Share the same script between frontend preview and backend enforcement.
 - **Synthetic monitoring** — Periodically run scripts that test your APIs and alert on failures or latency spikes.
-- **Data migration scripts** — One-off backfills via `io.call` with transaction support and automatic timeout.
+- **Data migration scripts** — One-off backfills via `$std.io.call` with transaction support and automatic timeout.
 - **Custom CI/CD steps** — Teams define build, test, or deploy steps as sandboxed scripts within a pipeline.
 
 ## Security & Observability

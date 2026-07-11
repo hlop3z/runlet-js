@@ -72,7 +72,7 @@ customer's own code, and a customer script can read or patch it (`Function.proto
 So:
 
 - I/O, secrets, a real security boundary → a **capability** (`http`/`s3`, or a service reached via
-  `io.call`). Only the Rust/broker side is outside the sandbox.
+  `$std.io.call`). Only the Rust/broker side is outside the sandbox.
 - Logic the customer must not read or alter → a **registered script** (called by `key`).
 - In-script helpers the customer composes with → an **injectable module**.
 
@@ -102,7 +102,7 @@ export function eqAll(filters) {
 import { eqAll } from "sql/where";
 export default function handler(ctx) {
   const w = eqAll({ status: ctx.status, owner: ctx.owner });
-  const r = io.call("orders", "query", {
+  const r = $std.io.call("orders", "query", {
     sql: `SELECT * FROM orders WHERE ${w.text}`,
     params: w.params,
   });

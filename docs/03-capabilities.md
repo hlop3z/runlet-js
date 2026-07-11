@@ -1,11 +1,11 @@
-# Build your own capability over `io.call` 🔌
+# Build your own capability over `$std.io.call` 🔌
 
 The box ships **three built-in super-powers**: `http` (talk to the internet), `s3` (signed
 upload/download links), and `io` (talk to a named service). Everything else — a database, a cache,
 a mail relay, a queue, your own service — you reach through **one tiny primitive**:
 
 ```js
-io.call(name, action, payload)
+$std.io.call(name, action, payload)
 ```
 
 - `name` — a nickname **you** picked for a resource (e.g. `"orders"`, `"cache"`), listed in
@@ -18,7 +18,7 @@ fails — the same shape every built-in uses (see [Errors](99-errors.md)).
 
 ```js
 function handler(ctx) {
-  const rows = io.call("orders", "query", { sql: "SELECT * FROM orders WHERE id = $1", params: [ctx.id] });
+  const rows = $std.io.call("orders", "query", { sql: "SELECT * FROM orders WHERE id = $1", params: [ctx.id] });
   return json(rows, null);
 }
 ```
@@ -64,7 +64,7 @@ applies: the host must be allowlisted, and redirects are re-checked.
 
 `runlet` is a library. Build your own binary that composes a `CapabilityDef` (a JS wrapper + a
 trust declaration + an in-process `Egress` backend). Your driver and your credentials live in
-**your** process; `io.call("<your-name>", …)` is serviced in-process with no broker. See
+**your** process; `$std.io.call("<your-name>", …)` is serviced in-process with no broker. See
 [the composable-core design](design/composable-core.md).
 
 ### (c) Route `io` to a broker (the box holds nothing)
@@ -91,7 +91,7 @@ co-located loopback service in the box's **global config** — no broker, no Rus
 }
 ```
 
-Now `io.call("pricing", action, payload)` POSTs the **same `{action, payload}` envelope** a broker
+Now `$std.io.call("pricing", action, payload)` POSTs the **same `{action, payload}` envelope** a broker
 would receive, straight to `http://localhost:8080`. The script is unchanged whether `"pricing"`
 resolves box-direct or later moves to a broker — the nickname is a stable pointer.
 
@@ -110,7 +110,7 @@ from `localhost` to a broker to another host with **zero** script changes.
 
 ---
 
-Method names on any capability are `snake_case` (`io.call("orders", "find_one", …)`). Values that
+Method names on any capability are `snake_case` (`$std.io.call("orders", "find_one", …)`). Values that
 don't fit a JS number exactly (big integers, decimals) come back as **strings** — use the always-on
 [`$` / Decimal](05-decimal.md) helper for exact math.
 

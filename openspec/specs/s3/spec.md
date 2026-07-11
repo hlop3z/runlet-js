@@ -29,38 +29,38 @@ block `s3` is undefined and no operation is possible.
 ### Requirement: Presign operations are pure crypto with no network
 
 The presign operations SHALL compute a `SigV4`-signed URL or POST policy locally and return it
-without ever connecting to the object store. This covers `s3.upload_url`, `s3.download_url`,
-`s3.upload_form`, and the general `s3.sign_url`.
+without ever connecting to the object store. This covers `$std.s3.upload_url`, `$std.s3.download_url`,
+`$std.s3.upload_form`, and the general `$std.s3.sign_url`.
 
 #### Scenario: Sign an upload URL
 
-- **WHEN** the handler calls `s3.upload_url({ key })`
+- **WHEN** the handler calls `$std.s3.upload_url({ key })`
 - **THEN** it returns `{ url, method: "PUT", expires }` where `url` carries an `X-Amz-Signature`, computed with no network request
 
 #### Scenario: Sign a download URL
 
-- **WHEN** the handler calls `s3.download_url({ key })`
+- **WHEN** the handler calls `$std.s3.download_url({ key })`
 - **THEN** it returns `{ url, method: "GET", expires }` with no network request
 
 #### Scenario: General signing helper
 
-- **WHEN** the handler calls `s3.sign_url({ method, key })` with method `PUT`, `GET`, `HEAD`, or `DELETE` (default `PUT`)
+- **WHEN** the handler calls `$std.s3.sign_url({ method, key })` with method `PUT`, `GET`, `HEAD`, or `DELETE` (default `PUT`)
 - **THEN** it returns a signed URL for that method; an unsupported method is rejected
 
 ### Requirement: Presigned POST form upload with config-only size cap
 
-`s3.upload_form` SHALL return a `SigV4` browser POST policy whose `content-length-range`
+`$std.s3.upload_form` SHALL return a `SigV4` browser POST policy whose `content-length-range`
 condition is bounded by `config.s3.max_upload_size`; the size cap SHALL come only from operator
 config and never from the script payload.
 
 #### Scenario: Form policy carries the configured cap
 
-- **WHEN** the handler calls `s3.upload_form({ key })` and `config.s3.max_upload_size` is set
+- **WHEN** the handler calls `$std.s3.upload_form({ key })` and `config.s3.max_upload_size` is set
 - **THEN** it returns `{ url, fields, max_bytes, expires }` where `max_bytes` equals the configured cap and the script supplies no size
 
 #### Scenario: Missing size cap is rejected
 
-- **WHEN** the handler calls `s3.upload_form` but `config.s3.max_upload_size` is unset (`0`)
+- **WHEN** the handler calls `$std.s3.upload_form` but `config.s3.max_upload_size` is unset (`0`)
 - **THEN** the call fails with an `S3_ERROR` (the cap is required for `upload_form`)
 
 ### Requirement: Link lifetime defaulted and clamped
@@ -113,13 +113,13 @@ validated at sign time and there is nothing to pin.
 
 ### Requirement: Usage listing connects to the store and paginates
 
-`s3.usage({ prefix })` SHALL connect to the store, sign and send `ListObjectsV2` requests, page
+`$std.s3.usage({ prefix })` SHALL connect to the store, sign and send `ListObjectsV2` requests, page
 through continuation tokens summing each object's size, and return `{ prefix, bytes, objects }`;
 each list page SHALL count as one operation against `max_ops`.
 
 #### Scenario: Totals a prefix
 
-- **WHEN** the handler calls `s3.usage({ prefix: "user-a/" })`
+- **WHEN** the handler calls `$std.s3.usage({ prefix: "user-a/" })`
 - **THEN** it returns `{ prefix, bytes, objects }` totalling every object under the prefix (an omitted prefix totals the whole bucket)
 
 #### Scenario: Large listing hits the op limit
@@ -134,17 +134,17 @@ each list page SHALL count as one operation against `max_ops`.
 
 ### Requirement: Destructive delete gated behind allow_delete
 
-Object deletion — `s3.delete` and presigning a `DELETE` URL — SHALL be disabled unless the
+Object deletion — `$std.s3.delete` and presigning a `DELETE` URL — SHALL be disabled unless the
 operator sets `config.s3.allow_delete = true`, even when `s3` is otherwise configured.
 
 #### Scenario: Delete blocked by default
 
-- **WHEN** the handler calls `s3.delete({ key })` (or signs a `DELETE` URL) and `config.s3.allow_delete` is not `true`
+- **WHEN** the handler calls `$std.s3.delete({ key })` (or signs a `DELETE` URL) and `config.s3.allow_delete` is not `true`
 - **THEN** the call throws an `S3_FORBIDDEN` error and no object is removed
 
 #### Scenario: Delete allowed when opted in
 
-- **WHEN** `config.s3.allow_delete = true` and the handler calls `s3.delete({ key })`
+- **WHEN** `config.s3.allow_delete = true` and the handler calls `$std.s3.delete({ key })`
 - **THEN** it signs and sends a `DELETE` to the store and returns `{ key, deleted: true }` (idempotent — a missing key still succeeds)
 
 ### Requirement: Operations metered into meta.s3_requests

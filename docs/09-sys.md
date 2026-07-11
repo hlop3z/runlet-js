@@ -1,31 +1,31 @@
-# 9. `$sys` — the robot's built-in toolbox 🧰
+# 9. `$std` — the robot's built-in toolbox 🧰
 
 [← Back to the guide](README.md)
 
 Some helpers don't talk to the internet, a database, or anything outside the box — they're
 just handy **tools the robot always carries**: making fingerprints of text (hashes),
-signing things. Those live under one name: **`$sys`**.
+signing things. Those live under one name: **`$std`**.
 
-Think of `$sys` as the robot's tool belt:
+Think of `$std` as the robot's tool belt:
 
-- **`$sys.crypto`** — hashing, signing, IDs, and encoders. 🔐
+- **`$std.crypto`** — hashing, signing, IDs, and encoders. 🔐
 
-`$sys.crypto` is **always on** — no config, just like `$`. Two more show up only when the
+`$std.crypto` is **always on** — no config, just like `$`. Two more show up only when the
 operator fills them in:
 
-> 📅 Looking for dates and times? They moved out of `$sys` into their own always-on tool,
-> **`datetime`** — see [the `datetime` guide](10-datetime.md).
+> 📅 Looking for dates and times? They live in their own always-on tool,
+> **`$std.datetime`** — see [the `datetime` guide](10-datetime.md).
 
-- **`$sys.env`** — little settings the operator hands your script (like `REGION`). ⚙️
-- **`$sys.secrets`** — passwords/keys you can _use_ but never _see_. 🤫
+- **`$std.env`** — little settings the operator hands your script (like `REGION`). ⚙️
+- **`$std.secrets`** — passwords/keys you can _use_ but never _see_. 🤫
 
 > Why the funny `$` in front? It tells you "this is a built-in, not your own variable" —
-> the same hint `$` (decimal math) gives. Nobody accidentally writes `var $sys = ...`, so
+> the same hint `$` (decimal math) gives. Nobody accidentally writes `var $std = ...`, so
 > the name is always safe.
 
 ---
 
-## `$sys.crypto` — fingerprints, signatures, and IDs 🔐
+## `$std.crypto` — fingerprints, signatures, and IDs 🔐
 
 ### Make a fingerprint (hash)
 
@@ -34,8 +34,8 @@ scramble, but you can't turn the scramble back into the text. Great for checking
 change?" or building a cache key.
 
 ```js
-$sys.crypto.sha256("hello"); // "2cf24dba5fb0a30e..."  (always the same for "hello")
-$sys.crypto.sha512("hello"); // a longer one
+$std.crypto.sha256("hello"); // "2cf24dba5fb0a30e..."  (always the same for "hello")
+$std.crypto.sha512("hello"); // a longer one
 ```
 
 ### Sign something (HMAC)
@@ -46,8 +46,8 @@ message really came from them.
 
 ```js
 // hmac(algorithm, key, message, encoding?)
-$sys.crypto.hmac("sha256", "my-key", "the message"); // hex by default
-$sys.crypto.hmac("sha256", "my-key", "the message", "base64"); // or "base64url"
+$std.crypto.hmac("sha256", "my-key", "the message"); // hex by default
+$std.crypto.hmac("sha256", "my-key", "the message", "base64"); // or "base64url"
 ```
 
 `algorithm` is `"sha256"` or `"sha512"`. `encoding` is `"hex"` (default), `"base64"`, or
@@ -56,7 +56,7 @@ $sys.crypto.hmac("sha256", "my-key", "the message", "base64"); // or "base64url"
 ### A random ID
 
 ```js
-$sys.crypto.uuid(); // "0197c2f3-7d80-7b3a-9e4f-2a1b3c4d5e6f"  (a fresh one every time)
+$std.crypto.uuid(); // "0197c2f3-7d80-7b3a-9e4f-2a1b3c4d5e6f"  (a fresh one every time)
 ```
 
 It's a **UUIDv7** — the front of the ID is the current time, so IDs made later sort
@@ -71,12 +71,12 @@ Sometimes you need text in a different shape — to put in a URL, an auth header
 message. Each encoder has `.encode` and `.decode`:
 
 ```js
-$sys.crypto.base64.encode("hi there"); // "aGkgdGhlcmU="
-$sys.crypto.base64.decode("aGkgdGhlcmU="); // "hi there"
+$std.crypto.base64.encode("hi there"); // "aGkgdGhlcmU="
+$std.crypto.base64.decode("aGkgdGhlcmU="); // "hi there"
 
-$sys.crypto.base64url.encode("hi"); // URL-safe base64 (no = padding)
-$sys.crypto.hex.encode("AB"); // "4142"
-$sys.crypto.url.encode("a b&c"); // "a%20b%26c"  (safe to drop in a URL)
+$std.crypto.base64url.encode("hi"); // URL-safe base64 (no = padding)
+$std.crypto.hex.encode("AB"); // "4142"
+$std.crypto.url.encode("a b&c"); // "a%20b%26c"  (safe to drop in a URL)
 ```
 
 | Encoder     | For…                             |
@@ -88,7 +88,7 @@ $sys.crypto.url.encode("a b&c"); // "a%20b%26c"  (safe to drop in a URL)
 
 ---
 
-## `$sys.env` — settings from the operator ⚙️
+## `$std.env` — settings from the operator ⚙️
 
 The operator can hand your script little named settings, so the **same script** runs in
 dev, staging, and production without editing the code. They turn it on with
@@ -99,15 +99,15 @@ dev, staging, and production without editing the code. They turn it on with
 ```
 
 ```js
-$sys.env.REGION; // "us-east-1"
-$sys.env.NOPE; // undefined  (a key that wasn't set)
+$std.env.REGION; // "us-east-1"
+$std.env.NOPE; // undefined  (a key that wasn't set)
 ```
 
 These are plain, readable values — fine to return in your answer.
 
 ---
 
-## `$sys.secrets` — use a password without ever seeing it 🤫
+## `$std.secrets` — use a password without ever seeing it 🤫
 
 This is the special one. A **secret** (like an API key) is something your script needs to
 **use** but should never be able to **leak** — not even by accident, and not even on
@@ -120,27 +120,27 @@ The operator provides secrets with `config.sys.secrets`:
 "config": { "sys": { "secrets": { "SIGNING_KEY": "sk_live_•••••" } } }
 ```
 
-In your script, `$sys.secrets.SIGNING_KEY` is **not** the password — it's a sealed
+In your script, `$std.secrets.SIGNING_KEY` is **not** the password — it's a sealed
 **handle**. You can hand the handle to the one tool that's allowed to use it — **HMAC**:
 
 ```js
 // ✅ This works: the real key is used inside the robot to sign; you get the signature.
-var signature = $sys.crypto.hmac("sha256", $sys.secrets.SIGNING_KEY, body);
+var signature = $std.crypto.hmac("sha256", $std.secrets.SIGNING_KEY, body);
 ```
 
 But there is **no way to read the password itself**. Every attempt gives you a harmless
 placeholder, never the real value:
 
 ```js
-String($sys.secrets.SIGNING_KEY); // "[secret:SIGNING_KEY]"
-`${$sys.secrets.SIGNING_KEY}`; // "[secret:SIGNING_KEY]"
-return json({ k: $sys.secrets.SIGNING_KEY }, null); // -> { "k": "[secret:SIGNING_KEY]" }
+String($std.secrets.SIGNING_KEY); // "[secret:SIGNING_KEY]"
+`${$std.secrets.SIGNING_KEY}`; // "[secret:SIGNING_KEY]"
+return json({ k: $std.secrets.SIGNING_KEY }, null); // -> { "k": "[secret:SIGNING_KEY]" }
 ```
 
 And you **can't** sneak it out through an encoder — that throws on purpose:
 
 ```js
-$sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws: secrets can't be encoded
+$std.crypto.base64.encode($std.secrets.SIGNING_KEY); // ❌ throws: secrets can't be encoded
 ```
 
 > 🔒 **How it's safe:** the real password never enters your JavaScript at all — it lives
@@ -152,8 +152,8 @@ $sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws: secrets can'
 
 ## Turning it on 🔘
 
-`$sys.crypto` is **always there** — no config. `$sys.env` and
-`$sys.secrets` are empty `{}` until the operator adds them:
+`$std.crypto` is **always there** — no config. `$std.env` and
+`$std.secrets` are empty `{}` until the operator adds them:
 
 ```jsonc
 "config": {
@@ -168,11 +168,11 @@ $sys.crypto.base64.encode($sys.secrets.SIGNING_KEY); // ❌ throws: secrets can'
 
 ## Cheat sheet 📝
 
-- `$sys.crypto.sha256(t)` / `.sha512(t)` → fingerprint a string.
-- `$sys.crypto.hmac("sha256", key, msg)` → sign (key can be a `$sys.secrets.X` handle).
-- `$sys.crypto.uuid()` → a fresh ID (UUIDv7, time-ordered).
-- `$sys.crypto.base64 / base64url / hex / url` → `.encode()` / `.decode()`.
-- `$sys.env.KEY` → operator settings. `$sys.secrets.KEY` → use (HMAC), never read.
+- `$std.crypto.sha256(t)` / `.sha512(t)` → fingerprint a string.
+- `$std.crypto.hmac("sha256", key, msg)` → sign (key can be a `$std.secrets.X` handle).
+- `$std.crypto.uuid()` → a fresh ID (UUIDv7, time-ordered).
+- `$std.crypto.base64 / base64url / hex / url` → `.encode()` / `.decode()`.
+- `$std.env.KEY` → operator settings. `$std.secrets.KEY` → use (HMAC), never read.
 - Dates & times? They live in **`datetime`** now — see [10-datetime.md](10-datetime.md).
 
 **Next:** [`datetime` — dates & times done right →](10-datetime.md)

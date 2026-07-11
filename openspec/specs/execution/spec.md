@@ -216,7 +216,7 @@ operator-supplied gating config key (`allowed_hosts`) is unchanged.
 #### Scenario: HTTP calls go through the `http` global
 
 - **WHEN** a script performs an HTTP request in a request whose config permits it
-- **THEN** it calls `http.get`/`http.post`/`http.put`/`http.patch`/`http.delete` (method names unchanged), and the global `api` does not exist (`typeof api === "undefined"`)
+- **THEN** it calls `$std.http.get`/`$std.http.post`/`$std.http.put`/`$std.http.patch`/`$std.http.delete` (method names unchanged), and the global `api` does not exist (`typeof api === "undefined"`)
 
 ### Requirement: HTTP status projects the retry action
 

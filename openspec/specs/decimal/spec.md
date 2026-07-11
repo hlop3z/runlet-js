@@ -38,22 +38,22 @@ percentages).
 
 ### Requirement: Decimal construction
 
-`Decimal(value)` SHALL build a decimal from a string, a number, or another decimal, preserving
+`$std.decimal(value)` SHALL build a decimal from a string, a number, or another decimal, preserving
 exact value when the input is a string.
 
 #### Scenario: Construct from a string
 
-- **WHEN** a handler calls `Decimal("2.5")`
+- **WHEN** a handler calls `$std.decimal("2.5")`
 - **THEN** a decimal whose `to_string()` is `"2.5"` is produced
 
 #### Scenario: Construct from an existing decimal
 
-- **WHEN** a handler passes a decimal back into `Decimal(...)`
+- **WHEN** a handler passes a decimal back into `$std.decimal(...)`
 - **THEN** the same value is returned without re-parsing
 
 #### Scenario: Invalid input throws
 
-- **WHEN** a handler calls `Decimal("not-a-number")`
+- **WHEN** a handler calls `$std.decimal("not-a-number")`
 - **THEN** a JavaScript error is thrown that the handler can catch with `try/catch`
 
 ### Requirement: Method-based arithmetic
@@ -64,7 +64,7 @@ decimal argument.
 
 #### Scenario: Chained arithmetic
 
-- **WHEN** a handler evaluates `Decimal("19.99").mul(3).add("0.01").to_string()`
+- **WHEN** a handler evaluates `$std.decimal("19.99").mul(3).add("0.01").to_string()`
 - **THEN** the result is the exact string `"59.98"`
 
 #### Scenario: Method arguments are coerced
@@ -79,12 +79,12 @@ native JS number math.
 
 #### Scenario: No 0.1 + 0.2 drift
 
-- **WHEN** a handler evaluates `Decimal("0.1").add("0.2").to_string()`
+- **WHEN** a handler evaluates `$std.decimal("0.1").add("0.2").to_string()`
 - **THEN** the result is exactly `"0.3"`, not `0.30000000000000004`
 
 #### Scenario: Matches the database NUMERIC engine
 
-- **WHEN** a handler wraps a `NUMERIC`/`DECIMAL` value read as a string from the database in `Decimal(...)` and does math
+- **WHEN** a handler wraps a `NUMERIC`/`DECIMAL` value read as a string from the database in `$std.decimal(...)` and does math
 - **THEN** the result is exact and consistent with the database's own decimal arithmetic
 
 ### Requirement: Half-up rounding
@@ -96,7 +96,7 @@ multiple of `step` (e.g. `"0.05"` for cash rounding).
 
 #### Scenario: Round to places (default mode)
 
-- **WHEN** a handler evaluates `Decimal("19.985").round(2).to_string()`
+- **WHEN** a handler evaluates `$std.decimal("19.985").round(2).to_string()`
 - **THEN** the result is `"19.99"`
 
 #### Scenario: Default places
@@ -106,7 +106,7 @@ multiple of `step` (e.g. `"0.05"` for cash rounding).
 
 #### Scenario: Round to a step
 
-- **WHEN** a handler evaluates `Decimal("2.03").round_to("0.05").to_string()`
+- **WHEN** a handler evaluates `$std.decimal("2.03").round_to("0.05").to_string()`
 - **THEN** the result is `"2.05"`
 
 ### Requirement: Standard rounding-mode vocabulary
@@ -119,7 +119,7 @@ rounding strategy. An unrecognized mode SHALL throw a catchable error.
 
 #### Scenario: half_even is banker's rounding
 
-- **WHEN** a handler evaluates `Decimal("2.5").round(0, "half_even").to_string()` and `Decimal("3.5").round(0, "half_even").to_string()`
+- **WHEN** a handler evaluates `$std.decimal("2.5").round(0, "half_even").to_string()` and `$std.decimal("3.5").round(0, "half_even").to_string()`
 - **THEN** the results are `"2"` and `"4"` respectively (ties go to the even neighbor)
 
 #### Scenario: Unknown mode throws
@@ -135,12 +135,12 @@ the value and the argument; `pct(p)` returns `p` percent of the value.
 
 #### Scenario: Clamp to a range
 
-- **WHEN** a handler evaluates `Decimal("120").clamp(0, 100).to_string()`
+- **WHEN** a handler evaluates `$std.decimal("120").clamp(0, 100).to_string()`
 - **THEN** the result is `"100"`
 
 #### Scenario: Percentage of a value
 
-- **WHEN** a handler evaluates `Decimal("200").pct(15).to_string()`
+- **WHEN** a handler evaluates `$std.decimal("200").pct(15).to_string()`
 - **THEN** the result is `"30"`
 
 ### Requirement: Comparison
@@ -150,7 +150,7 @@ The system SHALL provide comparison helpers (`cmp`, `eq`, `lt`, `lte`, `gt`, `gt
 
 #### Scenario: Ordering predicates
 
-- **WHEN** a handler evaluates `Decimal("19.99").gt("9.99")`
+- **WHEN** a handler evaluates `$std.decimal("19.99").gt("9.99")`
 - **THEN** the result is `true`
 
 #### Scenario: cmp tri-state
@@ -160,7 +160,7 @@ The system SHALL provide comparison helpers (`cmp`, `eq`, `lt`, `lte`, `gt`, `gt
 
 #### Scenario: Sign predicates
 
-- **WHEN** a handler evaluates `Decimal("0").is_zero()`
+- **WHEN** a handler evaluates `$std.decimal("0").is_zero()`
 - **THEN** the result is `true`
 
 ### Requirement: snake_case naming (no aliases)
@@ -173,12 +173,12 @@ name per operation. The JS-runtime protocol hooks the engine invokes by fixed na
 
 #### Scenario: snake_case is canonical
 
-- **WHEN** a handler calls `Decimal("5").is_zero()` and `Decimal("5").to_number()`
+- **WHEN** a handler calls `$std.decimal("5").is_zero()` and `$std.decimal("5").to_number()`
 - **THEN** both resolve to the snake_case methods and return the expected results
 
 #### Scenario: Removed camelCase alias is absent
 
-- **WHEN** a handler calls the legacy `Decimal("5").isZero()`
+- **WHEN** a handler calls the legacy `$std.decimal("5").isZero()`
 - **THEN** it throws a `TypeError` (the camelCase alias no longer exists); the handler uses `is_zero()` instead
 
 #### Scenario: Protocol hooks keep JS spelling
@@ -193,7 +193,7 @@ parse failures as catchable JavaScript errors rather than crashing the engine.
 
 #### Scenario: Division by zero throws
 
-- **WHEN** a handler evaluates `Decimal("10").div(0)`
+- **WHEN** a handler evaluates `$std.decimal("10").div(0)`
 - **THEN** a JavaScript error is thrown (no panic, no process abort)
 
 #### Scenario: Overflow throws

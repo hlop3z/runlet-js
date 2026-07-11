@@ -122,7 +122,7 @@ gated; a registered-but-disabled import is not acceptable.
 #### Scenario: Ambient authority is removed, not gated, under deterministic profile
 
 - **WHEN** an invocation runs with the deterministic profile
-- **THEN** the neutralized ambient authorities (time, randomness — the `datetime` clock and `$sys` crypto entropy) are absent from the context such that a script cannot re-reach them, rather than present-but-stubbed in a way that could be un-gated by a later change
+- **THEN** the neutralized ambient authorities (time, randomness — the `datetime` clock and `$std` crypto entropy) are absent from the context such that a script cannot re-reach them, rather than present-but-stubbed in a way that could be un-gated by a later change
 
 #### Scenario: In-engine capabilities are declared as mux bypasses
 
@@ -156,7 +156,7 @@ expose.
 
 - **WHEN** the host is built with `LogicHost::builder(...).capability(def)` and the request names that
   capability's resource in `config.io`
-- **THEN** the def's wrapper is injected and routes through `io.call` under the same mux invariants
+- **THEN** the def's wrapper is injected and routes through `$std.io.call` under the same mux invariants
   (allowlist, metering, deadline, fail-closed) as a built-in
 
 ### Requirement: Three-path capability extension model
@@ -164,7 +164,7 @@ expose.
 The framework SHALL support three documented extension paths, selected by trust/infrastructure need:
 (a) reaching a service over the `http` capability (including an allowlisted local service);
 (b) compiling a `CapabilityDef` plus an in-process `Egress` into a consumer's own binary (the
-consumer holds the driver and credentials in its own process); (c) routing `io.call` to an
+consumer holds the driver and credentials in its own process); (c) routing `$std.io.call` to an
 out-of-process broker that holds all credentials (the box holds none). Path (c) SHALL additionally
 support a **broker-free** resolution: an operator-declared, co-located loopback endpoint reached
 box-direct (see `tenant-egress`). The framework SHALL NOT require a broker for paths (a), (b), or the
@@ -173,7 +173,7 @@ box-direct variant of (c).
 #### Scenario: In-process capability needs no broker
 
 - **WHEN** a consumer builds a host with a `CapabilityDef` backed by an in-process `Egress`
-- **THEN** `io.call` for that capability's name is serviced in-process, with no broker configured
+- **THEN** `$std.io.call` for that capability's name is serviced in-process, with no broker configured
 
 #### Scenario: Broker path keeps the box credential-free
 

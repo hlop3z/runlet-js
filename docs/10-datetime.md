@@ -7,17 +7,17 @@ Dates are sneaky. "The end of the month" is a different moment in Tokyo than in 
 robot's built-in tool for getting all of this **right** — and it's **always on**, no setup,
 just like `$` (money) and `Decimal`.
 
-> 🧭 It used to live at `$sys.date`. It grew up and moved out into its own name: **`datetime`**.
+> 🧭 It grew up and got its own name in the toolbox: **`$std.datetime`**.
 
 ## Make a `datetime`
 
 ```js
-var d = datetime.parse("2026-07-10T13:30:00Z"); // an ISO / RFC 3339 moment
-var day = datetime.parse("2026-07-10");          // just a day works too (becomes midnight UTC)
-var ms = datetime.parse(1783690200000);          // or epoch milliseconds
-var now = datetime.now();                         // right now (UTC)
-var built = datetime.from({ year: 2026, month: 7, day: 10 }); // from parts
-datetime("2026-07-10T13:30:00Z");                // calling datetime(x) is the same as .parse(x)
+var d = $std.datetime.parse("2026-07-10T13:30:00Z"); // an ISO / RFC 3339 moment
+var day = $std.datetime.parse("2026-07-10");          // just a day works too (becomes midnight UTC)
+var ms = $std.datetime.parse(1783690200000);          // or epoch milliseconds
+var now = $std.datetime.now();                         // right now (UTC)
+var built = $std.datetime.from({ year: 2026, month: 7, day: 10 }); // from parts
+$std.datetime("2026-07-10T13:30:00Z");                // calling $std.datetime(x) is the same as .parse(x)
 ```
 
 `parse` understands ISO 8601 / RFC 3339 (with or without a timezone), a plain `YYYY-MM-DD`,
@@ -25,7 +25,7 @@ or epoch millis — and always stores a **UTC instant** inside. It will **not** 
 `07/10/2026`-style string (is that July 10th or October 7th? nobody agrees) — that throws, on
 purpose, so you never get a silent wrong answer.
 
-> ⏱️ `datetime.now()` is the one part that's turned **off** in the "deterministic" mode (where
+> ⏱️ `$std.datetime.now()` is the one part that's turned **off** in the "deterministic" mode (where
 > the same input must always give the same answer). Everything else keeps working — you just
 > pass in the moment you care about.
 
@@ -34,7 +34,7 @@ purpose, so you never get a silent wrong answer.
 Every method gives you a **new** value; the one you had stays put. Great for avoiding bugs.
 
 ```js
-var d = datetime.parse("2026-07-10T00:00:00Z");
+var d = $std.datetime.parse("2026-07-10T00:00:00Z");
 var next = d.add({ days: 1 });
 d.day();    // 10  (unchanged!)
 next.day(); // 11
@@ -43,7 +43,7 @@ next.day(); // 11
 ## Read the pieces
 
 ```js
-var d = datetime.parse("2026-07-10T13:30:00Z");
+var d = $std.datetime.parse("2026-07-10T13:30:00Z");
 d.year();       // 2026
 d.month();      // 7   (1–12)
 d.day();        // 10
@@ -61,15 +61,15 @@ Add or subtract any mix of `years`, `months`, `weeks`, `days`, `hours`, `minutes
 `seconds`, `ms`:
 
 ```js
-var due = datetime.parse(ctx.invoiced).add({ months: 1 }); // one month later
-datetime.parse(ctx.when).sub({ weeks: 2 });                 // two weeks earlier
+var due = $std.datetime.parse(ctx.invoiced).add({ months: 1 }); // one month later
+$std.datetime.parse(ctx.when).sub({ weeks: 2 });                 // two weeks earlier
 ```
 
 Months and years are **smart** about short months — Jan 31 + 1 month lands on the **last day
 of February**, not an imaginary Feb 31:
 
 ```js
-datetime.from({ year: 2026, month: 1, day: 31 }).add({ months: 1 }).day(); // 28
+$std.datetime.from({ year: 2026, month: 1, day: 31 }).add({ months: 1 }).day(); // 28
 ```
 
 ### Snap to the start or end of a period
@@ -87,7 +87,7 @@ d.start_of("quarter");     // first instant of the calendar quarter
 Saturdays and Sundays are skipped. (Holidays are **not** — those are country/company specific.)
 
 ```js
-var fri = datetime.parse("2026-07-10T00:00:00Z"); // a Friday
+var fri = $std.datetime.parse("2026-07-10T00:00:00Z"); // a Friday
 fri.add_business_days(1).weekday(); // 1 (the next Monday)
 fri.is_weekend();                    // false
 fri.is_business_day();               // true
@@ -96,8 +96,8 @@ fri.is_business_day();               // true
 ## How far apart? Compare?
 
 ```js
-var a = datetime.parse("2026-07-10T00:00:00Z");
-var b = datetime.parse("2026-07-08T00:00:00Z");
+var a = $std.datetime.parse("2026-07-10T00:00:00Z");
+var b = $std.datetime.parse("2026-07-08T00:00:00Z");
 a.diff(b);            // { total_ms, total_seconds, days: 2, hours, minutes, seconds }  (signed)
 a.diff_in(b, "days"); // 2   (whole units: ms|seconds|minutes|hours|days|weeks)
 
@@ -106,7 +106,7 @@ a.is_between(b, a);   // true   (inclusive)
 ```
 
 > 🚫 There's no "is it in the past?" helper on purpose — that would secretly read the clock.
-> Compare against `datetime.now()` yourself when you mean "now".
+> Compare against `$std.datetime.now()` yourself when you mean "now".
 
 ## The big one: timezones 🌍
 
@@ -115,7 +115,7 @@ The value is always a UTC instant. Ask for a **view** in someone's timezone with
 underlying moment stays the same. This is the thing UTC-only tools simply can't do.
 
 ```js
-var d = datetime.parse("2026-07-15T12:00:00Z");
+var d = $std.datetime.parse("2026-07-15T12:00:00Z");
 var tokyo = d.in_zone("Asia/Tokyo");
 tokyo.hour();               // 21   (12:00 UTC is 21:00 in Tokyo)
 tokyo.epoch_ms() === d.epoch_ms(); // true — it's the SAME moment, just read in Tokyo
@@ -146,7 +146,7 @@ return json({ due: d }, null); // -> { "due": "2026-07-10T13:30:00Z" }
 
 ## Cheat sheet 📝
 
-- **Make:** `datetime(x)` / `datetime.parse(x)` / `datetime.now()` / `datetime.from({year,month,day,…}, zone?)`.
+- **Make:** `$std.datetime(x)` / `$std.datetime.parse(x)` / `$std.datetime.now()` / `$std.datetime.from({year,month,day,…}, zone?)`.
 - **Read:** `year/month/day/hour/minute/second/millisecond`, `weekday` (1=Mon), `quarter`,
   `day_of_year`, `iso_week`, `days_in_month`.
 - **Math:** `add({…})` / `sub({…})` (months/years clamp end-of-month), `start_of/end_of("day|week|month|quarter|year")`,

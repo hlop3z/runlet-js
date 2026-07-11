@@ -53,7 +53,7 @@ so a **program** can decide what to do:
 | Field       | What it tells you                                                                              |
 | ----------- | ---------------------------------------------------------------------------------------------- |
 | `type`      | the big bucket: `request`, `runtime`, `script`, or `capability` (see below)                    |
-| `source`    | who it came from: `engine`, `handler`, `http`/`s3`, or the capability nickname you called via `io.call` |
+| `source`    | who it came from: `engine`, `handler`, `http`/`s3`, or the capability nickname you called via `$std.io.call` |
 | `code`      | a stable label you can switch on, like `DB_CONSTRAINT`. Never changes meaning.                 |
 | `message`   | a short, safe sentence for humans. (Secrets/PII never go here.)                                |
 | `retryable` | `true` = trying again might help; `false` = it won't, don't bother                             |
@@ -119,7 +119,7 @@ what.
 
 ## Catching tool errors yourself
 
-A capability reached through **`io.call`** (a database, cache, queue, mail relay, or a
+A capability reached through **`$std.io.call`** (a database, cache, queue, mail relay, or a
 box-direct local service) and `s3` **throw** when they fail. If you don't catch one it
 becomes the answer, and its `retryable` decides the status (a retryable `DB_DEADLOCK` →
 `503`, a permanent `DB_CONSTRAINT` → `4xx`). Or `try/catch` and turn it into your own
@@ -128,7 +128,7 @@ friendly answer — now it's *your* error (add `retryable: true` to opt into `50
 ```js
 function handler(ctx) {
   try {
-    io.call("users", "execute", {
+    $std.io.call("users", "execute", {
       sql: "INSERT INTO users(email) VALUES($1)",
       params: [ctx.email],
     });
@@ -156,7 +156,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `SCRIPT_XOR_KEY`    | no    | caller | Request has both `script` and `key`, or neither — send exactly one (400). |
 | `SCRIPT_NOT_FOUND`  | no    | caller | The `key` isn't in the server's script registry (404).              |
 | `MALFORMED_REQUEST` | no    | caller | Body isn't valid JSON, has wrong field types, or is too large (400). |
-| `RESOURCE_NOT_FOUND` | no   | caller/developer | You called `io.call` with a nickname **not in your request's `config.io` allowlist**, or one the operator never set up (400). |
+| `RESOURCE_NOT_FOUND` | no   | caller/developer | You called `$std.io.call` with a nickname **not in your request's `config.io` allowlist**, or one the operator never set up (400). |
 | `RESOURCE_KIND_MISMATCH` | no | operator | The nickname exists but is a different kind than the broker expected. Operator misconfig ⇒ 409. |
 
 ### The engine (`type: "runtime"`)
@@ -172,7 +172,7 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `OVERLOADED`           | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (503 + `Retry-After`, never 429).         |
 | `PARTITION_OVERLOADED` | yes   | caller    | This partition key hit its concurrency share (per-partition fairness) — retry (503, never 429). |
 | `QUOTA_EXCEEDED`       | yes   | caller    | Tenant over its plan's in-flight cap — retry as executions free up (503, never 429).           |
-| `EGRESS_UNAVAILABLE`   | yes   | operator  | An `io.call` named a broker-resolved resource but the egress sidecar (`fabricd`) isn't configured or reachable (503).    |
+| `EGRESS_UNAVAILABLE`   | yes   | operator  | An `$std.io.call` named a broker-resolved resource but the egress sidecar (`fabricd`) isn't configured or reachable (503).    |
 | `EGRESS_PROTOCOL`      | no    | operator  | The egress sidecar spoke the protocol wrong — operator misconfig (409).                        |
 | `INTERNAL`             | yes   | operator  | The robot's own fault (rare) — a 500 with `Retry-After`.                                        |
 
@@ -192,7 +192,7 @@ was `200` — a retry worker couldn't see the difference.) The `retry`/`owner` c
 are exactly what drives that status.
 
 > The tables below (`db`/`mail`/`redis`/`amq`/`auth`) are the **broker-serviced** capabilities you
-> reach with `io.call("<nickname>", "<action>", …)` — the reference broker maps the nickname to one
+> reach with `$std.io.call("<nickname>", "<action>", …)` — the reference broker maps the nickname to one
 > of these kinds and returns these codes. A capability you compose yourself may define its own.
 
 **`db`** (from the database's `SqlState`):
@@ -267,13 +267,13 @@ thrown). These codes are only for the failures `auth` **throws**:
 | `AUTH_REQUEST`     | no    | operator  | Misconfig: bad endpoint, discovery failed, `introspect` without client creds. Operator misconfig ⇒ 409. |
 | `AUTH_OP_LIMIT`    | no    | developer | Hit `max_ops`.                                                                |
 
-**`io`** (the `io.call` layer itself — the mux gate + the **box-direct** local path). These wrap a
+**`io`** (the `$std.io.call` layer itself — the mux gate + the **box-direct** local path). These wrap a
 call regardless of which capability it targets:
 
 | `code`                | retry | owner     | When                                                                              |
 | --------------------- | ----- | --------- | --------------------------------------------------------------------------------- |
 | `RESOURCE_NOT_FOUND`  | no    | developer | Called a nickname not in the request's `config.io` allowlist (rejected before egress). |
-| `IO_OP_LIMIT`         | no    | developer | Hit `max_ops` across all `io.call`s in one run.                                   |
+| `IO_OP_LIMIT`         | no    | developer | Hit `max_ops` across all `$std.io.call`s in one run.                                   |
 | `IO_LOCAL_HTTP`       | yes   | operator  | A **box-direct** local endpoint answered with a non-2xx HTTP status.              |
 | `IO_TRANSPORT`        | yes   | operator  | Couldn't reach a box-direct local endpoint (connect failure, or over the deadline). |
 | `IO_SSRF_BLOCKED`     | no    | developer | A script-controlled capability's target failed the SSRF guard.                    |

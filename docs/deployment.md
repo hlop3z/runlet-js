@@ -4,7 +4,7 @@ runlet is a stateless service: `POST /execute` runs a JS `handler(ctx)` in a
 sandboxed QuickJS context and returns `{data, error, meta}`. The box ships **three in-engine
 built-ins** — `http`, `s3`, and `io` — and links no network drivers and holds no backend
 credentials. Any other capability (a database, cache, queue, mail relay, …) is reached with
-`io.call("<name>", …)` and resolved either **box-direct** to a co-located loopback service
+`$std.io.call("<name>", …)` and resolved either **box-direct** to a co-located loopback service
 (`local_resources` config) or by the **`fabricd` egress sidecar** (which holds the drivers +
 credentials). This guide is the operator's checklist for running it safely under load.
 Depth lives in the design notes ([resilience.md](design/resilience.md),
@@ -177,14 +177,14 @@ trusted caller genuinely needs open egress.
 credential table (logical name → driver kind + endpoint + credentials, loaded from
 `FABRICD_CONFIG`, default `fabricd.json`) and every network driver. A request lists the
 resources it may use as a **flat allowlist** of logical names (e.g. `"io": ["orders","cache"]`)
-and reaches them with `io.call("orders", …)`; the box forwards only the *names*, and `fabricd`
+and reaches them with `$std.io.call("orders", …)`; the box forwards only the *names*, and `fabricd`
 resolves them — credentials never reach the box. Treat `fabricd.json` as a secret file. Full
 rationale: [resource-egress.md](design/resource-egress.md); QUIC transport details:
 [network-fabric.md](design/network-fabric.md).
 
 **Box-direct local egress (no broker).** For a **co-located** service the operator can skip
 `fabricd` entirely: bind a logical name to a loopback endpoint in the box's global
-`local_resources` map (`{"pricing": {"url": "http://localhost:8080"}}`). `io.call("pricing", …)`
+`local_resources` map (`{"pricing": {"url": "http://localhost:8080"}}`). `$std.io.call("pricing", …)`
 then POSTs the identical `{action, payload}` envelope straight to that endpoint. Box-direct
 targets are **loopback-only** — the box refuses to start if one points at a public address (a
 remote target must go through a broker).
@@ -283,7 +283,7 @@ trusts blindly. Full model: [multitenant-trust.md](design/multitenant-trust.md).
 
 ## 8. Secrets
 
-`$sys.secrets` values are **opaque handles** inside JS — the plaintext never enters the sandbox;
+`$std.secrets` values are **opaque handles** inside JS — the plaintext never enters the sandbox;
 a script can only ever return the `"[secret:NAME]"` placeholder, never the value (see
 [docs/09-sys.md](09-sys.md)). Supply them in `config.sys`. The request `config` no longer carries
 driver credentials (they live in `fabricd`'s `resources` config, §5 — keep *that* file secret),
