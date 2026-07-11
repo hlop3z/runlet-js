@@ -44,6 +44,7 @@ pub mod types;
 // `reqwest`-based connect-time resolver inside is gated to the in-engine `http`/`s3` clients.
 pub mod ssrf;
 pub mod sys;
+pub mod template;
 pub mod text;
 
 // ── Curated public port ──────────────────────────────────────────────────────

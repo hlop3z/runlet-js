@@ -322,6 +322,34 @@ def test_datetime(t: Runner):
            lambda r: r["data"] == {"caught": True})
 
 
+def test_template(t: Runner):
+    t.section("template value-util")
+    # HTML mode auto-escapes interpolated values; literal markup in the template is untouched.
+    t.test("html mode escapes values",
+           h("return json({out: $std.template.html('<p>{{ name }}</p>').render({name:'<b>&x'})}, null);"),
+           lambda r: r["data"]["out"] == "<p>&lt;b&gt;&amp;x</p>")
+    # Text mode emits values verbatim (plain email / SMS).
+    t.test("text mode verbatim",
+           h("return json({out: $std.template.text('Hi {{ name }}').render({name:'<b>&x'})}, null);"),
+           lambda r: r["data"]["out"] == "Hi <b>&x")
+    # Statements + expressions render (a real invoice-line loop).
+    t.test("loop statement renders",
+           h("return json({out: $std.template.text('{% for i in items %}{{ i }},{% endfor %}').render({items:[1,2,3]})}, null);"),
+           lambda r: r["data"]["out"] == "1,2,3,")
+    # Missing merge tags render empty by default; a placeholder substitutes when set.
+    t.test("missing lenient + placeholder",
+           h("var tpl = $std.template.text('A{{ gap }}B'); return json({empty: tpl.render({}), dash: tpl.missing('-').render({})}, null);"),
+           lambda r: r["data"] == {"empty": "AB", "dash": "A-B"})
+    # .fields() reports the top-level merge tags (sorted), for "what data does this need?".
+    t.test("fields lists merge tags",
+           h("return json({f: $std.template.text('{{ first }} {{ last }} {{ first }}').fields()}, null);"),
+           lambda r: r["data"]["f"] == ["first", "last"])
+    # A malformed template throws a catchable Error at construction (not a runtime crash).
+    t.test("malformed template throws",
+           h("try { $std.template.text('{{ unclosed '); return json(null,'no throw'); } catch(e){ return json({caught:true}, null); }"),
+           lambda r: r["data"] == {"caught": True})
+
+
 def test_list_interop(t: Runner):
     t.section("list value-util interop (money / datetime wrappers)")
     # A money column sums to a money value (currency preserved), not a bare Decimal, and never 0.
@@ -1567,6 +1595,7 @@ def main():
     test_functionality(t)
     test_money(t)
     test_datetime(t)
+    test_template(t)
     test_list_interop(t)
     test_user_errors(t)
     test_exceptions(t)

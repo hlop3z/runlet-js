@@ -43,7 +43,10 @@ Read these in order. Each one is short.
 10. **[`list` & `dict` — tidy tables and records](13-lists-and-dicts.md)** — filter, sort,
    group, and sum by field name, no functions needed (`where`, `sort_by`, `group_by`, `sum`,
    `get`). Always on. 📋
-11. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
+11. **[`template` — fill-in-the-blank text](14-template.md)** — turn data into invoices, emails,
+   SMS, and receipts with `{{ blanks }}`; `html` mode auto-escapes, `text` mode is verbatim.
+   Always on. 📝
+12. **[When Things Go Wrong (Errors)](99-errors.md)** — what the robot hands back when
    something fails, and how to read it. 🚦
 
 ## The super-powers 🦸
