@@ -90,6 +90,15 @@ limits, with `eval` and `Proxy` removed before the handler runs. Any cross-reque
 or bytecode cache SHALL be namespaced by the trusted tenant identity, so identical source from
 different tenants never shares a cache entry (no cross-tenant dedup or compile-timing leak).
 
+The engine MAY precompile the **injected framework and value-util surface** (the standard
+library scaffolding, bridges, capability wrappers, and value-util wrappers it injects into every
+context) to bytecode once and load that bytecode into each fresh context. Such precompiled
+injected code SHALL be reused as **compiled code only, never as retained state**: every execution
+still receives a fresh context whose global scope reflects no prior request. Because the injected
+surface is operator-fixed and identical for all tenants, its bytecode is NOT tenant-scoped and
+carries no per-tenant or per-request data — only tenant-submitted *handler* source remains subject
+to the tenant-namespaced cache rule above.
+
 A wall-clock `TIMEOUT` SHALL take its `retryable` value from the operator-configured
 `timeout_retryable` flag (default `true`), because the engine cannot distinguish a transient
 slow-dependency stall (retrying helps) from a slow algorithm (retrying wastes budget); it
@@ -101,6 +110,11 @@ so they SHALL be non-retryable (`422`) regardless of the flag.
 
 - **WHEN** one request mutates global scope
 - **THEN** a subsequent request observes a clean global scope
+
+#### Scenario: Precompiled injected surface does not leak state across requests
+
+- **WHEN** a request mutates a global or a prototype reachable through the injected framework/value-util surface, and a subsequent request runs against a context built from the same precompiled injected bytecode
+- **THEN** the subsequent request observes the pristine injected surface, identical to a context parsed fresh from source (bytecode reuse restores compiled code, not the prior request's mutations)
 
 #### Scenario: Wall-clock timeout
 
