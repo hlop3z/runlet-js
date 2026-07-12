@@ -29,6 +29,10 @@ use tokio::time::timeout;
 
 use crate::broker::BrokerEgress;
 
+/// Out-of-band header carrying the request's trusted tenant id on a box-direct POST, matching the
+/// `x-runlet-*` trusted-header family. Emitted only when a trusted tenant is present.
+const TENANT_HEADER: &str = "x-runlet-tenant";
+
 /// Per-op metric for one box-direct local call, surfaced in `meta.io.<name>` exactly like the
 /// broker's per-capability metrics (so box-direct and broker resolution meter identically).
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +74,12 @@ pub(crate) struct BoxEgress {
     /// The broker session for non-local names; `None` when the request named only box-direct
     /// resources (no broker session was opened).
     broker: Option<Arc<BrokerEgress>>,
+    /// The request's **trusted** tenant id, forwarded to the box-direct loopback service as an
+    /// out-of-band `X-Runlet-Tenant` header so a multitenant local service can scope by tenant —
+    /// the box-direct analogue of the broker path's `WireInit.tenant`. Sourced only from the
+    /// trusted-header extractor (never the script). `None` on the single-tenant/non-trusted path,
+    /// where no header is emitted and the request is byte-for-byte unchanged.
+    tenant: Option<String>,
     /// Box-direct per-op metrics, keyed by logical name — drained into `meta.io.<name>`.
     metrics: Mutex<BTreeMap<String, Vec<LocalIoMetric>>>,
 }
@@ -77,12 +87,18 @@ pub(crate) struct BoxEgress {
 impl BoxEgress {
     /// Wraps the box-direct bindings + client and (optionally) the broker session. Build this on the
     /// `spawn_blocking` thread — its calls `block_on`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one internal constructor called once from execute_blocking; grouping these already-\
+                  distinct per-request values into a params struct would be pure indirection"
+    )]
     pub(crate) fn new(
         local: Arc<HashMap<String, String>>,
         client: Client,
         handle: Handle,
         budget: Duration,
         broker: Option<Arc<BrokerEgress>>,
+        tenant: Option<String>,
     ) -> Self {
         let deadline = Instant::now()
             .checked_add(budget)
@@ -93,6 +109,7 @@ impl BoxEgress {
             handle,
             deadline,
             broker,
+            tenant,
             metrics: Mutex::new(BTreeMap::new()),
         }
     }
@@ -103,6 +120,22 @@ impl BoxEgress {
             let mut guard = self.metrics.lock().await;
             mem::take(&mut *guard)
         })
+    }
+
+    /// Builds the box-direct POST for `url` with the serialized `body`, attaching the trusted tenant
+    /// as an out-of-band `X-Runlet-Tenant` header **only** when one is present (the box-direct
+    /// analogue of the broker's `WireInit.tenant`). The `{action, payload}` body is unchanged either
+    /// way, so a service moves between box-direct and broker with no wire-body change (D9).
+    fn build_request(&self, url: &str, body: String) -> reqwest::RequestBuilder {
+        let request = self
+            .client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json");
+        match self.tenant.as_deref() {
+            Some(tenant) => request.header(TENANT_HEADER, tenant),
+            None => request,
+        }
+        .body(body)
     }
 
     /// Performs one box-direct POST to `url`, records its metric under `name`, and maps the result
@@ -119,12 +152,8 @@ impl BoxEgress {
         let request_bytes = body.len();
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         let start = Instant::now();
+        let request = self.build_request(url, body);
         let outcome = self.handle.block_on(async {
-            let request = self
-                .client
-                .post(url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body);
             match timeout(remaining, request.send()).await {
                 Ok(Ok(response)) => {
                     let status = response.status();
@@ -209,4 +238,83 @@ fn local_error(name: &str, code: &str, message: &str) -> EgressError {
     EgressError::new(name, code, message.to_owned())
         .retryable()
         .owner(ErrorOwner::Operator)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Box-direct tenant propagation: the trusted tenant rides an out-of-band `X-Runlet-Tenant`
+    //! header while the `{action, payload}` body stays byte-identical (D9). These assert on the
+    //! built request (no network), so no loopback server or `block_on` threading is involved.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use reqwest::Client;
+    use tokio::runtime::Handle;
+
+    use super::{BoxEgress, LocalCallEnvelope, TENANT_HEADER};
+
+    /// A `BoxEgress` with one box-direct binding and the given trusted tenant, on the test runtime's
+    /// handle. The URL is never dialed — the tests only inspect the request the box would send.
+    fn egress_with_tenant(tenant: Option<String>) -> BoxEgress {
+        let local: HashMap<String, String> =
+            HashMap::from([("pricing".to_owned(), "http://127.0.0.1:9/".to_owned())]);
+        BoxEgress::new(
+            Arc::new(local),
+            Client::new(),
+            Handle::current(),
+            Duration::from_secs(5),
+            None,
+            tenant,
+        )
+    }
+
+    /// The exact `{action, payload}` envelope the box serializes for a box-direct call.
+    fn envelope(action: &str, payload: &str) -> String {
+        serde_json::to_string(&LocalCallEnvelope { action, payload }).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn tenant_present_adds_header_and_leaves_body_identical() {
+        let egress = egress_with_tenant(Some("ws_acme".to_owned()));
+        let body = envelope("query", "{\"x\":1}");
+        let request = egress
+            .build_request("http://127.0.0.1:9/", body.clone())
+            .build()
+            .unwrap_or_else(|_err| unreachable!("a POST with a static body always builds"));
+
+        // The trusted tenant rides the out-of-band header.
+        let sent = request
+            .headers()
+            .get(TENANT_HEADER)
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(sent, Some("ws_acme"));
+
+        // D9: the body is exactly the {action, payload} envelope — the tenant never leaks into it.
+        let sent_body = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .unwrap_or_default();
+        assert_eq!(sent_body, body.as_bytes());
+        assert!(!body.contains("tenant"));
+    }
+
+    #[tokio::test]
+    async fn no_tenant_omits_header() {
+        let egress = egress_with_tenant(None);
+        let body = envelope("query", "{}");
+        let request = egress
+            .build_request("http://127.0.0.1:9/", body.clone())
+            .build()
+            .unwrap_or_else(|_err| unreachable!("a POST with a static body always builds"));
+
+        // Single-tenant / non-trusted path: no header, and the body is unchanged.
+        assert!(request.headers().get(TENANT_HEADER).is_none());
+        let sent_body = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .unwrap_or_default();
+        assert_eq!(sent_body, body.as_bytes());
+    }
 }

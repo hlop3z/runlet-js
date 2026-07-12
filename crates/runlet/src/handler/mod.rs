@@ -314,6 +314,10 @@ pub(crate) async fn run_execute(
         cache_ns,
         log_floor,
         default_currency: state.default_currency.clone(),
+        // Same trusted tenant fed to the broker's `WireInit`; forwarded box-direct as a header.
+        tenant: identity
+            .as_ref()
+            .and_then(|id| id.tenant.as_deref().map(str::to_owned)),
     })
     .await;
 
@@ -341,6 +345,10 @@ pub(crate) struct ExecuteBlocking {
     session: Option<SessionConn>,
     /// Box-direct local egress bindings (name → loopback URL), consulted before the broker (D8).
     local_resources: Arc<HashMap<String, String>>,
+    /// The request's trusted tenant id, forwarded to a box-direct loopback service as the
+    /// `X-Runlet-Tenant` header (the box-direct analogue of the broker's `WireInit.tenant`).
+    /// `None` on the single-tenant/non-trusted path — no header is then emitted.
+    tenant: Option<String>,
     /// Shared `reqwest` client for the box-direct POSTs.
     local_client: reqwest::Client,
     /// The resolved script source (inline or registered).
@@ -380,6 +388,7 @@ pub(crate) async fn execute_blocking(
         cache_ns,
         log_floor,
         default_currency,
+        tenant,
     } = params;
     task::spawn_blocking(move || -> (Result<Outcome, EngineError>, EgressMetrics) {
         // The broker session (if any) is wrapped as a `BrokerEgress`, then composed with the
@@ -394,6 +403,7 @@ pub(crate) async fn execute_blocking(
                 handle.clone(),
                 timeout,
                 broker,
+                tenant,
             ))
         });
         let egress: Option<Arc<dyn Egress>> = box_egress.as_ref().map(|metered| {

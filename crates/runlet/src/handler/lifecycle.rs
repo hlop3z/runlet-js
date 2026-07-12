@@ -142,6 +142,8 @@ pub(crate) async fn run_lifecycle_phase(ctx: LifecycleCtx<'_>) -> LifecyclePhase
         cache_ns: partition.map(str::to_owned),
         log_floor: None,
         default_currency: state.default_currency.clone(),
+        // Same trusted tenant fed to the broker's `WireInit`; forwarded box-direct as a header.
+        tenant: identity.and_then(|trusted| trusted.tenant.as_deref().map(str::to_owned)),
     })
     .await;
 

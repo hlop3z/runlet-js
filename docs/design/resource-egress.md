@@ -20,7 +20,11 @@ Companion to [resilience.md](resilience.md) and [network-fabric.md](network-fabr
 > endpoint → creds. **Model 1 gains one bounded exception:** a logical name may resolve
 > **box-direct** to an operator-declared, co-located **loopback** endpoint (global
 > `local_resources` config), reached over plain HTTP with the identical `{action, payload}`
-> envelope — logical local egress without a broker or Rust. The box still holds **no remote**
+> envelope — logical local egress without a broker or Rust. In trusted (multitenant) mode the
+> box-direct POST carries the request's trusted tenant id as an out-of-band `X-Runlet-Tenant`
+> header (the box-direct analogue of `WireInit.tenant`), so a co-located loopback service can scope
+> by tenant; the `{action, payload}` **body** is unchanged either way, so a name still moves between
+> box-direct and broker with no wire-body change. The box still holds **no remote**
 > endpoint or credential (a remote target must go through a broker; the boot guard refuses a
 > non-loopback box-direct binding). The least-privilege / trust-model section below (carried from
 > the superseded `resource-privilege-guard` change) is unchanged: a tenant-scoped session is
