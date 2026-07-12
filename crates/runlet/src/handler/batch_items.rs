@@ -435,6 +435,8 @@ pub(crate) async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         // Batch items neither mirror nor stream logs (out of scope for §3); use the host's floor.
         log_floor: None,
         default_currency: state.default_currency.clone(),
+        // Same trusted tenant fed to the broker's `WireInit`; forwarded box-direct as a header.
+        tenant: identity.and_then(|trusted| trusted.tenant.as_deref().map(str::to_owned)),
     })
     .await;
 
