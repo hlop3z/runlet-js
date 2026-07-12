@@ -2046,6 +2046,7 @@ name = "runlet-bench"
 version = "0.1.1"
 dependencies = [
  "criterion",
+ "mimalloc",
  "rquickjs",
  "runlet-core",
 ]

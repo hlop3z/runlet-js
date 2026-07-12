@@ -15,6 +15,9 @@ rquickjs.workspace = true
 # `default-features = false` keeps the bench light — the mux/host/engine need no network stack,
 # so this pulls no `reqwest`/`aws-lc-sys` (the deterministic-only core).
 runlet-core = { path = "../runlet-core", default-features = false }
+# Global-allocator A/B for the sweep bin: musl's malloc serializes QuickJS's heavy per-eval
+# alloc/free under threads; mimalloc is the scalable-allocator hypothesis test.
+mimalloc = "0.1"
 
 [dev-dependencies]
 # HTML/plotting backend trimmed to keep the dev-dep graph small.
@@ -23,6 +26,16 @@ criterion = { version = "0.5", default-features = false }
 [[bench]]
 name = "bytecode"
 harness = false
+
+[[bench]]
+name = "context"
+harness = false
+
+# Throughput/concurrency sweep (compute-scaling + I/O worker lever) — a bin, not a bench, since it
+# measures aggregate req/s under N threads rather than single-op latency.
+[[bin]]
+name = "sweep"
+path = "src/bin/sweep.rs"
 
 [[bench]]
 name = "mux"
