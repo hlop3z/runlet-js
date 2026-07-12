@@ -18,9 +18,9 @@ that change's `design.md`.
   signature. Duplicate names are rejected at build, before any request is served.
 - **The egress mux** (`CapabilityRegistry::dispatch`) — every `$std.io.call(name, action, payload)`
   routes by `name`: a locally-bound backend first, then the per-request fallback (the stock
-  server's `fabricd` sidecar), then the builder-wired fallback; an unrouted registered name with
+  server's `fabricd` broker), then the builder-wired fallback; an unrouted registered name with
   no fallback fails `EGRESS_UNAVAILABLE`. An **unregistered** name has no JS global at all, but a
-  raw `$std.io.call` still reaches the fallback (the sidecar resolves the logical name, or nothing
+  raw `$std.io.call` still reaches the fallback (the broker resolves the logical name, or nothing
   does) — the box grants no authority the operator did not wire.
 - **Per-request opt-in** — a registered def's wrapper is injected only when its name is in the
   request's enabled `io` list (and only under `Profile::Full`).
@@ -112,7 +112,7 @@ datetime) see ~2×. Orthogonally, per-release `run_gc` became amortized (one swe
    backend; D5 says names without a local backend fall through to a fallback. So the backend is
    `Option<Arc<dyn Egress>>`: present ⇒ bound in the mux routing table (in-process, e.g. a
    `fabric-backends` `*Backend`); absent ⇒ the name routes to the fallback egress. The stock
-   server registers the six standard defs **without** backends and wires the sidecar as the
+   server registers the six standard defs **without** backends and wires the broker as the
    per-request fallback; a custom box binds whichever backends it wants in-process and lets the
    rest fall through.
 
@@ -146,7 +146,7 @@ without forking core. A `CapabilityDef` is `new(name, js_wrapper, dts_fragment, 
 use runlet_core::{CapabilityDef, LogicHost, Trust};
 
 // A capability whose backend runs in-process (e.g. a fabric_backends *Backend, which already
-// implements runlet_wire::Egress), plus the stock preset for everything else via the sidecar.
+// implements runlet_wire::Egress), plus the stock preset for everything else via the broker.
 let my_pg = CapabilityDef::new(
     "db",
     include_str!("js/db.js"),      // routes through $std.io.call('db', <action>, payload)
@@ -158,7 +158,7 @@ let host = LogicHost::builder(pool, script_registry, settings)
     .capability(my_pg)                       // served in-process
     .capabilities(runlet_caps::preset()       // db is overridden above by name; rest…
         .into_iter().filter(|d| d.name() != "db"))
-    .fallback_egress(sidecar)                // …fall through to the fabricd sidecar
+    .fallback_egress(broker)                 // …fall through to the fabricd broker
     .build()?;                                // duplicate names error here (D1)
 ```
 
@@ -166,4 +166,4 @@ A `ScriptControlled` capability instead declares `Trust::ScriptControlled(SsrfPo
 extractor))`, and the mux applies the SSRF guard pre-connect. Per-capability metrics surface under
 `meta.io.<name>`; regenerate `container/types.d.ts` with `runlet_core::generate_types_dts` (a golden
 test guards drift). The stock `runlet` binary is itself just this composition over the `runlet-caps`
-preset with the sidecar as the per-request fallback.
+preset with the broker as the per-request fallback.

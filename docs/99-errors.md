@@ -172,8 +172,8 @@ Want to handle specific cases? Switch on `code`. Here's every code, by tool.
 | `OVERLOADED`           | yes   | operator  | Server at capacity (bulkhead full) — back off, retry (503 + `Retry-After`, never 429).         |
 | `PARTITION_OVERLOADED` | yes   | caller    | This partition key hit its concurrency share (per-partition fairness) — retry (503, never 429). |
 | `QUOTA_EXCEEDED`       | yes   | caller    | Tenant over its plan's in-flight cap — retry as executions free up (503, never 429).           |
-| `EGRESS_UNAVAILABLE`   | yes   | operator  | An `$std.io.call` named a broker-resolved resource but the egress sidecar (`fabricd`) isn't configured or reachable (503).    |
-| `EGRESS_PROTOCOL`      | no    | operator  | The egress sidecar spoke the protocol wrong — operator misconfig (409).                        |
+| `EGRESS_UNAVAILABLE`   | yes   | operator  | An `$std.io.call` named a broker-resolved resource but the egress broker isn't configured or reachable (503).    |
+| `EGRESS_PROTOCOL`      | no    | operator  | The egress broker spoke the protocol wrong — operator misconfig (409).                        |
 | `INTERNAL`             | yes   | operator  | The robot's own fault (rare) — a 500 with `Retry-After`.                                        |
 
 ### Your script (`type: "script"`)

@@ -4,7 +4,7 @@ Companion to [resilience.md](resilience.md) and [network-fabric.md](network-fabr
 
 > **Status: implemented (Project A complete).** All five phases below have landed: the
 > driver-backed I/O capabilities (`db`, `mongo`, `mail`, `redis`, `amq`, `auth`) are out of
-> `runlet-core` and the box binary, behind a single egress port served by the `fabricd` sidecar;
+> `runlet-core` and the box binary, behind a single egress port served by the `fabricd` broker;
 > the box links no driver and holds no credentials. This doc is the rationale + the (now-historical)
 > staged plan; the live system is the source of truth. Next horizon is
 > [network-fabric.md](network-fabric.md) (Project B): `fabricd` growing into a cross-node fabric.
@@ -38,9 +38,9 @@ Postgres is not its job, it is a *dependency* of the logic.
 
 So: the box should depend on a **stable egress port**, not on a pile of drivers. Each external
 resource is reached as `resource.call("db", action, payload, binding)` — a string-in /
-string-out call that crosses a process boundary to a sidecar (`fabricd`) that holds the
-drivers. Whether that sidecar reaches Postgres directly or routes across a global mesh is the
-sidecar's problem, invisible to the box.
+string-out call that crosses a process boundary to a broker (`fabricd`) that holds the
+drivers. Whether that broker reaches Postgres directly or routes across a global mesh is the
+broker's problem, invisible to the box.
 
 This mirrors the move already made on the inbound side: [`LogicHost`](../../crates/runlet-core/src/host.rs)
 is a callable port (`Invocation → Outcome`) that knows nothing about HTTP. `Resource` is the
@@ -63,7 +63,7 @@ capability pattern is *already* a string-in/string-out FFI with a wire-ready err
   bounded by the wall-clock budget. A QUIC round-trip slots into the exact same shape.
 
 So the only thing that changes is *what is inside the closure*: `dispatch(&call, …)` →
-`tokio_postgres` becomes `resource.call("db", action, payload, binding)` → sidecar. The JS
+`tokio_postgres` becomes `resource.call("db", action, payload, binding)` → broker. The JS
 wrapper (`db.js`), the metrics collector, `check_op_limit`/`record`, and the `__runlet`
 envelope are all unchanged.
 
@@ -253,8 +253,8 @@ constraint** plus the fact that there are two binaries:
 That is the entire goal of this work — shrink the sandbox's native attack surface and its
 supply-chain audit tail (`mongocrypt`/`ring`/`aws-lc`). Trace what the constraint forces:
 
-1. **`runlet` (box bin)** and **`fabricd` (sidecar bin)** are two separate *processes* — the box
-   runs untrusted JS, the sidecar holds credentials. Two binaries ⇒ two crates.
+1. **`runlet` (box bin)** and **`fabricd` (broker bin)** are two separate *processes* — the box
+   runs untrusted JS, the broker holds credentials. Two binaries ⇒ two crates.
 2. **`runlet-core`** — the sandbox library (QuickJS engine, pool, capabilities). The box binary is
    a thin HTTP shell over it. Drivers must leave here or the box links them.
 3. **`fabric-backends`** — the driver bag (every vendor crate). This is what `fabricd` links and the
@@ -275,7 +275,7 @@ never depends on `runlet-core`):
 ```
 runlet-wire            (leaf: no drivers, no QuickJS)
   ├── runlet-core      (QuickJS, no drivers)      ──>  runlet   (box: no drivers, no creds)
-  └── fabric-backends  (drivers, no QuickJS)       ──>  fabricd  (sidecar: drivers + creds)
+  └── fabric-backends  (drivers, no QuickJS)       ──>  fabricd  (broker: drivers + creds)
 ```
 
 `runlet-wire` is the only crate both arms touch, and it is deliberately tiny. The guarantee is
@@ -350,7 +350,7 @@ QuickJS/`rquickjs`.
      host. `runlet` wires an in-process `BackendSet` (provable no-op: clippy clean across the full
      cfg matrix, all tests green, behavior unchanged). The driver-backed `ExecMetrics` fields left
      the engine — the binary drains them straight from the `BackendSet`.
-   - ✅ **4b — done.** Adapter impl #2: a local **`fabricd`** sidecar (new bin crate) hosts
+   - ✅ **4b — done.** Adapter impl #2: a local **`fabricd`** broker (new bin crate) hosts
      `BackendSet` over a Unix-domain socket. Wire protocol in `fabric_backends::wire`
      (length-prefixed JSON frames): one connection = one box-request session — `Init`
      (resolved configs + deadline) → `Call`(kind, action, payload)\* → `Drain`(metrics); the
@@ -360,7 +360,7 @@ QuickJS/`rquickjs`.
      internally, forbidden on a runtime worker) and drops the `BackendSet` on EOF (tearing down
      driver connections). The box's `runlet::uds::UdsEgress` implements `Egress` + `MeteredEgress`
      by `block_on(timeout(deadline, roundtrip))` over the socket; `build_adapter` wires it when
-     `config.fabricd_socket` is set, **with automatic in-process fallback** if the daemon is
+     `config.broker_socket` is set, **with automatic in-process fallback** if the daemon is
      unreachable. All of it runs on the `spawn_blocking` thread (connect + calls + drain all
      `block_on`). **Live-smoked** box→UDS→`fabricd`→Postgres: a `db.query` returned through the
      daemon with metrics, and after killing `fabricd` the box fell back to in-process and still
@@ -376,9 +376,9 @@ QuickJS/`rquickjs`.
      `MeteredEgress`) moved to `runlet-wire`; `fabric-backends` keeps the drivers + `*Config` +
      `ResourceBinding`.
    - **No in-process fallback:** a request that names a driver resource requires `fabricd`. An
-     unreachable/absent sidecar is `503 EGRESS_UNAVAILABLE`; an unknown/wrong-kind name is resolved
+     unreachable/absent broker is `503 EGRESS_UNAVAILABLE`; an unknown/wrong-kind name is resolved
      daemon-side and surfaced as the same `400 RESOURCE_NOT_FOUND` / `RESOURCE_KIND_MISMATCH` as
-     before. Deterministic / `http` / `s3` requests need no sidecar.
+     before. Deterministic / `http` / `s3` requests need no broker.
    - `LogicHost::new` shed its vestigial `handle` + `db_breaker` params (the host drives no I/O); the
      db circuit breaker moved daemon-side (the box reports zero trips for scrape compatibility).
    - **Live-smoked** box→UDS→`fabricd`→Postgres with the box holding no creds: query + metrics, the
@@ -387,8 +387,8 @@ QuickJS/`rquickjs`.
 6. ✅ **Remote QUIC transport — done** (Project B's one approved slice; see
    [network-fabric.md](network-fabric.md)). The same wire framing now rides a `quinn` bidirectional
    stream so `fabricd` can run on a different host as a shared, stateless cluster service. The box's
-   `runlet::sidecar` generalized `UdsEgress`→`SidecarEgress` over a `SessionConn` (UDS stream **or**
-   QUIC send/recv halves); transport is config-selected (`fabricd_socket` vs `fabricd_quic`, QUIC
+   `runlet::broker` generalized `UdsEgress`→`BrokerEgress` over a `SessionConn` (UDS stream **or**
+   QUIC send/recv halves); transport is config-selected (`broker_socket` vs `broker_quic`, QUIC
    winning if both). Encryption + anti-MITM use a **pinned self-signed server cert** (the box trusts
    one cert by SHA-256 fingerprint — no CA / cert manager); client *identity* is a token in
    `WireInit` validated daemon-side by a pluggable `ClientAuthenticator` (`none` / `static` shipping;

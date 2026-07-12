@@ -165,7 +165,7 @@ def start_stack(box_config: dict, fabricd_config: dict | None) -> list:
             if os.path.exists(socket):
                 break
             time.sleep(0.25)
-        box_config = {**box_config, "fabricd_socket": socket}
+        box_config = {**box_config, "broker_socket": socket}
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(box_config, fh)
     procs.append(subprocess.Popen(

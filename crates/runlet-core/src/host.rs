@@ -9,7 +9,7 @@
 //!
 //! `run` is synchronous and must be called from a blocking context — `QuickJS` is
 //! single-threaded and must not run on a runtime worker. The host drives no I/O itself; any
-//! async capability work happens in the consumer's wired [`Egress`] (e.g. a `fabricd` sidecar),
+//! async capability work happens in the consumer's wired [`Egress`] (e.g. a broker),
 //! which carries its own runtime handle.
 
 use core::fmt;
@@ -125,7 +125,7 @@ pub struct Invocation<'a> {
     pub caps: CapabilitySet<'a>,
     /// Optional I/O egress seam (the `io.call` global). `None` = no `io` global.
     /// Withheld under [`Profile::Deterministic`] (it performs I/O). The HTTP front passes
-    /// `None`; a sidecar-backed consumer wires its egress here.
+    /// `None`; a broker-backed consumer wires its egress here.
     pub egress: Option<Arc<dyn Egress>>,
     /// Partition/tenant namespace for the bytecode cache key. Identical source under different
     /// namespaces gets separate cache entries (no cross-tenant dedup / compile-timing leak).
@@ -298,7 +298,7 @@ impl LogicHost {
     /// To compose driver-backed capabilities, use [`builder`](Self::builder).
     ///
     /// As of the resource-egress trust flip the host drives no I/O itself — every driver runs in
-    /// the consumer's wired [`Egress`] (a `fabricd` sidecar) — so it no longer takes a tokio
+    /// the consumer's wired [`Egress`] (a broker) — so it no longer takes a tokio
     /// `Handle` or a `db` circuit breaker (see `docs/design/resource-egress.md` step 5).
     #[must_use]
     pub fn new(pool: JsPool, registry: Arc<ScriptRegistry>, settings: HostSettings) -> Self {
@@ -509,7 +509,7 @@ impl LogicHostBuilder {
     }
 
     /// Sets the fallback egress consulted for any capability name without a locally-bound
-    /// backend (e.g. a `fabricd` sidecar serving the brokered capabilities).
+    /// backend (e.g. a broker serving the brokered capabilities).
     #[must_use]
     pub fn fallback_egress(mut self, egress: Arc<dyn Egress>) -> Self {
         self.fallback = Some(egress);

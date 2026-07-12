@@ -9,9 +9,7 @@ host routes each capability call through a per-name egress mux (local backend or
 the sandbox invariants centrally and fail-closed, applies the SSRF guard for script-controlled
 targets, excludes all I/O under the deterministic profile, and generates the editor type surface
 from the registered set. Rationale: `docs/design/composable-core.md`, `CLAUDE.md`.
-
 ## Requirements
-
 ### Requirement: Capability registration at host construction
 
 The logic host SHALL be composed at construction time from a set of capability definitions,
@@ -75,12 +73,12 @@ authors cannot opt out of the guard for script-controlled targets.
 
 The host SHALL route each capability call to the backend registered for that capability's
 name. Names without a locally registered backend SHALL route to the configured fallback
-egress (e.g. the sidecar) when one is wired. A driver-backed call whose name has neither a
+egress (e.g. the broker) when one is wired. A driver-backed call whose name has neither a
 local backend nor a fallback SHALL fail with `EGRESS_UNAVAILABLE`.
 
 #### Scenario: Local and remote backends coexist
 
-- **WHEN** a host registers an in-process backend for `db` and wires a sidecar fallback, and one request calls `db` and `amq`
+- **WHEN** a host registers an in-process backend for `db` and wires a broker fallback, and one request calls `db` and `amq`
 - **THEN** `db` calls are served in-process and `amq` calls are served through the fallback egress
 
 #### Scenario: No backend and no fallback
@@ -195,3 +193,4 @@ capabilities). The former per-driver-capability features SHALL NOT exist.
 
 - **WHEN** a consumer enables a removed feature name (e.g. `db`) on the core crate
 - **THEN** the build fails with an unknown-feature error (registration replaces feature gating)
+

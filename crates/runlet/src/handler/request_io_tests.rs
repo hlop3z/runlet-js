@@ -1,7 +1,7 @@
 //! The box-side `config.io` interpretation (byo-capabilities: a flat allowlist of logical
 //! names): which names are enabled, which need the broker vs box-direct, and the session-open
 //! `WireInit` (the flat `resources` list). Name→kind/endpoint resolution itself lives in
-//! `fabricd`; box-direct bindings live in the operator's global config.
+//! the broker; box-direct bindings live in the operator's global config.
 
 use super::{RequestIo, wire_init};
 use std::collections::HashMap;

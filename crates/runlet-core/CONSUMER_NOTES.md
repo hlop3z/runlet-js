@@ -171,7 +171,7 @@ into a new leaf **`runlet-wire`** crate. `runlet-core` now links **no** network 
 > Affects **every** consumer, including the deterministic-only embed (reactive-database-pg).
 
 **What changed:** `LogicHost::new` dropped its two vestigial parameters. The host drives no I/O
-itself anymore — all driver work runs in the consumer's wired `Egress` (a `fabricd` sidecar) — so
+itself anymore — all driver work runs in the consumer's wired `Egress` (a broker) — so
 the tokio `Handle` and the `Option<Arc<CircuitBreaker>>` it used to take are gone:
 
 ```rust

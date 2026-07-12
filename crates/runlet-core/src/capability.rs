@@ -111,7 +111,7 @@ pub enum Trust {
 ///
 /// Register defs on [`LogicHost::builder`](crate::host::LogicHost::builder). A def with a bound
 /// backend serves its own calls in-process; a def without one routes to the request/registry
-/// fallback egress (e.g. the `fabricd` sidecar).
+/// fallback egress (e.g. a broker).
 #[derive(Clone)]
 pub struct CapabilityDef {
     /// Unique capability name — the JS global, the mux routing key, and the metric key.
@@ -229,7 +229,7 @@ pub(crate) struct MuxCall<'a> {
     pub(crate) payload: &'a str,
     /// Debug SSRF relaxation (server `debug` mode).
     pub(crate) allow_private: bool,
-    /// Per-request fallback egress (the sidecar), consulted after a local backend.
+    /// Per-request fallback egress (the broker), consulted after a local backend.
     pub(crate) fallback: Option<&'a Arc<dyn Egress>>,
 }
 
@@ -295,7 +295,7 @@ impl CapabilityRegistry {
     /// Routes one capability call through the mux and returns the FFI JSON — the backend's
     /// success JSON verbatim, or a `__runlet` error tag.
     ///
-    /// The per-request fallback ([`MuxCall::fallback`], the stock server's sidecar) is consulted
+    /// The per-request fallback ([`MuxCall::fallback`], the stock server's broker) is consulted
     /// after a local backend and before the builder-wired [`Self::fallback`]. **Fail-closed**
     /// (D9): a panic in routing or SSRF-policy evaluation denies the call rather than falling
     /// through to the I/O.
@@ -329,7 +329,7 @@ impl CapabilityRegistry {
             return call_backend(backend, call);
         }
         // An unregistered name has no wrapper/global; a raw `io.call(name, …)` still reaches the
-        // fallback (the sidecar resolves the logical name, or nothing does).
+        // fallback (the broker resolves the logical name, or nothing does).
         let backend = call.fallback.or(self.fallback.as_ref());
         call_backend(backend, call)
     }

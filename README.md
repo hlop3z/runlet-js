@@ -7,7 +7,8 @@ Powered by QuickJS (via rquickjs), axum, and mimalloc.
 > 🧒 **New here?** Start with the friendly, beginner-first guide in **[`docs/`](docs/README.md)** —
 > it explains `http`, `db`, `mail`, `s3`, and how to handle money/decimals in plain language.
 
-The driver-backed capabilities are brokered by the **`fabricd` egress sidecar**, which lives
+The driver-backed capabilities are brokered by the **egress broker** (reference
+implementation: `fabricd`), which lives
 in its own repo: [github.com/hlop3z/fabricd](https://github.com/hlop3z/fabricd). This repo is
 fully independent of it — `fabricd` implements the wire contract defined here
 (`crates/runlet-wire`) and can be replaced by anything else that speaks it.
@@ -62,7 +63,7 @@ runnable fork-me example at [`examples/kv-capability`](examples/kv-capability/sr
 (`cargo run -p kv-capability`). `config.io`
 is a **flat allowlist of logical names** (`["orders","cache"]`); the box is kind-blind and forwards
 only the names. Each name resolves either **box-direct** to an operator-declared co-located loopback
-endpoint (`local_resources` config) or through a **broker** (the reference `fabricd` sidecar) that
+endpoint (`local_resources` config) or through a **broker** that
 holds the credentials — the runlet server holds no remote endpoint or password. `http`
 (`allowed_hosts`) and `s3` stay script-controlled/in-engine and keep their inline config.
 
@@ -203,8 +204,8 @@ locking, so items stay pure and nothing waits on anything:
 
 Driver-backed capabilities are addressed by **logical name**, not inline connection
 config. The runlet server links no database/mail/broker driver and **holds no
-credentials** — the operator declares each named resource once in the **`fabricd`
-egress sidecar's** config (`fabricd.json`, or the path in `FABRICD_CONFIG`), in its
+credentials** — the operator declares each named resource once in the **egress
+broker's** config (`fabricd.json`, or the path in `FABRICD_CONFIG`), in its
 `resources` table (an internally-tagged object: `kind` selects the capability, the rest
 is that driver's config; an optional `tenant` scopes the binding to one workspace in
 trusted-identity mode):
@@ -229,8 +230,8 @@ instead of waiting on the connect timeout; `0` = off, cool-down default 5000 ms)
 `fabricd_db_breaker_trips_total` and `fabricd_auth_failures_total` — as a plaintext
 `GET /metrics`; omit it for no listener, and never expose it publicly.
 
-The runlet server config carries only the sidecar **transport**: `fabricd_socket` (local
-Unix socket, the default deployment) or `fabricd_quic` (remote `fabricd` over QUIC) — see
+The runlet server config carries only the broker **transport**: `broker_socket` (local
+Unix socket, the default deployment) or `broker_quic` (remote broker over QUIC) — see
 [Configuration](#configuration). A request then lists, as a **flat allowlist of logical
 names**, the resources it may use, and reaches them with `$std.io.call(name, action, payload)`:
 
@@ -243,7 +244,7 @@ allowlist, else the call is rejected `RESOURCE_NOT_FOUND` before any I/O. A list
 resolves either **box-direct** — when the operator bound it to a co-located loopback endpoint
 in the box's global `local_resources` map — or through the **broker** (`fabricd`), which
 resolves the name to a kind/endpoint/credentials. Naming a broker-resolved resource when no
-sidecar transport is configured is a `503` `EGRESS_UNAVAILABLE`. This is the trust boundary: a
+broker transport is configured is a `503` `EGRESS_UNAVAILABLE`. This is the trust boundary: a
 (possibly compromised) caller can only reach operator-provisioned resources and never sees an
 endpoint or a credential. Box-direct bindings are loopback-only (a remote target must go
 through a broker; the boot guard refuses a non-loopback binding):
@@ -493,7 +494,7 @@ envelope so a service can move between them with no script change:
 - **Box-direct** — bound to a co-located loopback endpoint in the box's global `local_resources`
   config; the box POSTs the envelope over plain HTTP, no broker. Loopback-only (boot-guard
   enforced).
-- **Broker** — resolved by the `fabricd` egress sidecar, which holds the driver + credentials
+- **Broker** — resolved by the egress broker, which holds the driver + credentials
   (the box holds none). See [Logical resources](#logical-resources-configio).
 
 Driver-backed capabilities (Postgres, Redis, RabbitMQ/NATS, SMTP, OIDC/IAM, …) are **not shipped**
@@ -538,7 +539,7 @@ internal one. The sandboxed script cannot set `endpoint`; only operator config c
 
 `config.s3` (trusted, caller-supplied in the request — the sandboxed script can never
 set the endpoint; unlike the driver-backed capabilities it stays in-engine, so it is
-**not** a `fabricd` resource). Works with any SigV4 store — AWS S3, Cloudflare R2,
+**not** a broker resource). Works with any SigV4 store — AWS S3, Cloudflare R2,
 MinIO, Backblaze B2, DigitalOcean Spaces:
 
 ```json
@@ -872,7 +873,7 @@ Optional `config.json` in the working directory. All fields have defaults:
     "max_concurrent_executions": 0
   },
   "scripts_dir": "scripts",
-  "fabricd_socket": "/tmp/fabricd.sock"
+  "broker_socket": "/tmp/fabricd.sock"
 }
 ```
 
@@ -897,8 +898,8 @@ Optional `config.json` in the working directory. All fields have defaults:
 | `modules_dir`                  | _(unset)_     | Directory of injectable ES modules for handler `import`. Unset = `import` never resolves. See [ES modules](#es-modules-import--export).                                                                                                                                                                                        |
 | `access_token`                 | _(unset)_     | Shared-secret bearer token gating `/execute` (constant-time compared); `/health` and `/metrics` stay open. Required on a non-loopback bind unless `allow_unauthenticated` is set.                                                                                                                                               |
 | `allow_unauthenticated`        | `false`       | Explicit opt-out: allow a non-loopback bind with no `access_token` (auth terminated upstream). Without it, an exposed tokenless bind **refuses to start** (fail-closed).                                                                                                                                                        |
-| `fabricd_socket`               | _(unset)_     | Path to the `fabricd` egress sidecar's Unix socket. **Required for any broker-resolved `io` resource** — `fabricd` holds the `resources` credential table; the box only forwards `config.io` names. Unset + a broker request ⇒ `503 EGRESS_UNAVAILABLE`.                                  |
-| `fabricd_quic`                 | _(unset)_     | Remote `fabricd` over QUIC (alternative to `fabricd_socket`): `{ replicas, server_name, server_cert_pin, auth_token \| auth_token_file }`. The box pins the daemon cert by SHA-256 fingerprint and presents an auth token. See [`docs/design/network-fabric.md`](docs/design/network-fabric.md).                                |
+| `broker_socket`                | _(unset)_     | Path to the egress broker's Unix socket. **Required for any broker-resolved `io` resource** — the broker holds the `resources` credential table; the box only forwards `config.io` names. Unset + a broker request ⇒ `503 EGRESS_UNAVAILABLE`.                                  |
+| `broker_quic`                  | _(unset)_     | Remote broker over QUIC (alternative to `broker_socket`): `{ replicas, server_name, server_cert_pin, auth_token \| auth_token_file }`. The box pins the daemon cert by SHA-256 fingerprint and presents an auth token. See [`docs/design/network-fabric.md`](docs/design/network-fabric.md).                                |
 | `local_resources`              | _(none)_      | Box-direct `io` bindings: logical name → `{ url }` co-located **loopback** endpoint the box POSTs the `{action, payload}` envelope to directly (no broker). Loopback/private only — the boot guard refuses a remote binding. A listed `config.io` name bound here resolves box-direct; any other forwards to the broker.        |
 | `trusted`                      | _(off)_       | Trusted-identity ("nexus edge") mode: `{ enabled, assert_network_isolation, headers, capability_entitlements, quota }`. Derives tenant/user identity from edge-injected headers; refuses an exposed bind unless isolation is asserted. See [`docs/design/multitenant-trust.md`](docs/design/multitenant-trust.md).              |
 | `telemetry`                    | _(off)_       | Tracing/logging: `{ otlp_endpoint, sample_ratio, service_name }`. No `otlp_endpoint` (default) = structured JSON logs only, no OTLP export.                                                                                                                                                                                     |

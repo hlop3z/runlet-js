@@ -9,7 +9,7 @@ services:
     restart: unless-stopped
 
   # Driver-backed capabilities (db/mongo/mail/redis/amq/auth) additionally need the
-  # `fabricd` egress sidecar — it holds the credential table (resources config) and
+  # `fabricd` egress broker — it holds the credential table (resources config) and
   # all the network drivers; the box only forwards logical names from `config.io`.
   # Without it, requests naming a driver resource get `503 EGRESS_UNAVAILABLE`;
   # deterministic / `http` / `s3` requests work with the box alone.
@@ -17,7 +17,7 @@ services:
   # No prebuilt fabricd image is published yet — build it from its own repo
   # (github.com/hlop3z/fabricd) and uncomment, sharing the UDS socket dir
   # with the box: add `- fabricd-sock:/run/fabricd` to the jsbox volumes too, and
-  # set `"fabricd_socket": "/run/fabricd/fabricd.sock"` in config.json.
+  # set `"broker_socket": "/run/fabricd/fabricd.sock"` in config.json.
   # Credentials: copy the fabricd repo's fabricd.example.json -> fabricd.json
   # (gitignored) and fill in real values. See docs/deployment.md §5.
   #

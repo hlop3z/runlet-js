@@ -159,7 +159,7 @@ def start_stack(engine_overrides: dict, ceiling_ms: int) -> list:
         "debug": True,
         "server": {"host": "127.0.0.1", "port": 3000},
         "engine": engine_overrides,
-        "fabricd_socket": socket,
+        "broker_socket": socket,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(box_cfg, fh)

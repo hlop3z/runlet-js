@@ -4,7 +4,7 @@
 //! `local_resources` map resolves **box-direct**: the box POSTs the identical `{action, payload}`
 //! envelope a broker would receive in `WireCall` to the configured co-located loopback endpoint,
 //! using a shared `reqwest` client — no broker session, no credentials. Any other named name
-//! forwards to the broker ([`SidecarEgress`]). Both paths run through the same capability-mux
+//! forwards to the broker ([`BrokerEgress`]). Both paths run through the same capability-mux
 //! invariants (the request allowlist, `meta.io.<name>` metering, the execution deadline,
 //! fail-closed).
 //!
@@ -27,7 +27,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use crate::sidecar::SidecarEgress;
+use crate::broker::BrokerEgress;
 
 /// Per-op metric for one box-direct local call, surfaced in `meta.io.<name>` exactly like the
 /// broker's per-capability metrics (so box-direct and broker resolution meter identically).
@@ -69,7 +69,7 @@ pub(crate) struct BoxEgress {
     deadline: Instant,
     /// The broker session for non-local names; `None` when the request named only box-direct
     /// resources (no broker session was opened).
-    broker: Option<Arc<SidecarEgress>>,
+    broker: Option<Arc<BrokerEgress>>,
     /// Box-direct per-op metrics, keyed by logical name — drained into `meta.io.<name>`.
     metrics: Mutex<BTreeMap<String, Vec<LocalIoMetric>>>,
 }
@@ -82,7 +82,7 @@ impl BoxEgress {
         client: Client,
         handle: Handle,
         budget: Duration,
-        broker: Option<Arc<SidecarEgress>>,
+        broker: Option<Arc<BrokerEgress>>,
     ) -> Self {
         let deadline = Instant::now()
             .checked_add(budget)

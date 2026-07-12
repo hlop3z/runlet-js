@@ -1,9 +1,9 @@
-//! The box↔`fabricd` egress wire contract: the per-capability metric types, the session
+//! The box↔broker egress wire contract: the per-capability metric types, the session
 //! protocol, and the length-prefixed JSON framing.
 //!
 //! This lives in `runlet-wire` (not `fabric-backends`) so the sandbox box links it **without** any
 //! driver: after the trust flip the box sends only logical resource *names*, then reads back
-//! results and metrics, while `fabricd` (which links the drivers) resolves the names to operator
+//! results and metrics, while the broker (which links the drivers) resolves the names to operator
 //! configs. One client connection = one box-request session — an `Init` (a **flat list of logical
 //! names** + deadline), then one `Call` (name, action, payload) per `io.call(...)`, then a `Drain`
 //! for the metrics. See `docs/design/resource-egress.md`.
@@ -30,7 +30,7 @@ const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 // -- Per-capability metric types --------------------------------------------
 //
 // Plain serde data (no driver types), so they live here and the box can deserialize them into the
-// response `meta.<cap>_requests` without linking the drivers. `fabricd`'s backends construct them.
+// response `meta.<cap>_requests` without linking the drivers. The broker's backends construct them.
 
 /// Metric recorded for each `db` operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,7 +176,7 @@ pub trait MeteredEgress: Egress {
 /// + deadline.
 ///
 /// The box is **kind-blind** and holds no credentials — it forwards only the logical names the
-/// request listed in `config.io`; `fabricd` resolves each name against its operator config (name →
+/// request listed in `config.io`; the broker resolves each name against its operator config (name →
 /// kind → endpoint → creds). An empty `resources` = no egress requested this session; `timeout_ms`
 /// is the per-execution wall-clock budget (the per-op client-side deadline).
 ///
@@ -187,21 +187,21 @@ pub trait MeteredEgress: Egress {
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct WireInit {
     /// The flat list of logical resource names this session may address (the request's `config.io`
-    /// allowlist). The box forwards names only; `fabricd` resolves each to its kind/endpoint/creds
+    /// allowlist). The box forwards names only; the broker resolves each to its kind/endpoint/creds
     /// operator-side. Never per-kind slots (D3).
     #[serde(default)]
     pub resources: Vec<String>,
     /// Per-execution wall-clock budget in milliseconds (the per-op client-side deadline).
     pub timeout_ms: u64,
     /// The request's **trusted** tenant id (the acting-workspace id the edge authorized), forwarded
-    /// so `fabricd` can scope name resolution to that tenant's binding set. `None` on the
+    /// so the broker can scope name resolution to that tenant's binding set. `None` on the
     /// single-tenant/loopback path (no trusted identity). Sourced only from the trusted-header
     /// extractor — never from anything the executing script can influence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
     /// Opaque client-auth credential proving the box may pull credentials — a static shared
     /// secret or a k8s projected `ServiceAccount` token. `None` on the local UDS path (filesystem
-    /// permissions gate it); set on the remote QUIC path, where `fabricd` validates it *before*
+    /// permissions gate it); set on the remote QUIC path, where the broker validates it *before*
     /// resolving any name. Carried in the handshake so it costs no extra round-trip. Treated as a
     /// secret: never logged. See `docs/design/network-fabric.md` (QUIC remote transport).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,7 +228,7 @@ impl fmt::Debug for WireInit {
 /// One egress call: the logical resource name, action, and the script's JSON payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireCall {
-    /// Logical resource name (`"orders"`, `"cache"`, …) — `fabricd` resolves it to a kind/backend.
+    /// Logical resource name (`"orders"`, `"cache"`, …) — the broker resolves it to a kind/backend.
     pub name: String,
     /// Action (`"query"`, `"send"`, …).
     pub action: String,

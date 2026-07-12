@@ -18,10 +18,10 @@ use runlet_core::s3::S3Config;
 use runlet_core::sys::SysConfig;
 use runlet_wire::wire::WireInit;
 
+use crate::broker::BrokerTransport;
 use crate::config::{BatchConfig, TrustedHeaders};
 use crate::events::Sink;
 use crate::quota::TenantQuota;
-use crate::sidecar::SidecarTransport;
 
 /// Shared application state for the router: the logic host, the script registry, and
 /// the concurrency bulkhead.
@@ -44,12 +44,12 @@ pub(crate) struct AppState {
     /// disabled. Acquired *before* the global bulkhead so a noisy partition fast-fails on its
     /// own share (`429 PARTITION_OVERLOADED`) while global capacity stays free for others.
     pub(crate) partition_limiter: Option<PartitionLimiter>,
-    /// How the box reaches the `fabricd` egress sidecar (local UDS, remote QUIC, or none). The box
+    /// How the box reaches the egress broker (local UDS, remote QUIC, or none). The box
     /// links no driver and holds no credentials: a request that names a driver resource in
-    /// `config.io` opens a session over this transport to `fabricd`, which resolves the name against
-    /// its own operator config and performs the I/O. [`SidecarTransport::None`] ⇒ driver
+    /// `config.io` opens a session over this transport to the broker, which resolves the name against
+    /// its own operator config and performs the I/O. [`BrokerTransport::None`] ⇒ driver
     /// capabilities are unavailable (`503 EGRESS_UNAVAILABLE`).
-    pub(crate) transport: SidecarTransport,
+    pub(crate) transport: BrokerTransport,
     /// Box-direct local egress bindings (byo-capabilities D8): logical resource name → co-located
     /// loopback endpoint URL. A name in `config.io` bound here resolves **box-direct** (a POST of the
     /// `{action, payload}` envelope) instead of forwarding to the broker; empty = every name forwards
@@ -180,7 +180,7 @@ impl ScriptSource {
 /// Per-request configuration sent by the caller.
 ///
 /// Driver-backed capabilities carry no connection config here: the request names logical resources
-/// in [`io`](Self::io) and the box forwards those names to `fabricd`, which resolves the
+/// in [`io`](Self::io) and the box forwards those names to the broker, which resolves the
 /// endpoint/credentials operator-side. `http` (`allowed_hosts`) and `s3` stay
 /// script-controlled/in-engine and keep their config.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -195,7 +195,7 @@ pub(crate) struct RequestConfig {
     #[serde(default)]
     pub(crate) sys: Option<SysConfig>,
     /// Logical resources this invocation may reach — a plain allowlist of names (e.g.
-    /// `["orders","cache"]`). The box is kind-blind: it forwards the names to `fabricd` (which
+    /// `["orders","cache"]`). The box is kind-blind: it forwards the names to the broker (which
     /// resolves each to a kind/endpoint/creds) or, for a name the operator bound box-direct, POSTs
     /// to the co-located endpoint. The request never carries endpoints or credentials.
     #[serde(default)]
@@ -231,7 +231,7 @@ impl RequestIo {
 
     /// The names that must be resolved by the **broker** — every allowlisted name not bound
     /// box-direct in the global `local_resources` map. Box-direct names are served locally, so they
-    /// are never sent to `fabricd` (which would fail to resolve them).
+    /// are never sent to the broker (which would fail to resolve them).
     pub(crate) fn broker_names(&self, local: &HashMap<String, String>) -> Vec<String> {
         self.0
             .iter()
@@ -241,9 +241,9 @@ impl RequestIo {
     }
 }
 
-/// The `fabricd` session-open message: the flat list of broker-resolved resource names, the
-/// per-execution deadline, and the request's trusted tenant id (so `fabricd` scopes resolution to
-/// that tenant's bindings). `fabricd` resolves each name against its operator config.
+/// The broker session-open message: the flat list of broker-resolved resource names, the
+/// per-execution deadline, and the request's trusted tenant id (so the broker scopes resolution to
+/// that tenant's bindings). the broker resolves each name against its operator config.
 pub(crate) fn wire_init(
     resources: Vec<String>,
     timeout: Duration,
@@ -254,7 +254,7 @@ pub(crate) fn wire_init(
         timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         // The trusted tenant id, sourced only from the trusted-header extractor (never the script).
         // `None` on the single-tenant/loopback path. Its **presence** is itself the multitenant
-        // signal: `fabricd` treats any tenant-scoped session as least-privilege-mandatory (the
+        // signal: the broker treats any tenant-scoped session as least-privilege-mandatory (the
         // `allow_privileged` opt-out is void), so the box carries no separate privilege flag. See
         // `docs/design/resource-egress.md` (least-privilege / trust model).
         tenant: tenant.map(str::to_owned),

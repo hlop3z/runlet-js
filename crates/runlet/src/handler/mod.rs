@@ -21,8 +21,8 @@ use runlet_core::host::{CapabilitySet, Invocation, LogicHost, Outcome};
 use runlet_core::sandbox;
 use runlet_wire::{Egress, MeteredEgress};
 
+use crate::broker::{BrokerEgress, SessionConn, connect_session};
 use crate::local_io::BoxEgress;
-use crate::sidecar::{SessionConn, SidecarEgress, connect_session};
 
 mod batch;
 mod batch_items;
@@ -245,11 +245,11 @@ pub(crate) async fn run_execute(
         }
     };
 
-    // Open the `fabricd` egress session only for names the broker must resolve — every allowlisted
+    // Open the broker egress session only for names the broker must resolve — every allowlisted
     // name **not** bound box-direct in the global `local_resources` map (D8). A box-direct-only
     // request opens no broker session. The box holds no credentials: it sends the broker names + the
-    // trusted tenant id; `fabricd` resolves them within that tenant's binding set. An unknown/
-    // out-of-tenant name (400), or an unreachable/absent sidecar (503), is rejected here — before
+    // trusted tenant id; the broker resolves them within that tenant's binding set. An unknown/
+    // out-of-tenant name (400), or an unreachable/absent broker (503), is rejected here — before
     // admission.
     let broker_names = config.io.broker_names(&state.local_resources);
     let session = if broker_names.is_empty() {
@@ -333,11 +333,11 @@ pub(crate) async fn run_execute(
 pub(crate) struct ExecuteBlocking {
     /// The callable logic host (cloned per invocation; `Arc`-backed).
     host: LogicHost,
-    /// Runtime handle to drive the sidecar socket I/O via `block_on` on the blocking thread.
+    /// Runtime handle to drive the broker socket I/O via `block_on` on the blocking thread.
     handle: Handle,
     /// Per-execution wall-clock budget bounding every egress round-trip.
     timeout: Duration,
-    /// The pre-connected `fabricd` session, when the request named broker-resolved resources.
+    /// The pre-connected broker session, when the request named broker-resolved resources.
     session: Option<SessionConn>,
     /// Box-direct local egress bindings (name → loopback URL), consulted before the broker (D8).
     local_resources: Arc<HashMap<String, String>>,
@@ -361,7 +361,7 @@ pub(crate) struct ExecuteBlocking {
 }
 
 /// Runs one invocation to completion on a blocking thread — the shared execute core for `/execute`
-/// and each `/batch` item. Wraps the pre-connected `fabricd` session as the egress, runs the
+/// and each `/batch` item. Wraps the pre-connected broker session as the egress, runs the
 /// invocation under the full-capability profile, then drains the session's driver metrics (the
 /// round-trips + drain `block_on` must run on the `spawn_blocking` thread, never a runtime worker).
 pub(crate) async fn execute_blocking(
@@ -382,12 +382,11 @@ pub(crate) async fn execute_blocking(
         default_currency,
     } = params;
     task::spawn_blocking(move || -> (Result<Outcome, EngineError>, EgressMetrics) {
-        // The broker session (if any) is wrapped as a `SidecarEgress`, then composed with the
+        // The broker session (if any) is wrapped as a `BrokerEgress`, then composed with the
         // box-direct bindings into a single `BoxEgress` (D8): a listed local name resolves
         // box-direct, everything else forwards to the broker. The `io` port is wired whenever the
         // request named any resource; a box-direct-only request opened no broker session.
-        let broker =
-            session.map(|conn| Arc::new(SidecarEgress::new(conn, handle.clone(), timeout)));
+        let broker = session.map(|conn| Arc::new(BrokerEgress::new(conn, handle.clone(), timeout)));
         let box_egress = config.io.any().then(|| {
             Arc::new(BoxEgress::new(
                 Arc::clone(&local_resources),

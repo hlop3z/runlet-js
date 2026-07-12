@@ -8,7 +8,7 @@
 //!
 //! The response-envelope side of the taxonomy (`ErrorSource`, `ErrorCategory`, `ErrorEnvelope`,
 //! the throwing-capability `capability_fault_json`) stays in `runlet-core` — it is HTTP-front /
-//! assembly concern, not part of the wire contract a sidecar needs.
+//! assembly concern, not part of the wire contract a broker needs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -92,7 +92,7 @@ const FALLBACK_DYNAMIC_FAULT_JSON: &str = r#"{"error":"internal error","code":"I
 
 /// Builds the `__runlet` tag JSON for a [`crate::egress::Egress`] port failure.
 ///
-/// A egress's `source`/`code`/`owner` are supplied dynamically (by the sidecar / adapter)
+/// A egress's `source`/`code`/`owner` are supplied dynamically (by the broker / adapter)
 /// rather than from a static per-capability [`Fault`]. Produces the
 /// `{ error, code, retryable, owner, source, details? }` shape the engine classifies.
 #[must_use]

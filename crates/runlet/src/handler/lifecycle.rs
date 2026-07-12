@@ -15,8 +15,8 @@ use runlet_core::host::Outcome;
 use runlet_core::metrics::Metrics;
 use runlet_core::sandbox;
 
+use crate::broker::connect_session;
 use crate::identity::TrustedIdentity;
-use crate::sidecar::connect_session;
 
 use super::{
     AppState, BatchEnv, BatchItem, EgressMetrics, Envelope, ExecuteBlocking, Meta, RAW_NULL,

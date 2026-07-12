@@ -18,9 +18,9 @@ use runlet_core::metrics::Metrics;
 use runlet_core::sandbox;
 
 use crate::authz::authorize_capabilities;
+use crate::broker::connect_session;
 use crate::identity::TrustedIdentity;
 use crate::quota::QuotaGuard;
-use crate::sidecar::connect_session;
 
 use super::{
     AppState, BatchItem, EgressMetrics, Envelope, ExecuteBlocking, ItemErrorEnvelope,
@@ -391,7 +391,7 @@ pub(crate) async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         }
     };
 
-    // Open the fabricd session only for broker-resolved names (box-direct names are served locally).
+    // Open the broker session only for broker-resolved names (box-direct names are served locally).
     let broker_names = config.io.broker_names(&state.local_resources);
     let session = if broker_names.is_empty() {
         None

@@ -67,7 +67,7 @@ A sandboxed JavaScript execution service in Rust. Clients `POST /execute` a JS
 context and returns `{data, error, meta}`. The single endpoint is the whole product.
 
 **Two repos, one contract.** This repo (`runlet-js`) is the box and is fully self-contained:
-it links no vendor driver and holds no credentials. The egress sidecar **`fabricd`** and the
+it links no vendor driver and holds no credentials. The egress broker **`fabricd`** and the
 driver bag **`fabric-backends`** live in their own repo (`github.com/hlop3z/fabricd`, expected
 as a sibling checkout `../fabricd` for dev/tests) and are **replaceable at any time**: this
 repo owns the entire contract (`crates/runlet-wire`), and anything that speaks it can stand in
@@ -111,12 +111,12 @@ for `fabricd`. Nothing here depends on the fabricd repo — the dependency point
   (`local_io::BoxEgress` — box-direct HTTP POST of the identical `{action, payload}` envelope, no
   broker, no creds; guarded to loopback/private by the `Config::check_local_resources` boot guard),
   else over
-  a `fabricd` session on a **local UDS or a remote QUIC link** (`sidecar::SidecarEgress`, transport
-  chosen by config — `fabricd_socket` vs `fabricd_quic`), forwarding the logical name for `fabricd` to
+  a broker session on a **local UDS or a remote QUIC link** (`broker::BrokerEgress`, transport
+  chosen by config — `broker_socket` vs `broker_quic`), forwarding the logical name for the broker to
   resolve to a kind+endpoint+credentials. On the QUIC path the box pins the
   daemon cert by fingerprint and presents an auth token (`BoxAuth`: static secret or a re-read k8s
-  SA-token file). No sidecar configured + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.
-  Deterministic/`http`/`s3` requests need no sidecar. Prometheus metric names use the `runlet_*`
+  SA-token file). No broker configured + a driver request ⇒ `503 EGRESS_UNAVAILABLE`.
+  Deterministic/`http`/`s3` requests need no broker. Prometheus metric names use the `runlet_*`
   prefix and the internal capability-error wire tag is `__runlet`. **Observability is three signals,
   hybrid transport** (`telemetry.rs`, opt-in `config.telemetry`): metrics stay Prometheus **PULL**
   (`/metrics`), logs are structured **JSON to stdout**, and each `/execute` is an OpenTelemetry span
@@ -138,7 +138,7 @@ for `fabricd`. Nothing here depends on the fabricd repo — the dependency point
   `docs/design/multitenant-trust.md`.
 
 **In the sibling repo** (`github.com/hlop3z/fabricd`): **`fabricd`** — now an **optional reference
-broker** (demoted from shipped-core on byo-capabilities): the egress sidecar (bin) holding the
+broker** (demoted from shipped-core on byo-capabilities): the egress broker (bin) holding the
 operator credential table and **all** the vendor drivers (via its `fabric-backends` crate), hosting a
 `BackendSet` per session behind the `runlet-wire` protocol over UDS or QUIC. It resolves the flat
 `WireInit.resources` names → kind → endpoint → credentials (the `mongo` driver + `mongocrypt` are
@@ -156,7 +156,7 @@ The project uses [Task](https://taskfile.dev) (`Taskfile.yml`). Raw `cargo` equi
 - **Format:** `task fmt` / `task fmt-check`
 - **Lint:** `task clippy` (`cargo clippy`) — see the lint warning below
 - **Unit tests:** `cargo test`
-- **Integration tests:** `task test-backends-up` (starts the box's only test backend — a local httpbin — via `docker compose`), then `python tests/test_simple.py`. The suite is **box-only and self-contained**: it links no driver, needs no `fabricd` sidecar, and no `../fabricd` checkout. The HTTP `api` tests hit the local `httpbin` service (host `:8095`, env-overridable `HTTPBIN_URL`) — hermetic, no httpbin.org dependency; note go-httpbin echoes headers as **arrays**, and reaching it requires `debug: true` (SSRF private-IP relax). The Python harness **starts its own box** with `cargo run` (generating `.test-run/config.json` with `debug: true` + `scripts_dir=tests/scripts`), so don't run one separately; the box-direct/trusted/telemetry/events sections each spin up their own dedicated loopback box. It is a custom runner (not pytest) — there is no per-test name filter; edit `main()` in `tests/test_simple.py` to narrow what runs. The **fail-closed egress invariant** (no sidecar + an `io` request ⇒ `503 EGRESS_UNAVAILABLE`) is covered by Rust unit tests in `crates/runlet/src/sidecar.rs` + `handler.rs`, not this harness.
+- **Integration tests:** `task test-backends-up` (starts the box's only test backend — a local httpbin — via `docker compose`), then `python tests/test_simple.py`. The suite is **box-only and self-contained**: it links no driver, needs no broker, and no `../fabricd` checkout. The HTTP `api` tests hit the local `httpbin` service (host `:8095`, env-overridable `HTTPBIN_URL`) — hermetic, no httpbin.org dependency; note go-httpbin echoes headers as **arrays**, and reaching it requires `debug: true` (SSRF private-IP relax). The Python harness **starts its own box** with `cargo run` (generating `.test-run/config.json` with `debug: true` + `scripts_dir=tests/scripts`), so don't run one separately; the box-direct/trusted/telemetry/events sections each spin up their own dedicated loopback box. It is a custom runner (not pytest) — there is no per-test name filter; edit `main()` in `tests/test_simple.py` to narrow what runs. The **fail-closed egress invariant** (no broker + an `io` request ⇒ `503 EGRESS_UNAVAILABLE`) is covered by Rust unit tests in `crates/runlet/src/broker.rs` + `handler.rs`, not this harness.
   - **Real-driver conformance moved to the `fabricd` repo.** The former db/nats/auth/pgbouncer/pooler/breaker sections tested `fabricd`'s drivers *through* the box; they now live in the sibling `fabricd` repo as its own conformance suite (`fabricd/docker-compose.yml` + `docs/driver-conformance.md`), asserted against the `runlet-wire` contract it already depends on. This repo owns the contract; `fabricd` proves it conforms.
 - **Everything:** `task` (fmt-check + clippy + tests + supply-chain) · `task check` (no supply-chain)
 - **Supply chain:** `task supply-chain` (cargo-audit + cargo-deny + cargo-vet; install via `task setup`). cargo-vet is initialized (`supply-chain/`): the dep tree is covered by imported third-party audit sets (Mozilla/Google/Bytecode Alliance/Embark/Zcash/ISRG) with the remainder as `exemptions` — a new/bumped dep that isn't audited or exempted fails `cargo vet`, so re-run it after dependency changes and `cargo vet prune` / add an exemption as needed. **cargo-vet is version-pinned in lockstep between `task setup` (Taskfile) and CI (`ci.yml`), currently 0.10.2** — the `imports.lock` format changes across versions (0.10.2 writes `trusted-publisher` entries that 0.10.0, the last prebuilt GitHub release, cannot parse), so bump both places together or CI fails on a lock file the local tool wrote.

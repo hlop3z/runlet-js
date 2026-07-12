@@ -3,12 +3,10 @@
 ## Purpose
 
 Tenant-scoped egress isolation: the box forwards the request's trusted tenant identity in the
-box↔`fabricd` session handshake, and `fabricd` resolves logical resource names only within that
+box↔broker session handshake, and the broker resolves logical resource names only within that
 tenant's authorized binding set — so credentials and resources never cross workspace boundaries.
 Rationale: `docs/design/multitenant-trust.md`, `docs/design/resource-egress.md`.
-
 ## Requirements
-
 ### Requirement: Logical resource names on the egress session
 
 Egress SHALL address a **flat list of logical resource names**. The request SHALL declare the names
@@ -36,13 +34,13 @@ from `config.io` SHALL be rejected.
 
 ### Requirement: Tenant identity carried on the egress session
 
-The box SHALL include the request's trusted tenant identity in the `fabricd` session
-handshake (`WireInit`) when opening an egress session, so the daemon can scope resolution to
+The box SHALL include the request's trusted tenant identity in the broker session
+handshake (`WireInit`) when opening an egress session, so the broker can scope resolution to
 that tenant. The tenant identity SHALL never be sourced from a value the executing script can
 influence. The **presence** of a trusted tenant identity on the session SHALL itself mark the
 session as the untrusted-tenant (multitenant/nexus) context — the trigger for the least-privilege
 mandate below. The box SHALL NOT add any separate privilege signal to the handshake: the wire
-contract is unchanged, and the daemon derives the mandate from the tenant identity it already
+contract is unchanged, and the broker derives the mandate from the tenant identity it already
 receives.
 
 #### Scenario: Session opens with the trusted tenant id
@@ -59,7 +57,7 @@ receives.
 
 - **WHEN** a session opens carrying a trusted tenant identity
 - **THEN** that session is the multitenant context for the least-privilege mandate, derived by
-  the daemon from the tenant identity alone (no additional handshake field)
+  the broker from the tenant identity alone (no additional handshake field)
 
 #### Scenario: Single-tenant session is not a multitenant context
 
@@ -159,7 +157,7 @@ service can be moved between box-direct and broker resolution with no change to 
 
 The box SHALL refuse with a retryable `503 EGRESS_UNAVAILABLE`, before any egress executes, when a
 request addresses an allowlisted `io` logical name but no egress backend can serve it — neither an
-operator-declared box-direct `local_resources` binding nor a configured, reachable `fabricd` sidecar
+operator-declared box-direct `local_resources` binding nor a configured, reachable egress broker
 (over UDS or QUIC). The box MUST NOT fall back to any ambient network path. This decision is made at
 session-open (before the blocking execution is admitted), so a hung or absent broker is bounded
 rather than silently degraded.
@@ -167,10 +165,10 @@ rather than silently degraded.
 This requirement promotes an invariant previously stated only in prose ("fail-closed") into a
 testable behavioral contract; it does not change existing behavior.
 
-#### Scenario: Allowlisted name, no sidecar and no box-direct binding
+#### Scenario: Allowlisted name, no broker and no box-direct binding
 
 - **WHEN** a request lists a logical name in `config.io` that resolves neither to a box-direct
-  `local_resources` binding nor to any configured `fabricd` sidecar
+  `local_resources` binding nor to any configured egress broker
 - **THEN** the box returns `503` with error code `EGRESS_UNAVAILABLE` and executes no egress call
 
 #### Scenario: The refusal is retryable
@@ -188,5 +186,6 @@ testable behavioral contract; it does not change existing behavior.
 #### Scenario: Non-egress requests are unaffected
 
 - **WHEN** a request performs no `io` egress (deterministic work, or only `http`/`s3` built-ins)
-- **THEN** the absence of a configured `fabricd` sidecar does not cause an `EGRESS_UNAVAILABLE`
+- **THEN** the absence of a configured egress broker does not cause an `EGRESS_UNAVAILABLE`
   refusal and the request executes normally
+

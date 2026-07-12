@@ -448,9 +448,9 @@ def test_meta(t: Runner):
 def test_status_projection(t: Runner):
     """The HTTP status line is a truthful projection of the outcome (docs/99-errors.md): `2xx`
     **iff** `error` is null, `retryable => 5xx` (+ `Retry-After`), non-retryable `=> 4xx`, and
-    **never `429`**. Covers every path reachable without a `fabricd` sidecar; capability-error
+    **never `429`**. Covers every path reachable without a broker; capability-error
     projection (a driver throw ⇒ `503`/`4xx`) is asserted in the driver sections, which self-skip
-    when no sidecar is present."""
+    when no broker is present."""
     t.section("HTTP status projection")
 
     def rget(hdrs, name):
@@ -1205,7 +1205,7 @@ def _start_servers() -> list:
     """Start a single `runlet` box in `.test-run/` for the box-owned tests. Driver-backed egress is
     gone from this suite (real-driver conformance lives in the `fabricd` repo, see
     docs/design/tenant-egress and docs/design/resource-egress.md); the box links no driver and needs
-    no sidecar. Returns the started process (caller terminates it)."""
+    no broker. Returns the started process (caller terminates it)."""
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(repo, ".test-run")
     os.makedirs(run_dir, exist_ok=True)
@@ -1220,7 +1220,7 @@ def _start_servers() -> list:
         if os.path.isdir(src):
             shutil.copytree(src, merged_modules, dirs_exist_ok=True)
 
-    # Box config: scripts/modules + low bounds. NO fabricd sidecar, NO `resources`, NO credentials.
+    # Box config: scripts/modules + low bounds. NO broker, NO `resources`, NO credentials.
     # debug=true relaxes the SSRF private-IP block so the `api` tests can reach the local httpbin.
     box_cfg = {
         "debug": True,
@@ -1244,7 +1244,7 @@ def _start_servers() -> list:
 
 def _start_trusted_box(port: int = 3010):
     """Start a dedicated `runlet` in trusted-header mode on a loopback port, for the N5 acting-org
-    gate. No `fabricd` is needed â€” the gate fires before any egress session, and the probe script is
+    gate. No broker is needed â€” the gate fires before any egress session, and the probe script is
     deterministic. Loopback needs no `assert_network_isolation`. Returns `(proc, base_url)` or
     `(None, None)` if the box could not be built/started (the caller self-skips)."""
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

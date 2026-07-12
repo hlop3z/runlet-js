@@ -16,9 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 runlet-core = { path = "../runlet-core" }
-# The box links NO network driver: it talks to the `fabricd` sidecar over UDS or QUIC using the
+# The box links NO network driver: it talks to the egress broker over UDS or QUIC using the
 # driver-free wire contract in `runlet-wire` (the `Egress` trait, the wire + QUIC transport, the
-# metric types). Credentials live in `fabricd`, never here.
+# metric types). Credentials live in the broker, never here.
 runlet-wire = { path = "../runlet-wire" }
 axum.workspace = true
 mimalloc.workspace = true
@@ -36,7 +36,7 @@ opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 uuid.workspace = true
 rustls.workspace = true
-# Remote `fabricd` over QUIC (`sidecar.rs`): the box holds the `quinn` client connection + streams.
+# Remote broker over QUIC (`broker.rs`): the box holds the `quinn` client connection + streams.
 quinn.workspace = true
 # Decodes the configured server-cert pin (hex SHA-256) for the QUIC client.
 hex.workspace = true

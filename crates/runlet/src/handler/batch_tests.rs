@@ -1,12 +1,12 @@
 //! `POST /batch` driven directly through the handler: order preservation + `id` echo, per-item
 //! isolation, partial failure, batch-level caps (empty / too-many / xor-key item), the D6
 //! response-size truncation, and — the D5 GraphQL-batch-attack guard — per-item authorization.
-//! Egress is not wired (no sidecar), so items run deterministic scripts.
+//! Egress is not wired (no broker), so items run deterministic scripts.
 
 use super::{AppState, BatchItem, BatchRequest, RequestConfig, RequestIo, TrustedRuntime, batch};
+use crate::broker::BrokerTransport;
 use crate::config::{BatchConfig, TrustedHeaders};
 use crate::quota::{PlanLimit, TenantQuota};
-use crate::sidecar::SidecarTransport;
 use axum::Json;
 use axum::body::to_bytes;
 use axum::extract::State;
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// Builds an app state with a small warm pool, no sidecar, and the given trusted runtime.
+/// Builds an app state with a small warm pool, no broker, and the given trusted runtime.
 fn state(trusted: Option<Arc<TrustedRuntime>>) -> AppState {
     let mut engine = EngineConfig::default();
     engine
@@ -47,7 +47,7 @@ fn state(trusted: Option<Arc<TrustedRuntime>>) -> AppState {
         error_debug: false,
         limiter: Arc::new(Semaphore::new(8)),
         partition_limiter: None,
-        transport: SidecarTransport::None,
+        transport: BrokerTransport::None,
         local_resources: Arc::new(HashMap::new()),
         local_client: reqwest::Client::new(),
         metrics: Arc::new(Metrics::default()),
@@ -511,7 +511,7 @@ async fn before_is_quota_gated() {
     );
 }
 
-/// 4.7b — Gates: I/O in `before` is gated exactly as for an item — with no sidecar, a `before`
+/// 4.7b — Gates: I/O in `before` is gated exactly as for an item — with no broker, a `before`
 /// naming a broker-resolved `io` resource fails closed (`EGRESS_UNAVAILABLE`), a barrier that runs
 /// no items. (The box HTTP front always runs the full profile; fail-closed egress is the box-level
 /// analogue of the spec's "profile denies I/O in lifecycle phases".)
@@ -530,7 +530,7 @@ async fn before_io_fails_closed() {
     assert_ne!(
         status,
         StatusCode::OK,
-        "no sidecar ⇒ before I/O fails closed"
+        "no broker ⇒ before I/O fails closed"
     );
     assert_eq!(body["error"]["code"], "EGRESS_UNAVAILABLE");
     assert!(body.get("results").is_none(), "the barrier runs no items");

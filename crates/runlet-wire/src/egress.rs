@@ -7,7 +7,7 @@
 //! error-classification path consumes it unchanged.
 //!
 //! This is the seam that lets driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
-//! `auth`) move out of the sandbox process and behind a sidecar — see
+//! `auth`) move out of the sandbox process and behind a broker — see
 //! `docs/design/resource-egress.md`. It lives in `runlet-wire` (not `runlet-core`) so the
 //! driver host (`fabric-backends`, eventually `fabricd`) can implement it without linking the
 //! sandbox.
@@ -43,7 +43,7 @@ pub trait Egress: Send + Sync {
 /// `source` should be a known capability tag (`"db"`, `"mongo"`, …) so the engine classifies
 /// the throw as a capability error; an unrecognized source degrades to a script error.
 ///
-/// `Serialize`/`Deserialize` so it round-trips a sidecar (`fabricd`) call result over the wire.
+/// `Serialize`/`Deserialize` so it round-trips a broker call result over the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EgressError {
     /// Stable machine code (e.g. `"DB_TIMEOUT"`).

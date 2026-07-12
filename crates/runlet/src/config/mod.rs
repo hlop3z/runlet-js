@@ -22,7 +22,7 @@ use crate::quota::PlanLimit;
 mod guards;
 
 /// Default `Retry-After` delay (seconds) attached to a retryable `503`/`500` when no
-/// circuit-breaker cool-down applies (the box's breakers live in `fabricd`, so this is the
+/// circuit-breaker cool-down applies (the box's breakers live in the broker, so this is the
 /// usual value). A short floor: the status already says "retry", the header only bounds the
 /// backoff — a generic worker adds its own jitter on top.
 const DEFAULT_RETRY_AFTER_SECONDS: u32 = 1;
@@ -82,21 +82,21 @@ pub(crate) struct Config {
     /// loopback bind never needs this.
     #[serde(default)]
     pub(crate) allow_unauthenticated: bool,
-    /// Path to the `fabricd` egress sidecar's Unix-domain socket. **Required** to use any
+    /// Path to the egress broker's Unix-domain socket. **Required** to use any
     /// driver-backed capability (`db`/`mongo`/`mail`/`redis`/`amq`/`auth`): the box links no
     /// driver and holds no credentials — it sends the request's `config.io` logical names to
-    /// `fabricd`, which resolves them against its own operator config and performs the I/O. Omit
+    /// the broker, which resolves them against its own operator config and performs the I/O. Omit
     /// when the deployment serves only deterministic / `http` / `s3` capabilities; a request that
-    /// names a driver resource with no `fabricd_socket` set is rejected `503 EGRESS_UNAVAILABLE`.
+    /// names a driver resource with no `broker_socket` set is rejected `503 EGRESS_UNAVAILABLE`.
     /// See `docs/design/resource-egress.md` step 5.
     #[serde(default)]
-    pub(crate) fabricd_socket: Option<String>,
-    /// Remote `fabricd` over QUIC — the alternative to `fabricd_socket` for a shared `fabricd`
-    /// cluster service on a different host. When set (and `fabricd_socket` is not), driver-backed
+    pub(crate) broker_socket: Option<String>,
+    /// Remote broker over QUIC — the alternative to `broker_socket` for a shared broker
+    /// cluster service on a different host. When set (and `broker_socket` is not), driver-backed
     /// capabilities route over QUIC to one of the configured replicas. See
     /// `docs/design/network-fabric.md` (QUIC remote transport).
     #[serde(default)]
-    pub(crate) fabricd_quic: Option<FabricdQuic>,
+    pub(crate) broker_quic: Option<BrokerQuic>,
     /// Box-direct local egress bindings (byo-capabilities D8): logical resource name → a co-located
     /// loopback endpoint the box POSTs the `{action, payload}` envelope to **directly**, without a
     /// broker. Operator-only (global config; never per-request, never script-influenced). A name in
@@ -167,8 +167,8 @@ impl Default for Config {
             modules_dir: None,
             access_token: None,
             allow_unauthenticated: false,
-            fabricd_socket: None,
-            fabricd_quic: None,
+            broker_socket: None,
+            broker_quic: None,
             local_resources: HashMap::new(),
             trusted: TrustedConfig::default(),
             telemetry: TelemetryConfig::default(),
@@ -406,15 +406,15 @@ pub(crate) struct LocalResource {
     pub(crate) url: String,
 }
 
-/// Remote-`fabricd` QUIC transport settings (the box client side).
+/// Remote-broker QUIC transport settings (the box client side).
 ///
 /// The box pins the daemon's self-signed certificate by fingerprint (no CA / cert manager) and
-/// presents an auth token; `fabricd` validates the token and resolves the logical names operator-
+/// presents an auth token; the broker validates the token and resolves the logical names operator-
 /// side. Exactly one of `auth_token` / `auth_token_file` is the credential; omit both only when the
 /// daemon's auth provider is disabled.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct FabricdQuic {
+pub(crate) struct BrokerQuic {
     /// Replica endpoints to dial (`host:port`); a headless-Service DNS name resolving to many pod
     /// addresses is tried in turn (client-side failover). At least one is required.
     pub(crate) replicas: Vec<String>,

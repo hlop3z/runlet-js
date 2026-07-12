@@ -1,17 +1,17 @@
-//! Box-side egress client for the `fabricd` sidecar — over a **local UDS** or a **remote QUIC**
-//! link.
+//! Box-side egress client for the egress broker (reference implementation: `fabricd`) — over a
+//! **local UDS** or a **remote QUIC** link.
 //!
 //! The box links no driver and holds no credentials: a request that names driver resources in
-//! `config.io` opens a session to `fabricd`, sends the selected logical *names* (+ a per-execution
-//! deadline and, on the QUIC path, an auth token), and forwards each `io.call(...)`; `fabricd`
+//! `config.io` opens a session to the broker, sends the selected logical *names* (+ a per-execution
+//! deadline and, on the QUIC path, an auth token), and forwards each `io.call(...)`; the broker
 //! resolves the names to operator credentials and performs the I/O.
 //!
 //! Two transports behind one [`SessionConn`]:
 //!
-//! - **UDS** (`SidecarTransport::Uds`) — the zero-config local default; filesystem permissions
+//! - **UDS** (`BrokerTransport::Uds`) — the zero-config local default; filesystem permissions
 //!   gate it, so no token is sent. Unix-only (tokio has no UDS elsewhere): on other platforms the
 //!   variant is compiled out and a configured socket is rejected at startup.
-//! - **QUIC** ([`SidecarTransport::Quic`]) — the remote path for a shared `fabricd` cluster
+//! - **QUIC** ([`BrokerTransport::Quic`]) — the remote path for a shared broker cluster
 //!   service. One client endpoint multiplexes a session per box-request as a bidirectional stream;
 //!   the box pins the daemon's self-signed cert and presents an auth token. The client keeps one
 //!   long-lived connection per healthy replica, **failing over** across the configured replica set
@@ -39,13 +39,13 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use crate::config::FabricdQuic;
+use crate::config::BrokerQuic;
 
-/// How the box reaches `fabricd`. Selected once at startup from config and shared (cheaply cloned)
+/// How the box reaches the broker. Selected once at startup from config and shared (cheaply cloned)
 /// into [`crate::handler::AppState`].
 #[derive(Debug, Clone)]
-pub(crate) enum SidecarTransport {
-    /// No sidecar configured — driver-backed capabilities are unavailable (`503`).
+pub(crate) enum BrokerTransport {
+    /// No broker configured — driver-backed capabilities are unavailable (`503`).
     None,
     /// Local Unix-domain socket (the zero-config default). Unix-only — tokio has no UDS elsewhere.
     #[cfg(unix)]
@@ -54,8 +54,8 @@ pub(crate) enum SidecarTransport {
     Quic(Arc<QuicClient>),
 }
 
-impl SidecarTransport {
-    /// Selects the transport from config: QUIC when `fabricd_quic` is set, else the local UDS
+impl BrokerTransport {
+    /// Selects the transport from config: QUIC when `broker_quic` is set, else the local UDS
     /// `socket`, else none. (QUIC wins when both are set — a remote broker supersedes a local
     /// socket.)
     ///
@@ -66,18 +66,18 @@ impl SidecarTransport {
     /// a platform without UDS support.
     pub(crate) fn from_config(
         socket: Option<&str>,
-        quic: Option<&FabricdQuic>,
+        quic: Option<&BrokerQuic>,
     ) -> Result<Self, IoError> {
         if let Some(quic_cfg) = quic {
             if quic_cfg.replicas.is_empty() {
-                return Err(IoError::other("fabricd_quic.replicas must not be empty"));
+                return Err(IoError::other("broker_quic.replicas must not be empty"));
             }
             return Ok(Self::Quic(Arc::new(QuicClient::from_config(quic_cfg)?)));
         }
         #[cfg(not(unix))]
         if socket.is_some() {
             return Err(IoError::other(
-                "fabricd_socket (UDS) is unsupported on this platform; use fabricd_quic",
+                "broker_socket (UDS) is unsupported on this platform; use broker_quic",
             ));
         }
         #[cfg(unix)]
@@ -98,7 +98,7 @@ impl SidecarTransport {
     }
 }
 
-/// How the box proves to a remote `fabricd` that it may pull credentials.
+/// How the box proves to a remote broker that it may pull credentials.
 #[derive(Debug, Clone)]
 pub(crate) enum BoxAuth {
     /// No token (only valid when the daemon's auth provider is disabled).
@@ -125,7 +125,7 @@ impl BoxAuth {
     }
 }
 
-/// A QUIC client for a shared `fabricd` cluster service: one endpoint (one local UDP socket) that
+/// A QUIC client for a shared broker cluster service: one endpoint (one local UDP socket) that
 /// trusts the daemon's pinned cert, the configured replica addresses, and the auth token. Holds one
 /// live [`Connection`] for reuse, reconnecting / failing over across replicas as needed.
 #[derive(Debug)]
@@ -162,7 +162,7 @@ impl QuicClient {
     ///
     /// Returns an error if the cert pin is malformed, both/neither auth source is set, or the
     /// endpoint can't be built.
-    fn from_config(quic: &FabricdQuic) -> Result<Self, IoError> {
+    fn from_config(quic: &BrokerQuic) -> Result<Self, IoError> {
         let pin = parse_pin(&quic.server_cert_pin)?;
         let bind: SocketAddr = "0.0.0.0:0".parse().map_err(IoError::other)?;
         let endpoint = client_endpoint(bind, pin)?;
@@ -228,7 +228,7 @@ impl QuicClient {
             }
         }
         Err(last_error
-            .unwrap_or_else(|| IoError::other("no fabricd replica addresses to connect to")))
+            .unwrap_or_else(|| IoError::other("no broker replica addresses to connect to")))
     }
 
     /// Dials one resolved replica address and completes the handshake.
@@ -241,10 +241,10 @@ impl QuicClient {
     }
 }
 
-/// Why opening a `fabricd` session failed — mapped by the handler to an HTTP status.
+/// Why opening a broker session failed — mapped by the handler to an HTTP status.
 #[derive(Debug)]
 pub(crate) enum SessionError {
-    /// No sidecar configured, or it couldn't be reached / handshaked → retryable `503`.
+    /// No broker configured, or it couldn't be reached / handshaked → retryable `503`.
     Unavailable(String),
     /// A requested resource name didn't resolve at `Init` → the caller's `400` (`code` is
     /// `RESOURCE_NOT_FOUND` / `RESOURCE_KIND_MISMATCH`).
@@ -258,7 +258,7 @@ pub(crate) enum SessionError {
     Protocol(String),
 }
 
-/// One box-request session connection to `fabricd`, over either transport. A QUIC session is one
+/// One box-request session connection to the broker, over either transport. A QUIC session is one
 /// bidirectional stream (separate send/recv halves); a UDS session is the duplex socket.
 #[derive(Debug)]
 pub(crate) enum SessionConn {
@@ -294,41 +294,41 @@ impl SessionConn {
     }
 }
 
-/// Opens a `fabricd` session over the configured transport and performs the [`WireInit`] handshake
+/// Opens a broker session over the configured transport and performs the [`WireInit`] handshake
 /// — sending the selected logical resource *names*, the deadline, and (on QUIC) the auth token, and
 /// surfacing a name-resolution failure as a [`SessionError`] the handler maps to a status.
 ///
 /// Async — run on the request's async task (no `block_on`), so a name-resolution `400` or an
-/// unreachable-sidecar `503` is decided before the blocking execution is admitted.
+/// unreachable-broker `503` is decided before the blocking execution is admitted.
 ///
 /// # Errors
 ///
 /// Returns a [`SessionError`]: `Unavailable` (no transport / unreachable / closed), `Resolve` (a
 /// name failed to resolve), or `Protocol` (an unexpected response).
 pub(crate) async fn connect_session(
-    transport: &SidecarTransport,
+    transport: &BrokerTransport,
     init: &WireInit,
 ) -> Result<SessionConn, SessionError> {
     match transport {
-        SidecarTransport::None => Err(SessionError::Unavailable(
-            "no fabricd egress sidecar configured".to_owned(),
+        BrokerTransport::None => Err(SessionError::Unavailable(
+            "no egress broker configured".to_owned(),
         )),
         #[cfg(unix)]
-        SidecarTransport::Uds(path) => {
+        BrokerTransport::Uds(path) => {
             let stream = UnixStream::connect(path.as_ref())
                 .await
-                .map_err(|err| SessionError::Unavailable(format!("fabricd unreachable: {err}")))?;
+                .map_err(|err| SessionError::Unavailable(format!("broker unreachable: {err}")))?;
             // UDS is gated by filesystem permissions — never send a token.
             handshake(SessionConn::Uds(stream), init).await
         }
-        SidecarTransport::Quic(client) => {
+        BrokerTransport::Quic(client) => {
             let token = client.auth.token().map_err(|err| {
                 SessionError::Unavailable(format!("auth token unreadable: {err}"))
             })?;
             let (send, recv) = client
                 .open_session()
                 .await
-                .map_err(|err| SessionError::Unavailable(format!("fabricd unreachable: {err}")))?;
+                .map_err(|err| SessionError::Unavailable(format!("broker unreachable: {err}")))?;
             let mut authed = init.clone();
             authed.token = token;
             handshake(SessionConn::Quic { send, recv }, &authed).await
@@ -340,7 +340,7 @@ pub(crate) async fn connect_session(
 async fn handshake(mut conn: SessionConn, init: &WireInit) -> Result<SessionConn, SessionError> {
     conn.write(&WireRequest::Init(Box::new(init.clone())))
         .await
-        .map_err(|err| SessionError::Unavailable(format!("fabricd write failed: {err}")))?;
+        .map_err(|err| SessionError::Unavailable(format!("broker write failed: {err}")))?;
     match conn.read().await {
         Ok(Some(WireResponse::Ack)) => Ok(conn),
         Ok(Some(WireResponse::InitError { code, message })) => {
@@ -352,17 +352,17 @@ async fn handshake(mut conn: SessionConn, init: &WireInit) -> Result<SessionConn
             "unexpected response to Init".to_owned(),
         )),
         Ok(None) => Err(SessionError::Unavailable(
-            "fabricd closed the connection during handshake".to_owned(),
+            "broker closed the connection during handshake".to_owned(),
         )),
         Err(err) => Err(SessionError::Unavailable(format!(
-            "fabricd handshake read failed: {err}"
+            "broker handshake read failed: {err}"
         ))),
     }
 }
 
-/// A box-request session to `fabricd` over an already-handshaked [`SessionConn`] (UDS or QUIC).
+/// A box-request session to the broker over an already-handshaked [`SessionConn`] (UDS or QUIC).
 #[derive(Debug)]
-pub(crate) struct SidecarEgress {
+pub(crate) struct BrokerEgress {
     /// Runtime handle to drive the socket I/O via `block_on` (on the `spawn_blocking` thread).
     handle: Handle,
     /// The session connection — `tokio::sync::Mutex` so the `&self` egress can take `&mut` access
@@ -372,7 +372,7 @@ pub(crate) struct SidecarEgress {
     deadline: Instant,
 }
 
-impl SidecarEgress {
+impl BrokerEgress {
     /// Wraps an already-handshaked session (from [`connect_session`]) and anchors the deadline.
     /// Build this on the `spawn_blocking` thread — its calls `block_on`.
     pub(crate) fn new(conn: SessionConn, handle: Handle, budget: Duration) -> Self {
@@ -387,7 +387,7 @@ impl SidecarEgress {
     }
 }
 
-impl Egress for SidecarEgress {
+impl Egress for BrokerEgress {
     fn call(&self, name: &str, action: &str, payload_json: &str) -> Result<String, EgressError> {
         let request = WireRequest::Call(WireCall {
             name: name.to_owned(),
@@ -414,14 +414,14 @@ impl Egress for SidecarEgress {
                 Err(_elapsed) => Err(transport_error(
                     &source,
                     "IO_TIMEOUT",
-                    "fabricd call exceeded the execution deadline",
+                    "broker call exceeded the execution deadline",
                 )),
             }
         })
     }
 }
 
-impl MeteredEgress for SidecarEgress {
+impl MeteredEgress for BrokerEgress {
     fn drain_metrics(&self) -> BackendMetrics {
         // Best-effort: a drain failure (daemon gone, protocol slip) just yields empty metrics — it
         // must never turn a successful execution into an error.
@@ -447,7 +447,7 @@ async fn roundtrip(conn: &mut SessionConn, request: &WireRequest) -> Result<Wire
     conn.write(request).await?;
     conn.read()
         .await?
-        .ok_or_else(|| IoError::new(ErrorKind::UnexpectedEof, "fabricd closed the connection"))
+        .ok_or_else(|| IoError::new(ErrorKind::UnexpectedEof, "broker closed the connection"))
 }
 
 /// Builds a transport/protocol error tagged to the calling capability `source` so the engine
@@ -468,10 +468,10 @@ fn parse_pin(hex_pin: &str) -> Result<[u8; 32], IoError> {
 
 /// Selects the box's auth token source: exactly one of a static secret or a `ServiceAccount` token
 /// file (or neither, when the daemon's auth provider is disabled).
-fn build_auth(quic: &FabricdQuic) -> Result<BoxAuth, IoError> {
+fn build_auth(quic: &BrokerQuic) -> Result<BoxAuth, IoError> {
     match (quic.auth_token.as_deref(), quic.auth_token_file.as_deref()) {
         (Some(_token), Some(_path)) => Err(IoError::other(
-            "set only one of fabricd_quic.auth_token / auth_token_file",
+            "set only one of broker_quic.auth_token / auth_token_file",
         )),
         (Some(token), None) => Ok(BoxAuth::Static(Arc::from(token))),
         (None, Some(path)) => Ok(BoxAuth::ServiceAccountFile(Arc::from(path))),
@@ -481,32 +481,32 @@ fn build_auth(quic: &FabricdQuic) -> Result<BoxAuth, IoError> {
 
 #[cfg(test)]
 mod tests {
-    //! The fail-closed egress invariant: with no sidecar configured, opening an egress session
+    //! The fail-closed egress invariant: with no broker configured, opening an egress session
     //! refuses before any execution rather than falling back to an ambient path.
 
-    use super::{SessionError, SidecarTransport, connect_session};
+    use super::{BrokerTransport, SessionError, connect_session};
     use runlet_wire::wire::WireInit;
 
-    /// No `fabricd_socket` and no `fabricd_quic` in config ⇒ the `None` transport (nothing to reach).
+    /// No `broker_socket` and no `broker_quic` in config ⇒ the `None` transport (nothing to reach).
     #[test]
     fn absent_config_selects_no_transport() {
-        let transport = SidecarTransport::from_config(None, None)
+        let transport = BrokerTransport::from_config(None, None)
             .unwrap_or_else(|_err| unreachable!("None/None is always a valid config"));
-        assert!(matches!(transport, SidecarTransport::None));
+        assert!(matches!(transport, BrokerTransport::None));
         assert_eq!(transport.label(), "none");
     }
 
     /// Opening a session with no transport fails closed with `Unavailable` — the handler maps this
     /// to a retryable `503 EGRESS_UNAVAILABLE`, decided before the blocking execution is admitted.
     #[tokio::test]
-    async fn no_sidecar_session_fails_closed() {
+    async fn no_broker_session_fails_closed() {
         let init = WireInit {
             resources: vec!["orders".to_owned()],
             timeout_ms: 1000,
             tenant: None,
             token: None,
         };
-        let result = connect_session(&SidecarTransport::None, &init).await;
+        let result = connect_session(&BrokerTransport::None, &init).await;
         assert!(matches!(result, Err(SessionError::Unavailable(_))));
     }
 }

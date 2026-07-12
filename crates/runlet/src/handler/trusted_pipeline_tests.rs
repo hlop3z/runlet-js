@@ -1,16 +1,16 @@
 //! End-to-end `/execute` in trusted-header mode (driving the handler directly): anonymous /
 //! suspended / tenant-less / entitlement rejections (which return before any execution) and a
-//! quota over-limit, plus a permitted deterministic execution. Egress is not wired (no sidecar),
+//! quota over-limit, plus a permitted deterministic execution. Egress is not wired (no broker),
 //! so tests exercise deterministic scripts / pre-execution gates — tenant-scoped egress
 //! resolution is covered in `fabric_backends::resources`.
 
 use super::{
     AppState, ExecRequest, RequestConfig, RequestIo, TrustedRuntime, default_context, execute,
 };
+use crate::broker::BrokerTransport;
 use crate::config::TrustedHeaders;
 use crate::events::{Event, Sink};
 use crate::quota::{PlanLimit, TenantQuota};
-use crate::sidecar::SidecarTransport;
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use tokio::sync::Semaphore;
 
 /// Builds an app state in trusted mode with the given member-authz gate + optional quota, a tiny
-/// runtime pool, and no egress sidecar.
+/// runtime pool, and no egress broker.
 fn state(gate: HashMap<String, String>, quota: Option<TenantQuota>) -> AppState {
     let mut engine = EngineConfig::default();
     engine
@@ -51,7 +51,7 @@ fn state(gate: HashMap<String, String>, quota: Option<TenantQuota>) -> AppState 
         error_debug: false,
         limiter: Arc::new(Semaphore::new(8)),
         partition_limiter: None,
-        transport: SidecarTransport::None,
+        transport: BrokerTransport::None,
         local_resources: Arc::new(HashMap::new()),
         local_client: reqwest::Client::new(),
         metrics: Arc::new(Metrics::default()),
@@ -237,7 +237,7 @@ async fn missing_tenant_is_forbidden() {
 }
 
 /// A member lacking the entitlement a requested capability needs is rejected `403` (before the
-/// capability — and before the missing sidecar — is reached).
+/// capability — and before the missing broker — is reached).
 #[tokio::test]
 async fn member_without_entitlement_is_forbidden() {
     let mut gate = HashMap::new();

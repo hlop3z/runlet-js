@@ -14,7 +14,7 @@ Companion to [resource-egress.md](resource-egress.md).
 
 A **location-independent transport layer**: applications address *services*, not IP addresses,
 and Docker / Kubernetes / VMs / bare metal are irrelevant. The fabric is what `fabricd` (the
-sidecar that the box's `Resource` egress talks to) becomes once it needs to reach services
+broker that the box's `Resource` egress talks to) becomes once it needs to reach services
 across nodes and clouds.
 
 ```
@@ -37,7 +37,7 @@ The box never imports any of this. The box depends on the `Resource` trait
 ([resource-egress.md](resource-egress.md)); `fabricd` *implements* the far side. A capability
 call `db.query(...)` becomes `__resource("db", "query", payload, binding)` → local `fabricd` →
 `fabric.call("orders-db", ...)` → the node that holds that backend. The box's view ends at the
-local sidecar.
+local broker.
 
 ## Decisions taken (2026-06-23)
 
@@ -125,7 +125,7 @@ the drivers that leave `runlet-core` land here.
 # QUIC remote transport (approved slice)
 
 > **Status: implemented 2026-06-30** (approved same day). The one piece of the fabric vision built
-> so far: `runlet-wire::quic` (pinned-cert endpoints), the box's `runlet::sidecar` (UDS-or-QUIC
+> so far: `runlet-wire::quic` (pinned-cert endpoints), the box's `runlet::broker` (UDS-or-QUIC
 > egress with cert pinning + client-side failover), and `fabricd`'s QUIC listener + pluggable
 > `ClientAuthenticator` (`none`/`static`/`sa-token`) + connection/stream caps. Verified end-to-end
 > by `scripts/smoke_quic.sh` (happy path + wrong/absent-token negatives). The **`sa-token`** provider (k8s
@@ -140,7 +140,7 @@ the drivers that leave `runlet-core` land here.
 
 ## Why only this slice
 
-Project A made `fabricd` a **local** egress sidecar reached over a Unix-domain socket (UDS). The
+Project A made `fabricd` a **local** egress broker reached over a Unix-domain socket (UDS). The
 only structural limit that leaves is *locality* — `fabricd` must share a host with the box. The
 single increment that removes that limit, without committing to the full mesh, is **swapping the
 UDS for a QUIC link** so `fabricd` can run on a different host. No NATS, no membership/gossip, no
@@ -152,11 +152,11 @@ This is a thin swap because the wire contract is already transport-neutral: `run
 implements exactly those, so **the framing, name-resolution (`resolve`), metrics, and
 error-mapping code do not change** — only the two places that *produce* a stream do.
 
-## Topology: shared cluster broker, not a per-pod sidecar
+## Topology: shared cluster broker, not a per-pod broker
 
 The driving deployment is **many `runlet` pods → one shared `fabricd` service**, e.g. a Kubernetes
 `Deployment` of N `fabricd` replicas that every box pod in the cluster talks to — a centralized
-**egress / credential broker**, rather than a `fabricd` sidecar injected into every pod.
+**egress / credential broker**, rather than a broker injected into every pod.
 
 Why this is sound and HA-ready:
 
@@ -168,13 +168,13 @@ Why this is sound and HA-ready:
 - **Per-replica resilience.** The daemon-side circuit breaker is per-replica — each trips
   independently on its own view of backend health. Acceptable; no coordination needed.
 
-UDS stays the **zero-config local default** (single-host / dev / the existing same-pod sidecar
+UDS stays the **zero-config local default** (single-host / dev / the existing same-pod broker
 deployment). QUIC is selected only when a remote endpoint is configured. One `Transport` enum
 behind the existing `Egress` seam; the box picks UDS or QUIC at startup.
 
 ## Three independent security layers
 
-Inside a single cluster the box→`fabricd` hop rides the **CNI pod network**, which is generally
+Inside a single cluster the box→broker hop rides the **CNI pod network**, which is generally
 neither encrypted nor cryptographically per-peer authenticated — so we do **not** assume a
 WireGuard/NetBird underlay here (that assumption belongs to the cross-cloud future). Security is
 three independent layers, each mapped to a primitive we already run:

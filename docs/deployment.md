@@ -5,7 +5,7 @@ sandboxed QuickJS context and returns `{data, error, meta}`. The box ships **thr
 built-ins** — `http`, `s3`, and `io` — and links no network drivers and holds no backend
 credentials. Any other capability (a database, cache, queue, mail relay, …) is reached with
 `$std.io.call("<name>", …)` and resolved either **box-direct** to a co-located loopback service
-(`local_resources` config) or by the **`fabricd` egress sidecar** (which holds the drivers +
+(`local_resources` config) or by the **egress broker** (which holds the drivers +
 credentials). This guide is the operator's checklist for running it safely under load.
 Depth lives in the design notes ([resilience.md](design/resilience.md),
 [pooled-capabilities.md](design/pooled-capabilities.md),
@@ -47,7 +47,7 @@ way. For anything past a quickstart, mount a full config over `/app/config.json`
 > - [ ] `db_breaker_threshold` > 0 **in `fabricd`'s config** so a dead DB fast-fails instead of pinning threads.
 > - [ ] PgBouncer `query_timeout` set if you front Postgres with a transaction-mode pooler.
 > - [ ] Global per-tenant fairness lives at the gateway; runlet's is a per-pod backstop only.
-> - [ ] Backend credentials live **only** in `fabricd`'s `resources` config — never in the box's config or the request. Driver capabilities need a running `fabricd` (`fabricd_socket` or `fabricd_quic`).
+> - [ ] Backend credentials live **only** in `fabricd`'s `resources` config — never in the box's config or the request. Driver capabilities need a running `fabricd` (`broker_socket` or `broker_quic`).
 > - [ ] TLS on every backend connection **from `fabricd`** (`ssl: true` / `tls: true` / `rediss://` / `amqps://` in the resource definitions); secrets via `config.sys`.
 > - [ ] Remote (QUIC) `fabricd`: server cert pinned by fingerprint, client auth on (`sa-token` or `static`), `max_connections` sized, NetworkPolicy scoping who can reach it.
 > - [ ] Trusted-identity mode only behind the nexus edge: `trusted.assert_network_isolation` asserted **and** enforced out of band with a NetworkPolicy.
@@ -62,7 +62,7 @@ These are the difference between "internal demo" and "safe to point traffic at."
   arbitrary JS and picks which operator-declared resources to use (`config.io`) — so an
   unauthenticated reachable port is a full compromise (SSRF pivot, mail relay, use of any
   provisioned resource). (Credentials themselves never ride in the request or the box's
-  config — they live in the `fabricd` egress sidecar's `resources` config, §5 — but a
+  config — they live in the egress broker's `resources` config, §5 — but a
   reachable executor is still a pivot into everything the operator provisioned.) runlet
   **refuses to start** on a non-loopback bind unless you either set `access_token` (a shared
   secret; requests must send `Authorization: Bearer <token>`, constant-time compared) or
@@ -135,7 +135,7 @@ Sizes accept human-readable byte strings (`"32mb"`, `"1mb"`). The body limit is 
 The broker-serviced capabilities (`db`/`mail`/`redis`/`amq`/`auth`) connect to
 **operator-supplied** hosts, so they are trusted and not SSRF-guarded — but the connection
 originates from **`fabricd`**, not the box: the box only forwards logical resource names over
-its `fabricd` session (§5). Encrypt the backend hop in transit in the **resource
+its broker session (§5). Encrypt the backend hop in transit in the **resource
 definitions** in `fabricd`'s config:
 
 - `db`: `"ssl": true` (e.g. AWS RDS/Aurora, managed Postgres).
@@ -148,7 +148,7 @@ crypto stack. For an internal CA / self-signed cert, the platform trust store ap
 `fabricd`'s image** — mount your CA bundle into *that* image's trust path (or use the
 per-resource `ca_cert` where supported).
 
-The box↔`fabricd` hop itself is either a local Unix-domain socket (same host — no TLS
+The box↔broker hop itself is either a local Unix-domain socket (same host — no TLS
 needed, gated by filesystem permissions) or QUIC with TLS 1.3, a pinned server certificate,
 and client auth — see §5.
 
@@ -190,16 +190,16 @@ targets are **loopback-only** — the box refuses to start if one points at a pu
 remote target must go through a broker).
 
 **No `fabricd`, no broker drivers — by design.** A deployment serving only deterministic /
-`http` / `s3` / box-direct requests needs no sidecar at all. If a request names a
-broker-resolved resource and neither `fabricd_socket` nor `fabricd_quic` is configured, it is
+`http` / `s3` / box-direct requests needs no broker at all. If a request names a
+broker-resolved resource and neither `broker_socket` nor `broker_quic` is configured, it is
 rejected `503 EGRESS_UNAVAILABLE`; a name absent from the request's `config.io` allowlist (or
 one the operator never bound) is a `400 RESOURCE_NOT_FOUND`.
 
-### As a local sidecar (UDS — the zero-config default)
+### As a local broker (UDS — the zero-config default)
 
 Run `fabricd` next to the box (same pod/host). It binds a Unix-domain socket
 (`FABRICD_SOCKET` env or `socket` in its config; default `/tmp/fabricd.sock`), and the
-box points `fabricd_socket` at that path. The socket is gated by **filesystem
+box points `broker_socket` at that path. The socket is gated by **filesystem
 permissions** — no token rides the UDS hop — so scope the socket file to the two
 processes (in k8s: an `emptyDir` volume shared by the two containers of the pod).
 `fabricd` also owns the driver-side resilience knobs (§2): `max_statement_timeout_ms`,
@@ -213,13 +213,13 @@ text; scope it like the box's `/metrics` (pod-local / mesh, never a public ingre
 ### As a shared network service (QUIC)
 
 Many box pods can share one replicated `fabricd` `Deployment` instead of a per-pod
-sidecar. Enable the `quic` block in `fabricd`'s config and `fabricd_quic` in the box's
+broker. Enable the `quic` block in `fabricd`'s config and `broker_quic` in the box's
 (one daemon can serve UDS and QUIC at once). Three independent security layers apply —
 configure all of them:
 
 - **Encryption / anti-MITM: a pinned self-signed cert.** `fabricd` presents
   `server_cert`/`server_key` (one static self-signed PEM — no CA, no cert-manager); each
-  box pins it by SHA-256 fingerprint (`fabricd_quic.server_cert_pin`, 64 hex chars) and
+  box pins it by SHA-256 fingerprint (`broker_quic.server_cert_pin`, 64 hex chars) and
   must send a matching `server_name`. Rotating the cert means updating the pin on every
   box.
 - **Client auth (`quic.auth.mode`).** `none` is only safe on a strictly isolated network.
@@ -228,7 +228,7 @@ configure all of them:
   verifies a k8s projected `ServiceAccount` token offline against the cluster JWKS
   (`audience` + `issuer` required; prefer an explicit in-cluster `jwks_url` + the mounted
   `ca_cert`; fail-closed until the first JWKS fetch). On the box, set exactly one of
-  `fabricd_quic.auth_token` (static) or `auth_token_file` (the projected token path,
+  `broker_quic.auth_token` (static) or `auth_token_file` (the projected token path,
   re-read per session as the kubelet rotates it).
 - **Reachability: a NetworkPolicy** restricting which namespaces/pods may reach the
   `fabricd` Service at all.
@@ -236,7 +236,7 @@ configure all of them:
 Operational knobs: `quic.listen` (`host:port` UDP bind), `quic.max_connections`
 (default 1024) caps concurrent connections, and per-connection stream concurrency is
 capped by the transport — one misbehaving box can't starve the broker. On the box,
-`fabricd_quic.replicas` lists endpoints to dial (a headless-Service DNS name works;
+`broker_quic.replicas` lists endpoints to dial (a headless-Service DNS name works;
 replicas are tried in turn for client-side failover). `fabricd` replicas are stateless —
 the `resources` table is read-only config, so scale them like any Deployment.
 
@@ -269,7 +269,7 @@ trusts blindly. Full model: [multitenant-trust.md](design/multitenant-trust.md).
   (acting-org assurance, N5) — a tenant-scoped request without it is rejected fail-closed.
 - **What flips on.** Anonymous and suspended principals are rejected; the caller-asserted
   `X-Partition-Key` is dropped and Tier 5 fairness + the bytecode-cache namespace key off
-  the trusted tenant id; the tenant id is forwarded in the `fabricd` session handshake, so
+  the trusted tenant id; the tenant id is forwarded in the broker session handshake, so
   resource resolution is **tenant-scoped** (give each binding in `fabricd`'s `resources` a
   `tenant` — a name bound to another tenant resolves as `RESOURCE_NOT_FOUND`, so existence
   never leaks across workspaces).
@@ -354,7 +354,7 @@ cardinality rule: identity would explode Prometheus series at multi-tenant scale
   edge `traceparent` decision is always honored; the collector does tail-sampling for errors/slow.
 - Export is non-blocking (batch processor, drop-on-full) and fail-open: an unreachable collector
   never fails startup or a request. On graceful shutdown buffered spans are flushed.
-- **Edge propagation (N6):** for one trace across edge → box → `fabricd`, the nexus edge must inject
+- **Edge propagation (N6):** for one trace across edge → box → broker, the nexus edge must inject
   a W3C `traceparent`; the box continues it. Until then, box-rooted traces still work. See
   `docs/design/nexus-upstream-requirements.md` (N6).
 

@@ -113,7 +113,7 @@ pub(crate) struct UsageBody {
     /// Total input size (script + context) in bytes.
     pub(crate) input_bytes: usize,
     /// Per-capability operation counts (`db`, `mongo`, `http`, `mail`, `s3`, `redis`, `amq`,
-    /// `auth`) — the metered downstream work, including `fabricd`-drained egress.
+    /// `auth`) — the metered downstream work, including broker-drained egress.
     pub(crate) ops: CapabilityOps,
 }
 

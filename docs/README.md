@@ -69,7 +69,7 @@ through the **one primitive** `$std.io.call("nickname", action, payload)` after 
 nickname in `config.io`. `config.io` is a **flat list of nicknames** (`["orders", "cache"]`).
 Each nickname points at a resource the grown-up (operator) set up — either a **co-located
 local service** bound in the box's config, or one held by a little key-keeper helper
-(**`fabricd`**) that runs next to jsbox and does the actual connecting. The keys and passwords
+(the **broker**) that runs next to jsbox and does the actual connecting. The keys and passwords
 live there, never in your request and never in the robot's box. See
 **[Build your own capability](03-capabilities.md)**.
 
@@ -93,8 +93,8 @@ For builders and operators (a bit more advanced):
   observability). Browse with `openspec list --specs` / `openspec show <name>`.
 - **Design notes (rationale)** — the architecture deep-dives, the "why": [resilience](design/resilience.md)
   (timeouts, bulkheads, circuit breaker), [resource egress](design/resource-egress.md)
-  (the three built-ins, the `fabricd` broker, box-direct local egress, and why credentials
-  never enter the box), [network fabric](design/network-fabric.md) (remote `fabricd` over QUIC),
+  (the three built-ins, the egress broker, box-direct local egress, and why credentials
+  never enter the box), [network fabric](design/network-fabric.md) (remote broker over QUIC),
   [multitenant trust](design/multitenant-trust.md) (trusted-identity mode),
   [pooled capabilities](design/pooled-capabilities.md) (PgBouncer),
   [script registry](design/script-registry.md), and

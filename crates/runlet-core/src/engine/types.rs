@@ -208,7 +208,7 @@ pub(crate) struct ExecParams<'a> {
     /// Names of registered egress capabilities to enable for this request (per-request, opt-in).
     /// A registered def's wrapper is injected only if its name appears here.
     pub(crate) enabled_io: &'a [&'a str],
-    /// Per-request fallback egress for the mux (the `fabricd` sidecar). Consulted for any name
+    /// Per-request fallback egress for the mux (the broker). Consulted for any name
     /// without a local backend. `None` = no per-request fallback. Withheld under
     /// [`Profile::Deterministic`] (it performs I/O).
     pub(crate) egress: Option<Arc<dyn Egress>>,

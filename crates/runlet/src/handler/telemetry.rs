@@ -120,7 +120,7 @@ pub(crate) fn record_span_outcome(outcome: &str) {
 /// gauges (bulkhead permits read off the semaphore).
 pub(crate) async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let available = state.limiter.available_permits();
-    // The db circuit breaker moved to `fabricd` (it owns the driver connections now); the box
+    // The db circuit breaker moved to the broker (it owns the driver connections now); the box
     // reports zero trips, keeping the `runlet_db_breaker_trips_total` series present when the breaker is off.
     let trips = 0_u64;
     let cache = state.host.bytecode_cache_stats();

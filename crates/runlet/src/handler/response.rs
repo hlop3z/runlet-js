@@ -16,8 +16,8 @@ use runlet_core::errors::{ErrorCategory, ErrorEnvelope, ErrorOwner, ErrorSource}
 use runlet_core::host::ExecMetrics;
 use runlet_wire::BackendMetrics;
 
+use crate::broker::SessionError;
 use crate::local_io::LocalIoMetric;
-use crate::sidecar::SessionError;
 use crate::status::{Projected, project_envelope};
 
 use super::{RAW_NULL, RespCfg, request_error};
@@ -194,8 +194,8 @@ pub(crate) fn raw_null_ref() -> &'static RawValue {
     &RAW_NULL
 }
 
-/// Maps a [`SessionError`] (opening the `fabricd` session) to its classified envelope: a
-/// resolution failure is a caller fault, an unreachable/absent sidecar is a retryable operator
+/// Maps a [`SessionError`] (opening the broker session) to its classified envelope: a
+/// resolution failure is a caller fault, an unreachable/absent broker is a retryable operator
 /// fault (`EGRESS_UNAVAILABLE`), a protocol slip a non-retryable operator fault (`EGRESS_PROTOCOL`).
 /// The HTTP status is a *projection* of the envelope's `(retryable, owner)` (design D6) at the
 /// response site — shared by single-`/execute` (which sets the status) and per-item `/batch` (which
@@ -366,7 +366,7 @@ pub(crate) fn projected_error_response_with_effects(
 }
 
 /// Attaches (replacing any existing) the `Retry-After` header as a delay in seconds. Seeded from
-/// the configured default — the box's circuit breakers live in `fabricd`, so there is no local
+/// the configured default — the box's circuit breakers live in the broker, so there is no local
 /// cool-down to read; the status already says "retry", the header only bounds the backoff.
 pub(crate) fn add_retry_after(response: &mut AxumResponse, seconds: u32) {
     if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {

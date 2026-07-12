@@ -1,13 +1,13 @@
 //! runlet: A sandboxed JS execution service powered by `QuickJS` (HTTP front for `runlet-core`).
 
 mod authz;
+mod broker;
 mod config;
 mod events;
 mod handler;
 mod identity;
 mod local_io;
 mod quota;
-mod sidecar;
 mod status;
 mod telemetry;
 
@@ -33,10 +33,10 @@ use runlet_core::partition::PartitionLimiter;
 use runlet_core::pool::JsPool;
 use runlet_core::registry::ScriptRegistry;
 
+use crate::broker::BrokerTransport;
 use crate::config::Config;
 use crate::handler::{AppState, TrustedRuntime};
 use crate::quota::TenantQuota;
-use crate::sidecar::SidecarTransport;
 
 /// Use `mimalloc` as the global allocator for better small-allocation performance.
 /// `QuickJS` benefits significantly (~20-40%) from this via the `rust-alloc` feature.
@@ -163,16 +163,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "per-partition fairness: {per_partition} concurrent/partition across {partition_buckets} buckets"
         );
     }
-    // The egress sidecar transport. Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
-    // `auth`) route to `fabricd` — over a local UDS or a remote QUIC link — which holds the drivers
+    // The egress broker transport. Driver-backed capabilities (`db`/`mongo`/`mail`/`redis`/`amq`/
+    // `auth`) route to the broker — over a local UDS or a remote QUIC link — which holds the drivers
     // + credentials; the box links no driver. Built before the engine config moves into the pool.
-    let transport = SidecarTransport::from_config(
-        config.fabricd_socket.as_deref(),
-        config.fabricd_quic.as_ref(),
-    )?;
+    let transport =
+        BrokerTransport::from_config(config.broker_socket.as_deref(), config.broker_quic.as_ref())?;
     match transport.label() {
-        "none" => info!("no fabricd egress sidecar: driver-backed capabilities are unavailable"),
-        label => info!(transport = label, "fabricd egress sidecar configured"),
+        "none" => info!("no egress broker: driver-backed capabilities are unavailable"),
+        label => info!(transport = label, "egress broker configured"),
     }
 
     // Box-direct local egress bindings (byo-capabilities D8): logical name → co-located loopback
@@ -199,7 +197,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // (a non-HTTP scheduler could be another). It drives no I/O itself. The box ships **zero**
     // capability defs (byo-capabilities D1): the three built-ins `http`/`s3`/`io` are in-engine, not
     // defs. A script reaches a logical resource via `io.call(name, …)`, which the mux routes to the
-    // box-direct local endpoint (if the operator declared one) or the per-request `fabricd` egress
+    // box-direct local endpoint (if the operator declared one) or the per-request broker egress
     // fallback; driver-backed capabilities are **user-composed** `CapabilityDef`s, not shipped.
     let host = LogicHost::builder(
         js_pool,

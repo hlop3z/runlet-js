@@ -1,11 +1,11 @@
 //! `/execute` HTTP status = projection of the outcome (design D1/D5): a null-error success is
 //! `200`; a handler-returned error is never `2xx` — it parks at `422` unless the handler opts
 //! into retry (`retryable: true ⇒ 503` + `Retry-After`); the body is passed through verbatim.
-//! Also covers the engine-error projections reachable without a wired sidecar (oversize `413`,
+//! Also covers the engine-error projections reachable without a wired broker (oversize `413`,
 //! syntax `422`).
 
 use super::{AppState, ExecRequest, RequestConfig, default_context, execute};
-use crate::sidecar::SidecarTransport;
+use crate::broker::BrokerTransport;
 use axum::Json;
 use axum::body::to_bytes;
 use axum::extract::State;
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// A non-trusted (single-tenant, no sidecar) app state with a small warm pool.
+/// A non-trusted (single-tenant, no broker) app state with a small warm pool.
 fn state() -> AppState {
     let mut engine = EngineConfig::default();
     engine
@@ -47,7 +47,7 @@ fn state() -> AppState {
         error_debug: false,
         limiter: Arc::new(Semaphore::new(8)),
         partition_limiter: None,
-        transport: SidecarTransport::None,
+        transport: BrokerTransport::None,
         local_resources: Arc::new(HashMap::new()),
         local_client: reqwest::Client::new(),
         metrics: Arc::new(Metrics::default()),
