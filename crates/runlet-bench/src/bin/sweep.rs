@@ -178,7 +178,8 @@ fn measure_rawjs(workers: usize, window: Duration) -> f64 {
 /// A pure-compute handler: no `io.call`, touches no value-util (lazy `$std` stays unbuilt).
 const COMPUTE: &str = "function handler(ctx) { return json(ctx.n + 1); }";
 /// An I/O-bound handler: one `io.call` to the sleeping backend, dominated by the 5 ms wait.
-const IO: &str = "function handler(ctx) { io.call('slow', 'ping', { x: ctx.n }); return json(ctx.n + 1); }";
+const IO: &str =
+    "function handler(ctx) { io.call('slow', 'ping', { x: ctx.n }); return json(ctx.n + 1); }";
 
 fn main() {
     let cores = available_parallelism().map_or(1, std::num::NonZero::get);
@@ -193,30 +194,50 @@ fn main() {
     println!("{:>8} | {:>12} | {:>10}", "workers", "Mops/s", "vs 1x");
     let ctrl_base = measure_control(1, WINDOW);
     for &w in &[1_usize, 2, 4, 8, 16] {
-        let mops = if w == 1 { ctrl_base } else { measure_control(w, WINDOW) };
+        let mops = if w == 1 {
+            ctrl_base
+        } else {
+            measure_control(w, WINDOW)
+        };
         println!("{w:>8} | {mops:>12.1} | {:>9.2}x", mops / ctrl_base);
     }
     println!();
 
-    println!("== CONTROL 2: raw rquickjs (private Runtime+Context/thread) — does QuickJS scale? ==");
+    println!(
+        "== CONTROL 2: raw rquickjs (private Runtime+Context/thread) — does QuickJS scale? =="
+    );
     println!("{:>8} | {:>12} | {:>10}", "workers", "eval/s", "vs 1x");
     let raw_base = measure_rawjs(1, WINDOW);
     for &w in &[1_usize, 2, 4, 8, 16] {
-        let rps = if w == 1 { raw_base } else { measure_rawjs(w, WINDOW) };
+        let rps = if w == 1 {
+            raw_base
+        } else {
+            measure_rawjs(w, WINDOW)
+        };
         println!("{w:>8} | {rps:>12.0} | {:>9.2}x", rps / raw_base);
     }
     println!();
 
     println!("== COMPUTE regime (no io) — does per-request work scale across cores? ==");
-    println!("{:>8} | {:>12} | {:>10} | {:>10}", "workers", "req/s", "vs 1x", "eff/core");
+    println!(
+        "{:>8} | {:>12} | {:>10} | {:>10}",
+        "workers", "req/s", "vs 1x", "eff/core"
+    );
     let base = measure(&host, COMPUTE, 1, WINDOW);
     for &w in &[1_usize, 2, 4, 8, 16, 24, 32] {
-        let rps = if w == 1 { base } else { measure(&host, COMPUTE, w, WINDOW) };
+        let rps = if w == 1 {
+            base
+        } else {
+            measure(&host, COMPUTE, w, WINDOW)
+        };
         let speedup = rps / base;
         let ideal = w.min(cores);
         #[expect(clippy::cast_precision_loss, reason = "report only")]
         let eff = speedup / ideal as f64;
-        println!("{w:>8} | {rps:>12.0} | {speedup:>9.2}x | {:>9.0}%", eff * 100.0);
+        println!(
+            "{w:>8} | {rps:>12.0} | {speedup:>9.2}x | {:>9.0}%",
+            eff * 100.0
+        );
     }
 
     println!("\n== I/O regime (one 5ms egress call) — does adding workers raise throughput? ==");
@@ -226,7 +247,11 @@ fn main() {
     );
     let io_base = measure(&host, IO, cores, WINDOW);
     for &w in &[cores, cores * 2, cores * 4, cores * 8] {
-        let rps = if w == cores { io_base } else { measure(&host, IO, w, WINDOW) };
+        let rps = if w == cores {
+            io_base
+        } else {
+            measure(&host, IO, w, WINDOW)
+        };
         println!("{w:>8} | {rps:>12.0} | {:>13.2}x", rps / io_base);
     }
 }
