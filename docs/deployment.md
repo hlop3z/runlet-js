@@ -308,7 +308,7 @@ they keep a handler from turning the relay into an open spam cannon.
 - **Autoscaling.** Scale on CPU, or on the bulkhead headroom gauge
   `runlet_bulkhead_permits_available` (scale up as it trends toward zero). A rising
   `runlet_overload_total` rate means you're shedding — add replicas or raise the bulkhead.
-- **Image.** The release image is multi-stage → distroless/static, ~18 MB. It runs fine as
+- **Image.** The release image is multi-stage → distroless/static, ~26 MB. It runs fine as
   non-root with a read-only root filesystem: the script/module registries load **once at
   startup** and nothing is written at runtime. Mount `scripts_dir` / `modules_dir` read-only
   (image layer, ConfigMap, or volume).
