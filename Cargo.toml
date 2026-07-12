@@ -6,6 +6,7 @@ members = [
     "crates/runlet",
     "crates/runlet-bench",
     "examples/kv-capability",
+    "examples/tauri-embed",
 ]
 
 # ──────────────────────────────────────────────────────────────
