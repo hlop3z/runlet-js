@@ -134,11 +134,18 @@ pub struct EngineConfig {
 ///
 /// This protects against deep recursion or excessively nested function calls.
 ///
-/// # Throughput
-/// - `pool_size`: controls number of concurrent execution workers
+/// # Concurrency / resource budget
+/// - `pool_size`: number of concurrent execution workers (0 = auto: CPU cores)
+/// - `max_concurrent_executions`: admission bulkhead — excess load fast-fails
+///   `429 OVERLOADED` before it can exhaust blocking threads / downstream connections
 ///
-/// Higher values increase parallelism and request throughput, but may increase
-/// egress contention under load.
+/// These are **not** throughput dials: the auto defaults (`pool_size` = cores,
+/// bulkhead = `pool_size × AUTO_CONCURRENCY_FACTOR`) already saturate a compute-bound
+/// load, so raising them will not lift peak RPS (the per-request engine cost is the
+/// ceiling, not oversubscription). Tune them only against a real resource budget —
+/// raise `pool_size` past core count for I/O-bound handlers whose workers block on
+/// egress; lower the bulkhead to match a small downstream connection pool so you shed
+/// before starving it.
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
