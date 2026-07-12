@@ -8,6 +8,7 @@ fn run_profiled(script: &str, profile: Profile) -> String {
     let params = ExecParams {
         runtime: &runtime,
         bytecode_cache: None,
+        surface: None,
         cache_namespace: None,
         script,
         context_json: "{}",

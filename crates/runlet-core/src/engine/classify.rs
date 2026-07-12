@@ -210,6 +210,34 @@ fn load_bytecode<'js>(qctx: &Ctx<'js>, bytecode: &[u8]) -> Result<Module<'js, De
     unsafe { Module::load(qctx.clone(), bytecode) }.map_err(drop)
 }
 
+/// Loads and evaluates a precompiled **injected-surface** module (self-produced bytecode for the
+/// framework JS the engine injects into every context) to completion, for its global side
+/// effects. Mirrors [`try_eval_module`] but for the framework surface rather than the user
+/// handler: it preserves the `QuickJS` error on failure (rather than dropping it) so a corrupt
+/// precompiled blob fails the request **closed** — the alternative, silently skipping injection,
+/// would hand the handler a half-built sandbox.
+///
+/// The `unsafe` is the same one bounded in [`load_bytecode`]: the bytes are self-produced by
+/// `Module::write` at pool warm-up this same process, held in memory, never crossing a trust or
+/// `QuickJS`-version boundary.
+#[expect(
+    unsafe_code,
+    reason = "Module::load deserializes self-produced, in-process surface bytecode compiled at \
+              pool warm-up (see fn docs); identical safety argument to load_bytecode"
+)]
+pub(super) fn eval_surface_bytecode(
+    qctx: &Ctx<'_>,
+    bytecode: &[u8],
+) -> Result<(), rquickjs::Error> {
+    // SAFETY: `bytecode` was produced by `Module::write` on a framework module compiled in this
+    // process at pool warm-up and stored verbatim; it is valid QuickJS bytecode for this build.
+    let declared = unsafe { Module::load(qctx.clone(), bytecode) }?;
+    let (module, promise) = declared.eval()?;
+    drop(module);
+    promise.finish::<()>()?;
+    Ok(())
+}
+
 /// Classifies a module eval failure from the pending exception: the resolver's
 /// [`modules::UNRESOLVED_MARKER`] in the message ⇒ `MODULE_NOT_FOUND` (a bad `import`),
 /// otherwise a syntax / top-level error. Consumes the pending exception.

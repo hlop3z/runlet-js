@@ -11,6 +11,7 @@ fn params<'a>(runtime: &'a Runtime, cache: &'a BytecodeCache) -> ExecParams<'a> 
     ExecParams {
         runtime,
         bytecode_cache: Some(cache),
+        surface: None,
         cache_namespace: None,
         script: SCRIPT,
         context_json: "{\"n\":41}",

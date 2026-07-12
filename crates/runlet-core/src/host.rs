@@ -408,6 +408,7 @@ impl LogicHost {
             let params = ExecParams {
                 runtime: &runtime,
                 bytecode_cache: Some(self.pool.bytecode_cache()),
+                surface: self.pool.surface(),
                 cache_namespace: inv.cache_namespace,
                 script: source.as_str(),
                 context_json: inv.context_json,

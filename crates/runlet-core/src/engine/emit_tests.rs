@@ -10,6 +10,7 @@ fn run_exec(script: &str) -> ExecResult {
     let params = ExecParams {
         runtime: &runtime,
         bytecode_cache: None,
+        surface: None,
         cache_namespace: None,
         script,
         context_json: "{}",

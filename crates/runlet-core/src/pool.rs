@@ -4,10 +4,11 @@
 //! Contexts are created fresh per request on a pooled runtime (cheap ~100us)
 //! to ensure clean global scope without needing sanitization.
 
+use std::env;
 use std::error::Error;
 use std::num::NonZero;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
 use crossbeam_queue::ArrayQueue;
@@ -15,11 +16,26 @@ use rquickjs::Runtime;
 
 use crate::bytecode::{self, BytecodeCache};
 use crate::config::EngineConfig;
+use crate::engine::{PrecompiledSurface, compile_surface};
 use crate::modules::{ModuleRegistry, RegistryLoader, RegistryResolver};
 
 /// Max distinct compiled scripts to retain as bytecode. Sized for the hot working set, not the
 /// full tenant space — moka's `TinyLFU` keeps the most valuable entries under churn.
 const BYTECODE_CACHE_CAPACITY: u64 = 1024;
+
+/// Run `run_gc` on one in every `GC_EVERY_N` releases rather than every release. `QuickJS` collects
+/// its own cycles under memory pressure; the per-release GC was a belt-and-braces sweep whose cost
+/// (a full heap walk) landed on every request's tail. Amortizing it keeps steady-state memory
+/// bounded while removing that per-request cost. Conservative default — validate under load test
+/// (tasks.md 5.2) before lowering.
+const GC_EVERY_N: u64 = 16;
+
+/// Bench/diagnostic escape hatch: `RUNLET_DISABLE_SURFACE=1` skips precompiling the injected
+/// framework surface, so the engine parses the framework source each request (the fallback path).
+/// Lets a benchmark A/B the bytecode vs source-parse paths on one host. Default (unset) = enabled.
+fn surface_disabled() -> bool {
+    env::var("RUNLET_DISABLE_SURFACE").is_ok_and(|value| value == "1")
+}
 
 /// Shared lifecycle state for graceful teardown, behind one `Arc` so every [`JsPool`]
 /// clone (and thus every [`crate::host::LogicHost`] clone) observes the same flags.
@@ -30,6 +46,10 @@ struct PoolState {
     accepting: AtomicBool,
     /// Runtimes currently checked out (acquired but not yet released) — the in-flight gauge.
     in_flight: AtomicUsize,
+    /// Monotonic release counter driving the amortized GC (`GC_EVERY_N`).
+    release_seq: AtomicU64,
+    /// Count of `run_gc` sweeps actually performed — an observable for the amortization test.
+    gc_runs: AtomicU64,
 }
 
 /// A snapshot of pool liveness, for operability gauges (item #5 in `CONSUMER_NOTES.md`).
@@ -56,6 +76,12 @@ pub struct JsPool {
     modules: Arc<ModuleRegistry>,
     /// Shared compiled-bytecode cache, handed to every execution.
     bytecode_cache: BytecodeCache,
+    /// Precompiled injected-framework-surface bytecode, compiled once at warm-up and loaded into
+    /// each fresh per-request context (handed to every execution via `ExecParams.surface`).
+    /// `None` when disabled by the `RUNLET_DISABLE_SURFACE` bench/diagnostic toggle — the engine
+    /// then parses the framework source each request (the fallback), so a benchmark can A/B the
+    /// two paths on one host.
+    surface: Option<Arc<PrecompiledSurface>>,
     /// Shared graceful-teardown state (accepting flag + in-flight gauge).
     state: Arc<PoolState>,
 }
@@ -85,6 +111,20 @@ impl JsPool {
                 .map_err(|_err| "pool queue full during init")?;
         }
 
+        // Compile the injected framework surface to bytecode once, on a throwaway runtime, so the
+        // pooled runtimes stay pristine. The bytecode is process-valid (same QuickJS build) and is
+        // loaded into each fresh per-request context. A compile failure fails pool construction:
+        // the box must not boot if it cannot compile its own fixed surface (fail closed). Skipped
+        // under the `RUNLET_DISABLE_SURFACE` bench/diagnostic toggle (falls back to source-parse).
+        let surface = if surface_disabled() {
+            None
+        } else {
+            let warm = create_runtime(&engine_config, &modules)?;
+            let compiled = Arc::new(compile_surface(&warm)?);
+            drop(warm);
+            Some(compiled)
+        };
+
         Ok(Self {
             inner: Arc::new(queue),
             size,
@@ -94,9 +134,12 @@ impl JsPool {
                 BYTECODE_CACHE_CAPACITY,
                 bytecode::DEFAULT_MIN_SOURCE_BYTES,
             ),
+            surface,
             state: Arc::new(PoolState {
                 accepting: AtomicBool::new(true),
                 in_flight: AtomicUsize::new(0),
+                release_seq: AtomicU64::new(0),
+                gc_runs: AtomicU64::new(0),
             }),
         })
     }
@@ -106,6 +149,14 @@ impl JsPool {
     #[must_use]
     pub const fn bytecode_cache(&self) -> &BytecodeCache {
         &self.bytecode_cache
+    }
+
+    /// The precompiled injected-framework surface, handed to each execution so the framework JS is
+    /// loaded as bytecode into the fresh per-request context instead of re-parsed from source.
+    /// `None` when the `RUNLET_DISABLE_SURFACE` toggle forced the source-parse fallback.
+    #[must_use]
+    pub(crate) fn surface(&self) -> Option<&PrecompiledSurface> {
+        self.surface.as_deref()
     }
 
     /// Takes a runtime from the pool. Creates a new one if the pool is empty. Records it as
@@ -129,11 +180,29 @@ impl JsPool {
     pub fn release(&self, runtime: Runtime) {
         let _ = self.state.in_flight.fetch_sub(1, Ordering::Relaxed);
         if self.state.accepting.load(Ordering::Relaxed) {
-            runtime.run_gc();
+            // Amortized GC: sweep on one in every `GC_EVERY_N` releases (the first, then every Nth),
+            // not every release. `fetch_add` returns the pre-increment value, so the multiple-of test
+            // fires on release 0, N, 2N, … — ~1/N of releases, spread across the pool's runtimes.
+            if self
+                .state
+                .release_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(GC_EVERY_N)
+            {
+                runtime.run_gc();
+                let _ = self.state.gc_runs.fetch_add(1, Ordering::Relaxed);
+            }
             drop(self.inner.push(runtime));
         } else {
             drop(runtime);
         }
+    }
+
+    /// Count of `run_gc` sweeps performed so far (the amortized-GC observable, for the test).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn gc_run_count(&self) -> u64 {
+        self.state.gc_runs.load(Ordering::Relaxed)
     }
 
     /// Whether the pool is still accepting new acquisitions (`false` after
@@ -265,5 +334,31 @@ mod tests {
         // `shutdown` is idempotent.
         pool.shutdown();
         assert!(!pool.is_accepting());
+    }
+
+    /// Amortized GC (`GC_EVERY_N`): GC does not run on every release, but still runs — bounded —
+    /// under sustained acquire/release. Over `k * GC_EVERY_N` releases exactly `k` sweeps occur
+    /// (the first release and every `GC_EVERY_N`-th thereafter), so it is neither every-release
+    /// nor never.
+    #[test]
+    fn gc_is_amortized_not_per_release() {
+        let pool = pool(1);
+        assert_eq!(pool.gc_run_count(), 0, "no releases yet");
+        let rounds = super::GC_EVERY_N * 3;
+        for _ in 0..rounds {
+            let runtime = pool
+                .acquire()
+                .unwrap_or_else(|_err| unreachable!("acquire"));
+            pool.release(runtime);
+        }
+        assert_eq!(
+            pool.gc_run_count(),
+            3,
+            "over 3*N releases GC sweeps exactly 3 times — amortized, not per-release"
+        );
+        assert!(
+            pool.gc_run_count() < rounds,
+            "GC must not run on every release"
+        );
     }
 }

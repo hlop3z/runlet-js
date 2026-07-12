@@ -82,6 +82,28 @@ gating all preserved) but makes the per-request bootstrap usage-weighted: a util
 from ~5.0 ms to ~1.1 ms (~4.6×). It does **not** change the per-request isolation model — each request
 still runs in a fresh `Context`; laziness only changes *when* a member is built *within* a request.
 
+### Bytecode-precompiled injected surface (`precompile-injected-js-bytecode`)
+
+Lazy materialization cut *how many* wrappers get built per request; this change cuts the cost of
+building each one — and of the always-injected framework scaffolding — by **loading precompiled
+`QuickJS` bytecode instead of re-parsing source**. The injected framework scripts (`std.js`,
+`bridge.js`, `ffi.js`, `std_lazy.js`, `std_project.js`, `std_freeze.js`) and the
+profile/request-independent value-util build-units (decimal/money/text/list/dict/template/check +
+`datetime`'s two profile variants) are compiled to module bytecode **once at pool warm-up**
+(`inject::compile_surface`, stored on `JsPool`) and loaded into each fresh context via the audited
+self-produced-bytecode `Module::load` (`classify::eval_surface_bytecode`). `sys` stays source-parsed
+(its wrapper body carries per-request env/secrets). rquickjs 0.12 serializes bytecode only for ES
+*modules*, so each classic-script injection unit is loaded as a tiny side-effect module — behavior
+is byte-identical because the scripts install via explicit `$std.`/`globalThis.` assignment (proven
+by an equivalence golden test across both profiles).
+
+This is **compiled-code reuse, never state reuse**: every request still gets a fresh `Context`, so
+no global or prototype mutation survives forward (a cross-request no-leak test guards this). A
+same-host A/B (`RUNLET_DISABLE_SURFACE` toggles the source-parse fallback) measured, Docker/musl:
+compute-only **1.52×**, one-util **2.19×**, heavy-util **2.47×** — real business handlers (money/
+datetime) see ~2×. Orthogonally, per-release `run_gc` became amortized (one sweep per
+`GC_EVERY_N` releases) to take a full heap walk off every request's tail.
+
 ## Two mechanics this change pinned down
 
 `design.md` left two details to implementation; both are recorded here.

@@ -29,6 +29,7 @@ mod classify;
 mod inject;
 mod types;
 
+pub(crate) use inject::{PrecompiledSurface, compile_surface};
 pub use types::{
     CapabilityErr, Effect, EngineError, ExecOutcome, Gate, LogEntry, LogLevel, Profile,
 };
@@ -78,8 +79,8 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
 
     let js_result = ctx.with(|qctx| -> Result<ExecOutcome, EngineError> {
         // D3 step 1 — bootstrap `$std` before any member is built onto it.
-        inject_std_bootstrap(&qctx).map_err(EngineError::internal)?;
-        inject_bridge(&qctx).map_err(EngineError::internal)?;
+        inject_std_bootstrap(&qctx, params.surface).map_err(EngineError::internal)?;
+        inject_bridge(&qctx, params.surface).map_err(EngineError::internal)?;
         // D1/D2 — register the cheap eager native FFI bridges up front, then install the value-util
         // members as lazy getter-only accessors. A member's (expensive) wrapper IIFE is parsed +
         // executed only on first access within the request; an untouched member is never built. The
@@ -122,14 +123,14 @@ pub(crate) fn run(params: &ExecParams<'_>) -> Result<ExecResult, EngineError> {
         // evals, so it sees `$`/`json`/`log`/`emit`. `resolve_handler` then evals + hardens (D3
         // steps 4–6: sanitize `eval`/`Proxy`, and under the deterministic profile prune the ambient
         // authorities).
-        project_std_globals(&qctx).map_err(EngineError::internal)?;
+        project_std_globals(&qctx, params.surface).map_err(EngineError::internal)?;
         let handler = match resolve_handler(&qctx, params) {
             Ok(func) => func,
             Err(outcome) => return Ok(outcome),
         };
         // D3 step 7 — deep-freeze `$std` and lock the projected globals, strictly after the prune
         // and before `handler` runs, so the surface is tamper-proof for the invocation.
-        freeze_std(&qctx).map_err(EngineError::internal)?;
+        freeze_std(&qctx, params.surface).map_err(EngineError::internal)?;
         invoke_handler(
             &qctx,
             &handler,
@@ -263,3 +264,11 @@ mod log_tests;
 
 #[cfg(test)]
 mod lazy_std_tests;
+
+/// Golden equivalence: the injected framework surface loaded from precompiled bytecode is
+/// behaviorally identical to the same surface parsed from source (globals, projection identity,
+/// freeze/lock, determinism prune) under both profiles, and bytecode reuse never leaks state
+/// across requests. Capability-free build (no `http`/`s3`/`io` fields on `ExecParams`).
+#[cfg(test)]
+#[cfg(not(feature = "_io"))]
+mod surface_bytecode_tests;

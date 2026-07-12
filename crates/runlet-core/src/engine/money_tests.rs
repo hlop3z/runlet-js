@@ -9,6 +9,7 @@ fn run_script(script: &str, default_currency: Option<&str>) -> String {
     let params = ExecParams {
         runtime: &runtime,
         bytecode_cache: None,
+        surface: None,
         cache_namespace: None,
         script,
         context_json: "{}",

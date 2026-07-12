@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use super::PrecompiledSurface;
 use crate::bytecode::BytecodeCache;
 use crate::capability::CapabilityRegistry;
 use crate::egress::Egress;
@@ -176,6 +177,10 @@ pub(crate) struct ExecParams<'a> {
     /// Shared compiled-bytecode cache (parse/compile reuse for the ES-module path).
     /// `None` = always recompile (e.g. a consumer that opts out).
     pub(crate) bytecode_cache: Option<&'a BytecodeCache>,
+    /// Precompiled injected-framework-surface bytecode, produced once at pool warm-up and loaded
+    /// per request instead of re-parsing the framework JS. `None` = parse the framework source
+    /// each request (the fallback for a consumer/pool that builds no surface, and for tests).
+    pub(crate) surface: Option<&'a PrecompiledSurface>,
     /// Partition/tenant namespace mixed into the bytecode cache key, so identical source from
     /// different tenants does not share an entry. `None` = global (no namespace).
     pub(crate) cache_namespace: Option<&'a str>,

@@ -102,6 +102,7 @@ fn params<'a>(
     ExecParams {
         runtime,
         bytecode_cache: None,
+        surface: None,
         cache_namespace: None,
         script,
         context_json: "{\"n\":7}",
