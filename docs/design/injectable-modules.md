@@ -129,13 +129,17 @@ are real ESM rather than a bespoke loader format.
   same memory, timeout, `max_ops`, and stack limits as the handler, and the registry is
   immutable after startup.
 
-### Bytecode caching is blocked by `unsafe_code = "forbid"`
+### Imported modules aren't bytecode-cached — a cost/benefit choice, not a hard block
 
-`Module::write(WriteOptions)` to produce bytecode is safe, but reading it back is
-`unsafe Module::load(bytes)`. jsbox sets `unsafe_code = "forbid"`, so precompiling
-modules at startup to skip per-request parsing is not available without relaxing the
-unsafe ban. The measured saving (~201 µs/import, see Performance) does not justify that
-cost, so per-request compilation is the accepted floor.
+`Module::write(WriteOptions)` to produce bytecode is safe; reading it back is
+`unsafe Module::load(bytes)`. The workspace lints `unsafe_code = "deny"` (not `forbid`) and
+lets that one call through a scoped `#[expect(unsafe_code, reason = …)]` — the tree's only
+`unsafe`. The engine uses it to bytecode-cache the **handler's own top-level source**
+(`bytecode.rs`, always-on, sources ≥ ~2 KB). Imported registry modules, though, still compile
+from source each request (`RegistryLoader` → `Module::declare`); they aren't wired through that
+cache. Extending it to imports would mean keying and admitting each module's bytecode too —
+deferred because the measured saving (~201 µs/import, see Performance) is small. Per-request
+compilation is the current floor for imports **by choice**, not because `unsafe` is banned.
 
 ## Alternative considered: `use()` loader (superseded)
 
@@ -156,8 +160,9 @@ all carry over. Prior text is in git history.
   test-stubbing patterns. Revisit only with a concrete threat it solves.
 - Per-module metering or billing — module code is indistinguishable from script code
   inside the sandbox, so metering it separately is not honestly possible.
-- Bytecode caching of modules — blocked by the `unsafe_code = "forbid"` lint, for a
-  measured saving not worth relaxing the unsafe ban (see above).
+- Bytecode caching of **imported** modules — deferred, not blocked: the handler's top-level
+  source is already cached (`bytecode.rs`), but wiring imported modules through it isn't worth
+  the small measured saving (see above).
 
 ## Performance
 

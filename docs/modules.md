@@ -124,8 +124,11 @@ export default function handler(ctx) {
 
 A handler authored as a module adds **~39 µs/request** over a classic script (negligible); a
 handler that `import`s one small module adds **~201 µs/request** (compile + resolve + the
-imported module's own eval), against a ~2.5 ms request floor — see
-[design/injectable-modules.md](design/injectable-modules.md). Module **bytecode caching** would
-shave the import cost, but it's **not available**: rquickjs's bytecode load is an `unsafe` API
-and jsbox forbids `unsafe` entirely. The per-import compile is therefore the accepted floor;
-keep imported modules small and few, and the cost stays in the noise.
+imported module's own eval), against a low-millisecond request floor — see
+[design/injectable-modules.md](design/injectable-modules.md). The engine already
+bytecode-caches the handler's **own top-level source** (always-on, for sources ≥ ~2 KB, via
+the workspace's single scoped `unsafe Module::load`), but `import`ed registry modules still
+compile from source each request — they aren't wired through that cache. Extending it to
+imports is a deliberate not-yet-done (the measured per-import saving is small), not a hard
+block. So the per-import compile is the current floor; keep imported modules small and few,
+and the cost stays in the noise.
