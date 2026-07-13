@@ -504,6 +504,7 @@ mod tests {
             resources: vec!["orders".to_owned()],
             timeout_ms: 1000,
             tenant: None,
+            actor: None,
             token: None,
         };
         let result = connect_session(&BrokerTransport::None, &init).await;

@@ -51,8 +51,7 @@ credential. The guard fails closed.
 
 ## Tenant is the universal key
 
-The trusted tenant id (the acting workspace — a ZITADEL org; solo users get a personal workspace)
-is the single key for:
+The trusted tenant id (the acting workspace, opaque to the box) is the single key for:
 
 - **Tier 5 fairness** (`PartitionLimiter`): the partition key is the trusted tenant id. The
   caller-asserted `X-Partition-Key` header / `partition` body source is **removed** in trusted mode
@@ -70,6 +69,56 @@ is the single key for:
 `runlet` treats `x-workspace-id` as opaque and already-authorized; it never branches on "user vs org"
 and never learns how the acting workspace was chosen (that is nexus upstream requirement **N5** —
 see `nexus-upstream-requirements.md`).
+
+### Cross-repo vocabulary and identity axes
+
+The same concept carries a different load-bearing noun in each repo; the values are the same literal
+string, propagated verbatim through every hop (renaming any of them would cost more than it buys):
+
+```
+nexus Workspace.id  ==  runlet "trusted tenant"  ==  event-logs Tenant
+  x-workspace-id  ─▶  (runlet keys on it)  ─▶  X-Runlet-Tenant  ─▶  event-logs Tenant field
+```
+
+nexus's `docs/tenancy-and-identity.md` is the canonical model. It separates **three** identity axes;
+`runlet`'s relationship to them is deliberately lopsided:
+
+- **Workspace** (*where* — the tenancy boundary, nexus-minted `ws_<uuidv7>`) — this is the "trusted
+  tenant"; `runlet` **keys** every per-tenant boundary above on it.
+- **Actor** (*who* — the acting principal, a federated subject from `x-user-id`) — `runlet` **carries**
+  it for audit (`TrustedIdentity.user`) but reads nothing off it for scoping.
+- **Account** (*who owns/pays*, nexus-minted `acct_<uuidv7>`) — one level above workspace; it **never
+  reaches** `runlet` and needs no box-side concept.
+
+`runlet` deliberately abstracts nexus's `Workspace` into a generic `tenant` so it stays usable behind
+any identity plane, not permanently bound to nexus — the equivalence is written down, not unified.
+
+### Identity on the egress paths
+
+The acting identity — tenant (*where*) and actor (*who*) — rides **both** egress transports on equal
+terms, so a logical `io` name can move between a co-located loopback service and a remote broker without
+dropping identity. Box-direct carries it as out-of-band `x-runlet-*` headers; the broker carries it in the
+`WireInit` session handshake (`tenant` + `actor`). The `{action, payload}` body is identical on both (D9).
+
+A box-direct `io` target (an operator-declared co-located loopback service) receives the acting identity
+as out-of-band `x-runlet-*` headers, never in the `{action, payload}` body (D9):
+
+- **`X-Runlet-Tenant`** (*where*) — the trusted tenant; the box-direct analogue of the broker's
+  `WireInit.tenant`. Emitted only when a trusted tenant is present.
+- **`X-Runlet-Actor`** (*who*) — the trusted acting **subject** (`TrustedIdentity.user`, the bare
+  `x-user-id` value), so a consumer can build a who-did-what audit trail. Emitted only when a trusted
+  subject is present.
+
+Both are sourced **only** from the trusted-identity extractor. A routing key like an event stream may
+ride the untrusted `payload`, but an actor is a *trust assertion* and therefore must be out-of-band —
+the payload path is off-limits for it.
+
+Principal **kind** (user/apikey/service) is deliberately **not** forwarded on either path: it lives only
+inside the signed `x-identity-contract`, and the box verifies no signed assertions (the "no crypto in the
+box" invariant — the same reason in-box JWT verification was rejected for the N5 tripwire below). Should a
+consumer ever require kind, it arrives as a *separate* trusted field (a nexus bare-header emission the box
+forwards as its own header / `WireInit` field), leaving the actor stably equal to the bare subject. See
+`openspec/specs/tenant-egress/spec.md`.
 
 ## Acting-org assurance (the N5 tripwire)
 

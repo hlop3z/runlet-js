@@ -199,6 +199,14 @@ pub struct WireInit {
     /// extractor — never from anything the executing script can influence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The request's **trusted** acting subject (the acting-user id the edge authorized), forwarded so
+    /// a broker — and any backend it resolves to — can attribute who-did-what, the broker-path analogue
+    /// of the box-direct `X-Runlet-Actor` header. The bare subject only (never principal kind, roles, or
+    /// any other identity field). `None` on the single-tenant/loopback path (no trusted identity).
+    /// Sourced only from the trusted-header extractor — never from anything the executing script can
+    /// influence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
     /// Opaque client-auth credential proving the box may pull credentials — a static shared
     /// secret or a k8s projected `ServiceAccount` token. `None` on the local UDS path (filesystem
     /// permissions gate it); set on the remote QUIC path, where the broker validates it *before*
@@ -219,6 +227,8 @@ impl fmt::Debug for WireInit {
             .field("resources", &self.resources)
             .field("timeout_ms", &self.timeout_ms)
             .field("tenant", &self.tenant)
+            // The actor is trusted-edge identity, not a secret (like `tenant`): print it plainly.
+            .field("actor", &self.actor)
             // The token is a secret: print only its presence, never its value.
             .field("token", &self.token.as_ref().map(|_present| "<redacted>"))
             .finish()
@@ -339,7 +349,8 @@ mod tests {
     };
     use crate::{EgressError, ErrorOwner};
 
-    /// An `Init` frame carries the flat `resources` name list (+ tenant) intact across a round-trip.
+    /// An `Init` frame carries the flat `resources` name list (+ tenant + actor) intact across a
+    /// round-trip.
     #[tokio::test]
     async fn init_frame_carries_flat_resources() {
         let (mut sink, mut source) = tokio::io::duplex(1024);
@@ -347,6 +358,7 @@ mod tests {
             resources: vec!["orders".to_owned(), "cache".to_owned()],
             timeout_ms: 5000,
             tenant: Some("acme".to_owned()),
+            actor: Some("u_42".to_owned()),
             token: None,
         }));
         write_frame(&mut sink, &sent)
@@ -363,9 +375,44 @@ mod tests {
                     vec!["orders".to_owned(), "cache".to_owned()]
                 );
                 assert_eq!(init.tenant.as_deref(), Some("acme"));
+                assert_eq!(init.actor.as_deref(), Some("u_42"));
             }
             WireRequest::Call(_) | WireRequest::Drain => unreachable!("expected an Init"),
         }
+    }
+
+    /// Back-compat: a `WireInit` with no trusted identity serializes with **neither** the `tenant` nor
+    /// the `actor` key present (the `skip_serializing_if` guarantee), so the addition of `actor` cannot
+    /// change the bytes an unchanged broker sees on the single-tenant/loopback path. A populated `actor`
+    /// round-trips through JSON.
+    #[test]
+    fn actor_is_additive_and_round_trips() {
+        let bare = WireInit {
+            resources: vec!["orders".to_owned()],
+            timeout_ms: 1000,
+            tenant: None,
+            actor: None,
+            token: None,
+        };
+        let json = serde_json::to_string(&bare).unwrap_or_else(|_err| unreachable!("serialize"));
+        assert!(
+            !json.contains("actor"),
+            "absent actor is not serialized: {json}"
+        );
+        assert!(
+            !json.contains("tenant"),
+            "absent tenant is not serialized: {json}"
+        );
+
+        let populated = WireInit {
+            actor: Some("u_42".to_owned()),
+            ..bare
+        };
+        let json =
+            serde_json::to_string(&populated).unwrap_or_else(|_err| unreachable!("serialize"));
+        let back: WireInit =
+            serde_json::from_str(&json).unwrap_or_else(|_err| unreachable!("deserialize"));
+        assert_eq!(back.actor.as_deref(), Some("u_42"));
     }
 
     /// A request frame written then read back is structurally equivalent.

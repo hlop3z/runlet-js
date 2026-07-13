@@ -47,13 +47,14 @@ fn broker_names_exclude_box_direct_bindings() {
     );
 }
 
-/// `wire_init` carries the flat resource list, the deadline, and the trusted tenant.
+/// `wire_init` carries the flat resource list, the deadline, the trusted tenant, and the trusted actor.
 #[test]
 fn wire_init_carries_flat_resources() {
     let init = wire_init(
         vec!["orders".to_owned(), "cache".to_owned()],
         std::time::Duration::from_millis(1500),
         Some("ws_acme"),
+        Some("u_42"),
     );
     assert_eq!(
         init.resources,
@@ -65,4 +66,22 @@ fn wire_init_carries_flat_resources() {
         Some("ws_acme"),
         "trusted tenant carried on the handshake"
     );
+    assert_eq!(
+        init.actor.as_deref(),
+        Some("u_42"),
+        "trusted acting subject carried on the handshake"
+    );
+}
+
+/// On the single-tenant/loopback path both identity fields are absent from the handshake.
+#[test]
+fn wire_init_omits_identity_when_absent() {
+    let init = wire_init(
+        vec!["orders".to_owned()],
+        std::time::Duration::from_millis(500),
+        None,
+        None,
+    );
+    assert!(init.tenant.is_none(), "no tenant on the loopback path");
+    assert!(init.actor.is_none(), "no actor on the loopback path");
 }

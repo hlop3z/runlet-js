@@ -255,7 +255,12 @@ pub(crate) async fn run_execute(
     let session = if broker_names.is_empty() {
         None
     } else {
-        let init = wire_init(broker_names, engine_cfg.timeout(), tenant.as_deref());
+        let init = wire_init(
+            broker_names,
+            engine_cfg.timeout(),
+            tenant.as_deref(),
+            identity.as_ref().and_then(|id| id.user.as_deref()),
+        );
         match connect_session(&state.transport, &init).await {
             Ok(conn) => Some(conn),
             Err(err) => {
@@ -318,6 +323,10 @@ pub(crate) async fn run_execute(
         tenant: identity
             .as_ref()
             .and_then(|id| id.tenant.as_deref().map(str::to_owned)),
+        // Trusted acting subject, forwarded box-direct as the `X-Runlet-Actor` header (who).
+        actor: identity
+            .as_ref()
+            .and_then(|id| id.user.as_deref().map(str::to_owned)),
     })
     .await;
 
@@ -349,6 +358,10 @@ pub(crate) struct ExecuteBlocking {
     /// `X-Runlet-Tenant` header (the box-direct analogue of the broker's `WireInit.tenant`).
     /// `None` on the single-tenant/non-trusted path — no header is then emitted.
     tenant: Option<String>,
+    /// The request's trusted acting subject, forwarded to a box-direct loopback service as the
+    /// `X-Runlet-Actor` header (the *who* companion to `tenant`'s *where*). Sourced from
+    /// `TrustedIdentity.user`; `None` on the single-tenant/non-trusted path — no header is then emitted.
+    actor: Option<String>,
     /// Shared `reqwest` client for the box-direct POSTs.
     local_client: reqwest::Client,
     /// The resolved script source (inline or registered).
@@ -389,6 +402,7 @@ pub(crate) async fn execute_blocking(
         log_floor,
         default_currency,
         tenant,
+        actor,
     } = params;
     task::spawn_blocking(move || -> (Result<Outcome, EngineError>, EgressMetrics) {
         // The broker session (if any) is wrapped as a `BrokerEgress`, then composed with the
@@ -404,6 +418,7 @@ pub(crate) async fn execute_blocking(
                 timeout,
                 broker,
                 tenant,
+                actor,
             ))
         });
         let egress: Option<Arc<dyn Egress>> = box_egress.as_ref().map(|metered| {

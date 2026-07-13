@@ -242,12 +242,14 @@ impl RequestIo {
 }
 
 /// The broker session-open message: the flat list of broker-resolved resource names, the
-/// per-execution deadline, and the request's trusted tenant id (so the broker scopes resolution to
-/// that tenant's bindings). the broker resolves each name against its operator config.
+/// per-execution deadline, the request's trusted tenant id (so the broker scopes resolution to that
+/// tenant's bindings), and the request's trusted acting subject (so the broker can attribute
+/// who-did-what). the broker resolves each name against its operator config.
 pub(crate) fn wire_init(
     resources: Vec<String>,
     timeout: Duration,
     tenant: Option<&str>,
+    actor: Option<&str>,
 ) -> WireInit {
     WireInit {
         resources,
@@ -258,6 +260,11 @@ pub(crate) fn wire_init(
         // `allow_privileged` opt-out is void), so the box carries no separate privilege flag. See
         // `docs/design/resource-egress.md` (least-privilege / trust model).
         tenant: tenant.map(str::to_owned),
+        // The trusted acting subject (bare `x-user-id`), sourced only from the trusted-header
+        // extractor (never the script). `None` on the single-tenant/loopback path — the handshake is
+        // then byte-identical to before this field existed. The broker-path analogue of the box-direct
+        // `X-Runlet-Actor` header, so actor forwarding is transport-independent.
+        actor: actor.map(str::to_owned),
         // The token (QUIC path) is attached by `connect_session` from the transport's auth
         // provider — the box-request layer never sees it.
         token: None,

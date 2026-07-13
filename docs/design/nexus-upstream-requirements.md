@@ -29,9 +29,9 @@ name `x-tenant-scope` — nexus emits it under that name.
 
 `runlet` treats the `x-workspace-id` header as an opaque, **already-authorized acting-workspace id**
 and keys all per-tenant isolation (fairness, cache, egress scope, quota) off it. For this to be
-correct, the nexus identity plane must inject the tenant id as the **org the user is acting as for
-this request** — selected/authorized via a ZITADEL org-scoped token + grants — **not** the user's
-home org (`resourceowner`).
+correct, the nexus identity plane must inject the tenant id as the **workspace the user is acting in
+for this request** — selected and authorized upstream (an acting-scoped grant), opaque to the box —
+**not** the user's home workspace.
 
 - **Why:** a multi-org user acting in workspace B must be scoped to B's fairness bucket, cache
   namespace, egress bindings, and quota. If the edge emits the home org A instead, the user is
