@@ -1,0 +1,10 @@
+{
+  "server": { "host": "127.0.0.1", "port": 3000 },
+
+  "//": "Each key is a logical `io` name; each url is the co-located path this box POSTs to.",
+  "//local_resources": "The boot guard requires every url to be loopback/private.",
+  "local_resources": {
+    "cache":  { "url": "http://127.0.0.1:8090/cache" },
+    "orders": { "url": "http://127.0.0.1:8090/orders" }
+  }
+}

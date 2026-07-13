@@ -1,0 +1,12 @@
+{
+  "server": { "host": "127.0.0.1", "port": 3000 },
+
+  "//": "A remote broker over QUIC. Fill server_cert_pin + auth_token from the broker's boot",
+  "//2": "banner (it prints a ready-to-paste block). The box PINS this exact cert by SHA-256.",
+  "broker_quic": {
+    "replicas": ["127.0.0.1:4443"],
+    "server_name": "runlet-broker",
+    "server_cert_pin": "PASTE_THE_64_HEX_PIN_FROM_THE_BROKER_BANNER",
+    "auth_token": "dev-secret-token"
+  }
+}
