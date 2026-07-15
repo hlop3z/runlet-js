@@ -297,6 +297,11 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// The closed set of principal kinds a verified contract may assert (nexus authors one of these
+/// into `principal_kind`). The `allowed_principal_kinds` boot guard rejects any entry outside it, so
+/// a typo (`"services"`) is a startup error rather than a silent runtime all-deny.
+pub(crate) const VALID_PRINCIPAL_KINDS: [&str; 3] = ["user", "apikey", "service"];
+
 /// Trusted-identity mode configuration (the `trusted` block).
 ///
 /// `Default` (all off / empty) preserves the pre-change single-principal, caller-asserted-partition
@@ -318,6 +323,14 @@ pub(crate) struct TrustedConfig {
     /// role) a caller must hold in `x-user-entitlements`/`x-user-roles` to invoke it. A kind absent
     /// from this map is ungated. Empty by default (no member gating).
     pub(crate) capability_entitlements: HashMap<String, String>,
+    /// Box-wide principal-kind admission allowlist (`"user"`/`"apikey"`/`"service"`). Empty (the
+    /// default) admits every kind. When non-empty, a request is admitted only if its verified
+    /// `principal_kind` is a member; any other kind — including an absent one — is rejected with
+    /// `403 PRINCIPAL_KIND_FORBIDDEN`. Because kind is populated **only** by a verified contract, a
+    /// non-empty allowlist requires `contract.enabled` (enforced by [`Config::check_exposure`]); each
+    /// entry must be one of the known kinds. Deploy a dedicated box per kind (a user-box, a
+    /// service-box); defense-in-depth atop the contract `aud`-per-pool check.
+    pub(crate) allowed_principal_kinds: Vec<String>,
     /// Per-tenant plan-gated quota (section 6). Off by default.
     pub(crate) quota: QuotaConfig,
     /// Opt-in signed-contract verification (the `trusted.contract` sub-mode). Off by default; when

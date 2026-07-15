@@ -279,6 +279,16 @@ trusts blindly. Full model: [multitenant-trust.md](design/multitenant-trust.md).
   per-tenant in-flight usage by plan (from
   the plan header): an unknown plan gets the most restrictive configured limit, and an
   **empty** `plans` map while enabled denies everything — fail-closed, never unbounded.
+- **Principal-kind admission (optional).** `trusted.allowed_principal_kinds` restricts the
+  box to a set of principal kinds (`"user"`/`"apikey"`/`"service"`). Empty (the default)
+  admits every kind. When non-empty, a request is admitted only if its verified
+  `principal_kind` is in the list; any other kind — **including an absent one** — is
+  rejected with `403 PRINCIPAL_KIND_FORBIDDEN`. The intended shape is a **dedicated box per
+  kind** (a user-box `["user","apikey"]`, a service-box `["service"]`) that scales and is
+  routed independently. Because kind comes **only** from a verified contract, a non-empty
+  list **requires `trusted.contract.enabled`** and each entry must be a known kind — the
+  boot guard refuses to start otherwise (a typo like `"services"` is a startup error, not a
+  silent all-deny). `on_behalf_of` does not promote an api-key to a `user` for this gate.
 - Identity rides **spans, logs, and events** as attributes — never metric labels (§10).
 
 ## 8. Secrets

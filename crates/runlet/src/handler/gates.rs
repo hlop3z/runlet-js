@@ -234,9 +234,14 @@ pub(crate) async fn resolve_identity(
     // from its claims. A verified contract *is* the acting-org assurance (nexus mints it only for a
     // resolved caller), so the plain-path scope-header tripwire is not consulted here.
     if let Some(verifier) = trusted.contract.as_ref() {
-        return resolve_identity_contract(state, headers, trace_id, trusted, verifier)
-            .await
-            .map(Some);
+        let identity =
+            resolve_identity_contract(state, headers, trace_id, trusted, verifier).await?;
+        if let Some(rejection) =
+            enforce_principal_kind_admission(state, &identity, trusted, trace_id).await
+        {
+            return Err(rejection);
+        }
+        return Ok(Some(identity));
     }
     // Plain trusted-header path (unchanged): a non-nexus edge that injects plain headers.
     let identity = TrustedIdentity::from_headers(headers, &trusted.headers);
@@ -298,6 +303,14 @@ pub(crate) async fn resolve_identity(
             "trusted-header mode requires the edge to assert acting-org scope",
         )));
     }
+    // Principal-kind admission is a no-op on this path (the boot guard forbids a non-empty allowlist
+    // without the contract sub-mode, and the plain path never populates `principal_kind`), but the
+    // check is applied uniformly so the invariant holds structurally rather than by that guarantee.
+    if let Some(rejection) =
+        enforce_principal_kind_admission(state, &identity, trusted, trace_id).await
+    {
+        return Err(rejection);
+    }
     // Audit trail: bind the trusted tenant + user id to this request's trace so a support query can
     // grep one id across the mesh (the user id is otherwise only carried for audit).
     tracing::debug!(
@@ -307,6 +320,44 @@ pub(crate) async fn resolve_identity(
         "trusted identity accepted"
     );
     Ok(Some(identity))
+}
+
+/// Box-wide principal-kind admission (trusted mode): when `allowed_principal_kinds` is non-empty,
+/// admit only a request whose verified `principal_kind` is a member of the allowlist. An absent kind
+/// is never a member, so it fails closed. The decision is a pure function of `principal_kind` —
+/// `on_behalf_of` never promotes an api-key principal to a human. Evaluated once at identity
+/// resolution, so `/execute` and `/batch` inherit it without a per-item check. `None` = admitted (the
+/// allowlist is empty, or the kind is a member); `Some(response)` = a `403 PRINCIPAL_KIND_FORBIDDEN`.
+async fn enforce_principal_kind_admission(
+    state: &AppState,
+    identity: &TrustedIdentity,
+    trusted: &TrustedRuntime,
+    trace_id: &str,
+) -> Option<Box<AxumResponse>> {
+    if principal_kind_admitted(
+        &trusted.allowed_principal_kinds,
+        identity.principal_kind.as_deref(),
+    ) {
+        return None;
+    }
+    Some(
+        deny_identity(
+            state,
+            Some(identity),
+            trace_id,
+            "PRINCIPAL_KIND_FORBIDDEN",
+            "this box does not admit the caller's principal kind",
+        )
+        .await,
+    )
+}
+
+/// The pure box-wide principal-kind admission decision. An empty allowlist admits every kind
+/// (including an absent one); a non-empty allowlist admits only a `Some(kind)` that is a member —
+/// an absent kind (`None`) is never a member, so it fails closed. The decision reads `kind` alone,
+/// so an api-key acting on behalf of a human is never promoted across a human-only allowlist.
+fn principal_kind_admitted(allowed: &[String], kind: Option<&str>) -> bool {
+    allowed.is_empty() || kind.is_some_and(|actual| allowed.iter().any(|allow| allow == actual))
 }
 
 /// Builds the `403` authorization-failure response for a rejected trusted identity (anonymous /
@@ -584,4 +635,63 @@ pub(crate) fn request_error(code: &str, message: String) -> ErrorEnvelope {
         ErrorOwner::Caller,
     )
     .with_message(message)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The pure box-wide principal-kind admission decision: empty allowlist admits everything, a
+    //! non-empty allowlist admits only a member kind, an absent kind fails closed, and `on_behalf_of`
+    //! never promotes an api-key across a human-only allowlist (the decision reads kind alone).
+
+    use super::principal_kind_admitted;
+
+    /// A `Vec<String>` allowlist from string literals.
+    fn allow(kinds: &[&str]) -> Vec<String> {
+        kinds.iter().map(|kind| (*kind).to_owned()).collect()
+    }
+
+    /// An empty allowlist admits every kind — including an absent one (the default, backward compatible).
+    #[test]
+    fn empty_allowlist_admits_any_kind() {
+        assert!(principal_kind_admitted(&[], Some("service")));
+        assert!(principal_kind_admitted(&[], Some("user")));
+        assert!(principal_kind_admitted(&[], None));
+    }
+
+    /// A non-empty allowlist admits a member kind and rejects a non-member.
+    #[test]
+    fn allowlist_admits_member_rejects_other() {
+        let allowed = allow(&["service"]);
+        assert!(
+            principal_kind_admitted(&allowed, Some("service")),
+            "member admitted"
+        );
+        assert!(
+            !principal_kind_admitted(&allowed, Some("user")),
+            "non-member rejected"
+        );
+    }
+
+    /// An absent kind is never a member of a non-empty allowlist — it fails closed.
+    #[test]
+    fn absent_kind_fails_closed_when_gated() {
+        assert!(!principal_kind_admitted(&allow(&["service"]), None));
+        assert!(!principal_kind_admitted(&allow(&["user", "apikey"]), None));
+    }
+
+    /// The decision reads `principal_kind` alone: an api-key is rejected by a `["user"]` allowlist
+    /// regardless of any acted-for human (`on_behalf_of` is not an input to this function).
+    #[test]
+    fn apikey_is_not_promoted_across_a_human_only_allowlist() {
+        assert!(!principal_kind_admitted(&allow(&["user"]), Some("apikey")));
+    }
+
+    /// A multi-kind allowlist admits any listed kind (a box serving humans and their keys).
+    #[test]
+    fn multi_kind_allowlist_admits_each_member() {
+        let allowed = allow(&["user", "apikey"]);
+        assert!(principal_kind_admitted(&allowed, Some("user")));
+        assert!(principal_kind_admitted(&allowed, Some("apikey")));
+        assert!(!principal_kind_admitted(&allowed, Some("service")));
+    }
 }

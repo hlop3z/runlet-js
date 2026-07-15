@@ -127,6 +127,9 @@ pub(crate) struct TrustedRuntime {
     pub(crate) headers: TrustedHeaders,
     /// Coarse capability→required-entitlement gate (empty = no member gating).
     pub(crate) capability_entitlements: HashMap<String, String>,
+    /// Box-wide principal-kind admission allowlist (empty = admit every kind). When non-empty, only a
+    /// request whose verified `principal_kind` is a member is admitted (an absent kind fails closed).
+    pub(crate) allowed_principal_kinds: Vec<String>,
     /// Per-tenant plan-gated quota accountant. `None` when quota is disabled.
     pub(crate) quota: Option<TenantQuota>,
     /// Signed-contract verifier. `Some` only when the `trusted.contract` sub-mode is enabled; when
