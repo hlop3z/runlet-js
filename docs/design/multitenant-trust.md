@@ -115,18 +115,25 @@ as out-of-band `x-runlet-*` headers, never in the `{action, payload}` body (D9):
 - **`X-Runlet-Tenant`** (*where*) — the trusted tenant; the box-direct analogue of the broker's
   `WireInit.tenant`. Emitted only when a trusted tenant is present.
 - **`X-Runlet-Actor`** (*who*) — the trusted acting **subject** (`TrustedIdentity.user`, the bare
-  `x-user-id` value), so a consumer can build a who-did-what audit trail. Emitted only when a trusted
-  subject is present.
+  `x-user-id` value; the *key id* for an api-key principal), so a consumer can build a who-did-what audit
+  trail. Emitted only when a trusted subject is present.
+- **`X-Runlet-Principal-Kind`** (*what authenticated* — `user`/`apikey`/`service`) and
+  **`X-Runlet-On-Behalf-Of`** (*the human behind an api-key*) — sourced from the **verified signed
+  contract**, so a consumer can branch a `service` writer vs a human and attribute an api-key action to
+  **both** the key (`X-Runlet-Actor`) and the human. Emitted **only** when a verified contract populated
+  them — absent on the plain trusted-header path and single-tenant.
 
-Both are sourced **only** from the trusted-identity extractor. A routing key like an event stream may
+All are sourced **only** from the trusted-identity extractor. A routing key like an event stream may
 ride the untrusted `payload`, but an actor is a *trust assertion* and therefore must be out-of-band —
 the payload path is off-limits for it.
 
-Principal **kind** (user/apikey/service) is **not forwarded** on either egress path: in the plain path it
-is not available (it lives only inside the signed contract), and forwarding it downstream is out of scope
-for the contract sub-mode too (an [open question](#signed-contract-sub-mode-opt-in)). The sub-mode does now
-**capture** `principal_kind`/`on_behalf_of` from the verified claims onto `TrustedIdentity` (for audit and
-future gating), leaving the forwarded actor stably equal to the bare subject. See
+Principal **kind** and **on-behalf-of** ride **both** transports on equal terms with tenant/actor: the
+box-direct headers above, and the broker's `WireInit.principal_kind` / `WireInit.on_behalf_of` fields
+(each `Option`, skipped when absent). They are forwarded **only** when a verified contract populated them,
+so a present `principal_kind` on the wire is always a *verified* fact, never a bare-header assertion;
+`X-Runlet-Actor` / `WireInit.actor` stay stably equal to the bare subject. (Earlier this design forwarded
+neither, because the box verified no signed assertions — the signed-contract sub-mode changed that.)
+**Gating** on kind (admit a `service` writer vs a human) remains a separate, deferred concern. See
 `openspec/specs/tenant-egress/spec.md`.
 
 ## Acting-org assurance (the N5 tripwire)
@@ -219,8 +226,9 @@ Non-sensitive gateway fields nexus carries as plain `x-runlet-*` headers (mode /
 **not** claims and are still read from headers in the sub-mode. The build-vs-adopt record for the verify
 crate (`jsonwebtoken`/`aws_lc_rs`) and the JWKS-cache build is in the change's `design.md` (D6/D7).
 
-**Open (deferred):** gating on `principal_kind` (admit a `service` writer vs a human) and forwarding
-`principal_kind`/`on_behalf_of` downstream; whether `supported_ctr` should be a min-version range.
+Forwarding `principal_kind`/`on_behalf_of` downstream (broker `WireInit` + box-direct headers) is
+**done** — see "Identity on the egress paths" above. **Open (deferred):** *gating* on `principal_kind`
+(admit a `service` writer vs a human); whether `supported_ctr` should be a min-version range.
 
 ## Request pipeline (trusted mode)
 

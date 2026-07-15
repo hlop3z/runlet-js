@@ -505,6 +505,8 @@ mod tests {
             timeout_ms: 1000,
             tenant: None,
             actor: None,
+            principal_kind: None,
+            on_behalf_of: None,
             token: None,
         };
         let result = connect_session(&BrokerTransport::None, &init).await;

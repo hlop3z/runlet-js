@@ -38,6 +38,16 @@ const TENANT_HEADER: &str = "x-runlet-tenant";
 /// other identity field. Emitted only when a trusted subject is present.
 const ACTOR_HEADER: &str = "x-runlet-actor";
 
+/// Out-of-band header carrying the request's **verified** principal kind (`user`/`apikey`/`service`)
+/// from the signed identity contract, so a consumer can branch on what authenticated. Emitted only
+/// when a verified contract populated it (absent on the plain trusted-header and single-tenant paths).
+const PRINCIPAL_KIND_HEADER: &str = "x-runlet-principal-kind";
+
+/// Out-of-band header carrying the request's **verified** acted-for subject (`on_behalf_of`, the human
+/// behind an api-key) from the signed identity contract, so a consumer can attribute the action to
+/// both the key (`X-Runlet-Actor`) and the human. Emitted only when a verified contract populated it.
+const ON_BEHALF_OF_HEADER: &str = "x-runlet-on-behalf-of";
+
 /// Per-op metric for one box-direct local call, surfaced in `meta.io.<name>` exactly like the
 /// broker's per-capability metrics (so box-direct and broker resolution meter identically).
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +102,14 @@ pub(crate) struct BoxEgress {
     /// actor is a trust assertion, not a routing key). `None` on the single-tenant/non-trusted path,
     /// where no header is emitted.
     actor: Option<String>,
+    /// The request's **verified** principal kind from the signed contract, forwarded as the
+    /// `X-Runlet-Principal-Kind` header alongside the actor. `None` unless a verified contract
+    /// populated it — no header is then emitted. Sourced only from the trusted-identity extractor.
+    principal_kind: Option<String>,
+    /// The request's **verified** acted-for subject from the signed contract (the human behind an
+    /// api-key), forwarded as the `X-Runlet-On-Behalf-Of` header alongside the actor so a consumer can
+    /// attribute to both the key and the human. `None` unless present. From the trusted extractor only.
+    on_behalf_of: Option<String>,
     /// Box-direct per-op metrics, keyed by logical name — drained into `meta.io.<name>`.
     metrics: Mutex<BTreeMap<String, Vec<LocalIoMetric>>>,
 }
@@ -112,6 +130,8 @@ impl BoxEgress {
         broker: Option<Arc<BrokerEgress>>,
         tenant: Option<String>,
         actor: Option<String>,
+        principal_kind: Option<String>,
+        on_behalf_of: Option<String>,
     ) -> Self {
         let deadline = Instant::now()
             .checked_add(budget)
@@ -124,6 +144,8 @@ impl BoxEgress {
             broker,
             tenant,
             actor,
+            principal_kind,
+            on_behalf_of,
             metrics: Mutex::new(BTreeMap::new()),
         }
     }
@@ -137,9 +159,11 @@ impl BoxEgress {
     }
 
     /// Builds the box-direct POST for `url` with the serialized `body`, attaching the trusted tenant
-    /// (`X-Runlet-Tenant`, *where*) and acting subject (`X-Runlet-Actor`, *who*) as out-of-band headers
-    /// **only** when each is present. The `{action, payload}` body is unchanged either way, so a service
-    /// moves between box-direct and broker with no wire-body change (D9).
+    /// (`X-Runlet-Tenant`, *where*), acting subject (`X-Runlet-Actor`, *who*), and — when a verified
+    /// contract populated them — the principal kind (`X-Runlet-Principal-Kind`) and acted-for subject
+    /// (`X-Runlet-On-Behalf-Of`) as out-of-band headers, **only** when each is present. The
+    /// `{action, payload}` body is unchanged either way, so a service moves between box-direct and
+    /// broker with no wire-body change (D9).
     fn build_request(&self, url: &str, body: String) -> reqwest::RequestBuilder {
         let mut request = self
             .client
@@ -150,6 +174,12 @@ impl BoxEgress {
         }
         if let Some(actor) = self.actor.as_deref() {
             request = request.header(ACTOR_HEADER, actor);
+        }
+        if let Some(kind) = self.principal_kind.as_deref() {
+            request = request.header(PRINCIPAL_KIND_HEADER, kind);
+        }
+        if let Some(on_behalf_of) = self.on_behalf_of.as_deref() {
+            request = request.header(ON_BEHALF_OF_HEADER, on_behalf_of);
         }
         request.body(body)
     }
@@ -270,11 +300,19 @@ mod tests {
     use reqwest::Client;
     use tokio::runtime::Handle;
 
-    use super::{ACTOR_HEADER, BoxEgress, LocalCallEnvelope, TENANT_HEADER};
+    use super::{
+        ACTOR_HEADER, BoxEgress, LocalCallEnvelope, ON_BEHALF_OF_HEADER, PRINCIPAL_KIND_HEADER,
+        TENANT_HEADER,
+    };
 
-    /// A `BoxEgress` with one box-direct binding and the given trusted tenant + actor, on the test
-    /// runtime's handle. The URL is never dialed — the tests only inspect the request the box builds.
-    fn egress_with(tenant: Option<String>, actor: Option<String>) -> BoxEgress {
+    /// A `BoxEgress` with one box-direct binding and the given trusted identity, on the test runtime's
+    /// handle. The URL is never dialed — the tests only inspect the request the box builds.
+    fn egress_full(
+        tenant: Option<String>,
+        actor: Option<String>,
+        principal_kind: Option<String>,
+        on_behalf_of: Option<String>,
+    ) -> BoxEgress {
         let local: HashMap<String, String> =
             HashMap::from([("pricing".to_owned(), "http://127.0.0.1:9/".to_owned())]);
         BoxEgress::new(
@@ -285,7 +323,15 @@ mod tests {
             None,
             tenant,
             actor,
+            principal_kind,
+            on_behalf_of,
         )
+    }
+
+    /// A `BoxEgress` with the given trusted tenant + actor and no contract-only fields (the plain
+    /// trusted-header path).
+    fn egress_with(tenant: Option<String>, actor: Option<String>) -> BoxEgress {
+        egress_full(tenant, actor, None, None)
     }
 
     /// The exact `{action, payload}` envelope the box serializes for a box-direct call.
@@ -382,5 +428,44 @@ mod tests {
         assert_eq!(header(&request, TENANT_HEADER), Some("ws_acme"));
         assert_eq!(header(&request, ACTOR_HEADER), Some("u_42"));
         assert_eq!(body_bytes(&request), body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn verified_apikey_contract_adds_kind_and_on_behalf_of() {
+        // A verified api-key contract: actor is the key id, principal_kind is `apikey`, and
+        // on_behalf_of names the human. All three ride out-of-band alongside the tenant.
+        let egress = egress_full(
+            Some("ws_acme".to_owned()),
+            Some("key_9".to_owned()),
+            Some("apikey".to_owned()),
+            Some("u_42".to_owned()),
+        );
+        let body = envelope("append", "{\"stream\":\"orders\"}");
+        let request = egress
+            .build_request("http://127.0.0.1:9/", body.clone())
+            .build()
+            .unwrap_or_else(|_err| unreachable!("a POST with a static body always builds"));
+
+        assert_eq!(header(&request, ACTOR_HEADER), Some("key_9"));
+        assert_eq!(header(&request, PRINCIPAL_KIND_HEADER), Some("apikey"));
+        assert_eq!(header(&request, ON_BEHALF_OF_HEADER), Some("u_42"));
+        // D9: none of the identity dimensions leak into the body.
+        assert_eq!(body_bytes(&request), body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn plain_path_omits_kind_and_on_behalf_of() {
+        // Plain trusted-header path (no verified contract): the actor rides, but the contract-only
+        // headers are absent.
+        let egress = egress_with(Some("ws_acme".to_owned()), Some("u_42".to_owned()));
+        let body = envelope("query", "{}");
+        let request = egress
+            .build_request("http://127.0.0.1:9/", body.clone())
+            .build()
+            .unwrap_or_else(|_err| unreachable!("a POST with a static body always builds"));
+
+        assert_eq!(header(&request, ACTOR_HEADER), Some("u_42"));
+        assert!(request.headers().get(PRINCIPAL_KIND_HEADER).is_none());
+        assert!(request.headers().get(ON_BEHALF_OF_HEADER).is_none());
     }
 }

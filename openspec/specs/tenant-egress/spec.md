@@ -78,12 +78,17 @@ actor forwarding transport-independent — a consumer reached box-direct receive
 The subject SHALL be the bare acting-user identity and SHALL be sourced only from the trusted-identity
 extractor; it SHALL NEVER be sourced from a value the executing script or caller can influence. It SHALL be
 included when, and only when, a trusted subject is present; when none is present (the single-tenant/loopback
-path) the handshake SHALL carry no actor and SHALL be unchanged from before this requirement.
+path) the handshake SHALL carry no actor.
 
-The addition SHALL be backward-compatible on the wire: a broker that does not read the actor SHALL be
-unaffected (the field is optional and absent when no subject is present). Principal **kind** (user / apikey /
-service) SHALL NOT be included by this requirement — it is crypto-gated and, if ever required, arrives as a
-separate field, leaving the actor equal to the bare subject.
+When a **verified identity contract** populated the request's principal kind and/or its acted-for subject,
+the box SHALL ALSO carry those as **separate** `WireInit` fields — `principal_kind` (`user`/`apikey`/
+`service`) and `on_behalf_of` (the creating human for an api-key) — alongside `actor`. Each SHALL be
+included when, and only when, present, and SHALL be sourced only from the verified contract via the
+trusted-identity extractor. `actor` SHALL remain exactly the bare acting subject (the key id for an api-key
+principal); the kind and on-behalf-of ride beside it, so a consumer can attribute the action to both the
+acting subject and the human, and branch on the kind. On the plain trusted-header path and the
+single-tenant/loopback path (no verified contract), neither field SHALL be present and the handshake SHALL
+be unchanged from before this requirement.
 
 #### Scenario: Session opens with the trusted acting subject
 
@@ -95,7 +100,7 @@ separate field, leaving the actor equal to the bare subject.
 #### Scenario: No trusted subject, no actor on the session
 
 - **WHEN** a broker session opens on the single-tenant/loopback path with no trusted subject present
-- **THEN** the handshake carries no acting subject and is unchanged from before this requirement
+- **THEN** the handshake carries no acting subject, and no principal kind or on-behalf-of
 
 #### Scenario: Script cannot influence the session actor
 
@@ -109,6 +114,19 @@ separate field, leaving the actor equal to the bare subject.
   and a trusted subject `"u_42"` is present
 - **THEN** the co-located target receives `"u_42"` via the `X-Runlet-Actor` header and the remote target
   receives `"u_42"` via `WireInit`, so moving the service between transports does not drop the actor
+
+#### Scenario: Verified api-key contract carries kind and on-behalf-of on the session
+
+- **WHEN** a broker session opens for a request whose verified contract has `principal_kind = "apikey"`,
+  `actor` (sub) the key id `"key_9"`, and `on_behalf_of` the human `"u_42"`
+- **THEN** the handshake carries `actor = "key_9"`, `principal_kind = "apikey"`, and `on_behalf_of = "u_42"`
+  as separate fields, so a consumer attributes the action to both the key and the human
+
+#### Scenario: Plain-path session carries no kind or on-behalf-of
+
+- **WHEN** a broker session opens on the plain trusted-header path (no verified contract), with a trusted
+  subject present
+- **THEN** the handshake carries the acting subject but no `principal_kind` and no `on_behalf_of`
 
 ### Requirement: Multitenant path forbids the privilege opt-out
 
@@ -255,18 +273,19 @@ The subject SHALL be sourced only from the trusted-identity extractor (the actin
 NEVER be sourced from a value the executing script or caller can influence — an actor identity is a trust
 assertion and therefore MUST NOT be read from the script `payload` (unlike a routing/stream key, which
 may). When no trusted subject is present (the single-tenant / non-trusted path), the box SHALL add no
-such header and the box-direct request SHALL be unchanged.
+`X-Runlet-Actor` header.
 
-The header is out of band: the box-direct request **body** SHALL remain the identical `{action, payload}`
+When a **verified identity contract** populated the request's principal kind and/or its acted-for subject,
+the box SHALL ALSO convey those as **separate** out-of-band headers — `X-Runlet-Principal-Kind`
+(`user`/`apikey`/`service`) and `X-Runlet-On-Behalf-Of` (the creating human for an api-key) — attached when,
+and only when, present, and sourced only from the verified contract. `X-Runlet-Actor` SHALL remain the bare
+subject; the new headers ride beside it. On the plain trusted-header path and the single-tenant path (no
+verified contract), neither header SHALL be present.
+
+The headers are out of band: the box-direct request **body** SHALL remain the identical `{action, payload}`
 envelope a broker receives, so a service can still be moved between box-direct and broker resolution with
 no change to the calling script or the wire body. This requirement applies to the box-direct path only;
-the `http` and `s3` built-in capabilities SHALL carry no actor identity, and the broker path SHALL be
-unchanged.
-
-Principal **kind** (user / apikey / service) SHALL NOT be forwarded by this requirement. Kind is available
-to the box only inside a signed identity assertion, and the box does not verify signed assertions; should
-a consumer later require kind, it SHALL be conveyed as a separate trusted header so that `X-Runlet-Actor`
-remains stably equal to the bare subject.
+the `http` and `s3` built-in capabilities SHALL carry no actor identity.
 
 #### Scenario: Box-direct call with a trusted subject carries the actor header
 
@@ -285,8 +304,8 @@ remains stably equal to the bare subject.
 
 - **WHEN** a box-direct call is made on the single-tenant / non-trusted path (no trusted subject is
   present), even when a trusted tenant is present
-- **THEN** the box-direct POST carries no `X-Runlet-Actor` header and is byte-for-byte the same as before
-  this change with respect to the actor
+- **THEN** the box-direct POST carries no `X-Runlet-Actor`, `X-Runlet-Principal-Kind`, or
+  `X-Runlet-On-Behalf-Of` header
 
 #### Scenario: Script cannot influence the actor header
 
@@ -299,6 +318,19 @@ remains stably equal to the bare subject.
 - **WHEN** a request uses the `http` or `s3` built-in capability while a trusted subject is present
 - **THEN** no actor identity is attached to those calls (they target script-controlled or
   externally-signed endpoints, not the operator's privatized resources)
+
+#### Scenario: Verified api-key contract carries kind and on-behalf-of headers box-direct
+
+- **WHEN** a box-direct call is made for a request whose verified contract has `principal_kind = "apikey"`,
+  subject the key id `"key_9"`, and `on_behalf_of` the human `"u_42"`
+- **THEN** the POST carries `X-Runlet-Actor: key_9`, `X-Runlet-Principal-Kind: apikey`, and
+  `X-Runlet-On-Behalf-Of: u_42`, and the body is still exactly `{action, payload}`
+
+#### Scenario: Plain-path box-direct call carries no kind or on-behalf-of header
+
+- **WHEN** a box-direct call is made on the plain trusted-header path (no verified contract) with a trusted
+  subject present
+- **THEN** the POST carries `X-Runlet-Actor` but neither `X-Runlet-Principal-Kind` nor `X-Runlet-On-Behalf-Of`
 
 ### Requirement: Fail-closed when no egress backend can serve a logical name
 

@@ -398,7 +398,16 @@ pub(crate) async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
     } else {
         let tenant = identity.and_then(|trusted| trusted.tenant.as_deref());
         let actor = identity.and_then(|trusted| trusted.user.as_deref());
-        let init = wire_init(broker_names, state.engine_cfg.timeout(), tenant, actor);
+        let principal_kind = identity.and_then(|trusted| trusted.principal_kind.as_deref());
+        let on_behalf_of = identity.and_then(|trusted| trusted.on_behalf_of.as_deref());
+        let init = wire_init(
+            broker_names,
+            state.engine_cfg.timeout(),
+            tenant,
+            actor,
+            principal_kind,
+            on_behalf_of,
+        );
         match connect_session(&state.transport, &init).await {
             Ok(conn) => Some(conn),
             Err(err) => {
@@ -438,6 +447,10 @@ pub(crate) async fn run_batch_item(ctx: BatchItemCtx<'_>) -> RenderedItem {
         default_currency: state.default_currency.clone(),
         // Same trusted tenant fed to the broker's `WireInit`; forwarded box-direct as a header.
         tenant: identity.and_then(|trusted| trusted.tenant.as_deref().map(str::to_owned)),
+        principal_kind: identity
+            .and_then(|trusted| trusted.principal_kind.as_deref().map(str::to_owned)),
+        on_behalf_of: identity
+            .and_then(|trusted| trusted.on_behalf_of.as_deref().map(str::to_owned)),
         // Trusted acting subject, forwarded box-direct as the `X-Runlet-Actor` header (who).
         actor: identity.and_then(|trusted| trusted.user.as_deref().map(str::to_owned)),
     })

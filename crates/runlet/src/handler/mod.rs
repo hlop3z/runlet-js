@@ -260,6 +260,10 @@ pub(crate) async fn run_execute(
             engine_cfg.timeout(),
             tenant.as_deref(),
             identity.as_ref().and_then(|id| id.user.as_deref()),
+            identity
+                .as_ref()
+                .and_then(|id| id.principal_kind.as_deref()),
+            identity.as_ref().and_then(|id| id.on_behalf_of.as_deref()),
         );
         match connect_session(&state.transport, &init).await {
             Ok(conn) => Some(conn),
@@ -327,6 +331,13 @@ pub(crate) async fn run_execute(
         actor: identity
             .as_ref()
             .and_then(|id| id.user.as_deref().map(str::to_owned)),
+        // Verified principal kind + acted-for subject (sub-mode only); ride alongside actor.
+        principal_kind: identity
+            .as_ref()
+            .and_then(|id| id.principal_kind.as_deref().map(str::to_owned)),
+        on_behalf_of: identity
+            .as_ref()
+            .and_then(|id| id.on_behalf_of.as_deref().map(str::to_owned)),
     })
     .await;
 
@@ -362,6 +373,13 @@ pub(crate) struct ExecuteBlocking {
     /// `X-Runlet-Actor` header (the *who* companion to `tenant`'s *where*). Sourced from
     /// `TrustedIdentity.user`; `None` on the single-tenant/non-trusted path — no header is then emitted.
     actor: Option<String>,
+    /// The request's **verified** principal kind (`user`/`apikey`/`service`) from the signed contract,
+    /// forwarded box-direct as the `X-Runlet-Principal-Kind` header. `None` unless a verified contract
+    /// populated it — no header is then emitted.
+    principal_kind: Option<String>,
+    /// The request's **verified** acted-for subject from the signed contract (the human behind an
+    /// api-key), forwarded box-direct as the `X-Runlet-On-Behalf-Of` header. `None` unless present.
+    on_behalf_of: Option<String>,
     /// Shared `reqwest` client for the box-direct POSTs.
     local_client: reqwest::Client,
     /// The resolved script source (inline or registered).
@@ -403,6 +421,8 @@ pub(crate) async fn execute_blocking(
         default_currency,
         tenant,
         actor,
+        principal_kind,
+        on_behalf_of,
     } = params;
     task::spawn_blocking(move || -> (Result<Outcome, EngineError>, EgressMetrics) {
         // The broker session (if any) is wrapped as a `BrokerEgress`, then composed with the
@@ -419,6 +439,8 @@ pub(crate) async fn execute_blocking(
                 broker,
                 tenant,
                 actor,
+                principal_kind,
+                on_behalf_of,
             ))
         });
         let egress: Option<Arc<dyn Egress>> = box_egress.as_ref().map(|metered| {

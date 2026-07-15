@@ -207,6 +207,20 @@ pub struct WireInit {
     /// influence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// The **verified** principal kind (`user`/`apikey`/`service`) from the signed identity contract,
+    /// forwarded alongside `actor` so a broker/backend can branch on what authenticated (e.g. admit a
+    /// `service` writer vs a human). `None` unless a verified contract populated it (the plain
+    /// trusted-header path and the single-tenant/loopback path carry none). Sourced only from the
+    /// trusted-identity extractor — never from anything the executing script can influence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_kind: Option<String>,
+    /// The **verified** acted-for subject (`on_behalf_of`) from the signed identity contract — the
+    /// creating human for an api-key principal — forwarded alongside `actor` (which stays the bare
+    /// subject, i.e. the key id) so a consumer can attribute the action to both the key and the human.
+    /// `None` unless a verified contract populated it (absent for a user/service principal and on the
+    /// plain/single-tenant path). Sourced only from the trusted-identity extractor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
     /// Opaque client-auth credential proving the box may pull credentials — a static shared
     /// secret or a k8s projected `ServiceAccount` token. `None` on the local UDS path (filesystem
     /// permissions gate it); set on the remote QUIC path, where the broker validates it *before*
@@ -229,6 +243,9 @@ impl fmt::Debug for WireInit {
             .field("tenant", &self.tenant)
             // The actor is trusted-edge identity, not a secret (like `tenant`): print it plainly.
             .field("actor", &self.actor)
+            // Principal kind + acted-for subject are trusted-edge identity, not secrets: print plainly.
+            .field("principal_kind", &self.principal_kind)
+            .field("on_behalf_of", &self.on_behalf_of)
             // The token is a secret: print only its presence, never its value.
             .field("token", &self.token.as_ref().map(|_present| "<redacted>"))
             .finish()
@@ -359,6 +376,8 @@ mod tests {
             timeout_ms: 5000,
             tenant: Some("acme".to_owned()),
             actor: Some("u_42".to_owned()),
+            principal_kind: None,
+            on_behalf_of: None,
             token: None,
         }));
         write_frame(&mut sink, &sent)
@@ -392,6 +411,8 @@ mod tests {
             timeout_ms: 1000,
             tenant: None,
             actor: None,
+            principal_kind: None,
+            on_behalf_of: None,
             token: None,
         };
         let json = serde_json::to_string(&bare).unwrap_or_else(|_err| unreachable!("serialize"));
@@ -403,16 +424,26 @@ mod tests {
             !json.contains("tenant"),
             "absent tenant is not serialized: {json}"
         );
+        assert!(
+            !json.contains("principal_kind") && !json.contains("on_behalf_of"),
+            "absent principal_kind/on_behalf_of are not serialized: {json}"
+        );
 
+        // A verified api-key contract populates actor (the key id) + principal_kind + on_behalf_of;
+        // all three round-trip alongside each other.
         let populated = WireInit {
-            actor: Some("u_42".to_owned()),
+            actor: Some("key_9".to_owned()),
+            principal_kind: Some("apikey".to_owned()),
+            on_behalf_of: Some("u_42".to_owned()),
             ..bare
         };
         let json =
             serde_json::to_string(&populated).unwrap_or_else(|_err| unreachable!("serialize"));
         let back: WireInit =
             serde_json::from_str(&json).unwrap_or_else(|_err| unreachable!("deserialize"));
-        assert_eq!(back.actor.as_deref(), Some("u_42"));
+        assert_eq!(back.actor.as_deref(), Some("key_9"));
+        assert_eq!(back.principal_kind.as_deref(), Some("apikey"));
+        assert_eq!(back.on_behalf_of.as_deref(), Some("u_42"));
     }
 
     /// A request frame written then read back is structurally equivalent.

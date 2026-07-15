@@ -249,11 +249,19 @@ impl RequestIo {
 /// per-execution deadline, the request's trusted tenant id (so the broker scopes resolution to that
 /// tenant's bindings), and the request's trusted acting subject (so the broker can attribute
 /// who-did-what). the broker resolves each name against its operator config.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the trusted-identity fields (tenant/actor/principal_kind/on_behalf_of) are \
+              already-distinct per-request values threaded onto the handshake; bundling them into a \
+              struct here would be pure indirection"
+)]
 pub(crate) fn wire_init(
     resources: Vec<String>,
     timeout: Duration,
     tenant: Option<&str>,
     actor: Option<&str>,
+    principal_kind: Option<&str>,
+    on_behalf_of: Option<&str>,
 ) -> WireInit {
     WireInit {
         resources,
@@ -269,6 +277,11 @@ pub(crate) fn wire_init(
         // then byte-identical to before this field existed. The broker-path analogue of the box-direct
         // `X-Runlet-Actor` header, so actor forwarding is transport-independent.
         actor: actor.map(str::to_owned),
+        // The verified principal kind + acted-for subject from the signed contract (sub-mode only);
+        // `None` on the plain trusted-header path and single-tenant. They ride alongside `actor` (which
+        // stays the bare subject / key id) so a consumer attributes to both the key and the human.
+        principal_kind: principal_kind.map(str::to_owned),
+        on_behalf_of: on_behalf_of.map(str::to_owned),
         // The token (QUIC path) is attached by `connect_session` from the transport's auth
         // provider — the box-request layer never sees it.
         token: None,

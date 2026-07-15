@@ -47,13 +47,16 @@ fn broker_names_exclude_box_direct_bindings() {
     );
 }
 
-/// `wire_init` carries the flat resource list, the deadline, the trusted tenant, and the trusted actor.
+/// `wire_init` carries the flat resource list, the deadline, and the trusted identity — tenant,
+/// actor, and (from a verified contract) principal kind + on-behalf-of.
 #[test]
 fn wire_init_carries_flat_resources() {
     let init = wire_init(
         vec!["orders".to_owned(), "cache".to_owned()],
         std::time::Duration::from_millis(1500),
         Some("ws_acme"),
+        Some("key_9"),
+        Some("apikey"),
         Some("u_42"),
     );
     assert_eq!(
@@ -68,12 +71,22 @@ fn wire_init_carries_flat_resources() {
     );
     assert_eq!(
         init.actor.as_deref(),
+        Some("key_9"),
+        "trusted acting subject (the key id) carried on the handshake"
+    );
+    assert_eq!(
+        init.principal_kind.as_deref(),
+        Some("apikey"),
+        "verified principal kind carried alongside the actor"
+    );
+    assert_eq!(
+        init.on_behalf_of.as_deref(),
         Some("u_42"),
-        "trusted acting subject carried on the handshake"
+        "verified acted-for human carried alongside the actor"
     );
 }
 
-/// On the single-tenant/loopback path both identity fields are absent from the handshake.
+/// On the single-tenant/loopback path all identity fields are absent from the handshake.
 #[test]
 fn wire_init_omits_identity_when_absent() {
     let init = wire_init(
@@ -81,7 +94,13 @@ fn wire_init_omits_identity_when_absent() {
         std::time::Duration::from_millis(500),
         None,
         None,
+        None,
+        None,
     );
     assert!(init.tenant.is_none(), "no tenant on the loopback path");
     assert!(init.actor.is_none(), "no actor on the loopback path");
+    assert!(
+        init.principal_kind.is_none() && init.on_behalf_of.is_none(),
+        "no principal kind / on-behalf-of on the loopback path"
+    );
 }
