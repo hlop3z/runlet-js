@@ -152,6 +152,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Arc::new(TrustedRuntime {
             headers: config.trusted.headers.clone(),
             capability_entitlements: config.trusted.capability_entitlements.clone(),
+            allowed_principal_kinds: config.trusted.allowed_principal_kinds.clone(),
             quota,
             contract,
         })

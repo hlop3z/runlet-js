@@ -69,6 +69,7 @@ fn trusted_runtime(gate: HashMap<String, String>) -> Arc<TrustedRuntime> {
     Arc::new(TrustedRuntime {
         headers: TrustedHeaders::default(),
         capability_entitlements: gate,
+        allowed_principal_kinds: Vec::new(),
         quota: None,
         contract: None,
     })
@@ -310,6 +311,7 @@ fn trusted_runtime_with_quota(quota: TenantQuota) -> Arc<TrustedRuntime> {
     Arc::new(TrustedRuntime {
         headers: TrustedHeaders::default(),
         capability_entitlements: HashMap::new(),
+        allowed_principal_kinds: Vec::new(),
         quota: Some(quota),
         contract: None,
     })

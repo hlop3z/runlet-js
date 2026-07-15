@@ -60,6 +60,7 @@ fn state(gate: HashMap<String, String>, quota: Option<TenantQuota>) -> AppState 
         trusted: Some(Arc::new(TrustedRuntime {
             headers: TrustedHeaders::default(),
             capability_entitlements: gate,
+            allowed_principal_kinds: Vec::new(),
             quota,
             contract: None,
         })),

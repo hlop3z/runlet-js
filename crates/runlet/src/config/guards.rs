@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 
-use super::{Config, is_truthy};
+use super::{Config, VALID_PRINCIPAL_KINDS, is_truthy};
 
 impl Config {
     /// Fail-closed start gate: refuse to bind a **non-loopback** address with no
@@ -40,6 +40,43 @@ impl Config {
         self.check_ssrf_relaxation(exposed)?;
         self.check_local_resources()?;
         self.check_contract_config()?;
+        self.check_principal_kind_admission()?;
+        Ok(())
+    }
+
+    /// Principal-kind admission boot guard: a non-empty `trusted.allowed_principal_kinds` requires the
+    /// contract sub-mode (kind is populated **only** by a verified contract, so without it the box
+    /// would deny every request — a silent total outage), and every configured entry must be a known
+    /// kind (`user`/`apikey`/`service`) so a typo aborts startup instead of failing closed at runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the allowlist is non-empty but the contract sub-mode is off, or when it
+    /// names a kind outside [`VALID_PRINCIPAL_KINDS`].
+    fn check_principal_kind_admission(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let allowed = &self.trusted.allowed_principal_kinds;
+        if allowed.is_empty() {
+            return Ok(());
+        }
+        if !self.trusted.contract.enabled {
+            return Err("refusing to start: `trusted.allowed_principal_kinds` is non-empty but \
+                        `trusted.contract.enabled` is false. Principal kind is populated only by a \
+                        verified signed contract, so without the contract sub-mode every request \
+                        would be denied. Enable `trusted.contract`, or clear the allowlist to admit \
+                        all kinds."
+                .into());
+        }
+        if let Some(bad) = allowed
+            .iter()
+            .find(|kind| !VALID_PRINCIPAL_KINDS.contains(&kind.as_str()))
+        {
+            return Err(format!(
+                "refusing to start: `trusted.allowed_principal_kinds` names unknown kind `{bad}`. \
+                 Valid kinds are {VALID_PRINCIPAL_KINDS:?}; a verified contract never asserts any \
+                 other value, so this entry would only ever fail closed.",
+            )
+            .into());
+        }
         Ok(())
     }
 

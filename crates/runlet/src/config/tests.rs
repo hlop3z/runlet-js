@@ -338,3 +338,62 @@ fn local_resource_remote_fails_closed() {
         "a remote box-direct binding must refuse to start"
     );
 }
+
+/// Enables the contract sub-mode with all three required fields set (so the contract boot guard
+/// passes and only the principal-kind guard is under test).
+fn with_valid_contract(cfg: &mut Config) {
+    cfg.trusted.enabled = true;
+    cfg.trusted.contract.enabled = true;
+    cfg.trusted.contract.jwks_url = "https://id.example/.well-known/jwks.json".to_owned();
+    cfg.trusted.contract.issuer = "https://id.example".to_owned();
+    cfg.trusted.contract.audience = "box-pool".to_owned();
+}
+
+/// A non-empty `allowed_principal_kinds` without the contract sub-mode refuses to start — kind is
+/// populated only by a verified contract, so the box would otherwise deny every request.
+#[test]
+fn principal_kind_allowlist_without_contract_fails_closed() {
+    let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), None, false);
+    cfg.trusted.enabled = true;
+    cfg.trusted.allowed_principal_kinds = vec!["service".to_owned()];
+    assert!(
+        cfg.check_exposure().is_err(),
+        "an allowlist without the contract sub-mode must refuse to start"
+    );
+}
+
+/// A non-empty `allowed_principal_kinds` with the contract sub-mode enabled starts.
+#[test]
+fn principal_kind_allowlist_with_contract_ok() {
+    let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), None, false);
+    with_valid_contract(&mut cfg);
+    cfg.trusted.allowed_principal_kinds = vec!["service".to_owned()];
+    assert!(
+        cfg.check_exposure().is_ok(),
+        "an allowlist with the contract sub-mode is a valid config"
+    );
+}
+
+/// An empty `allowed_principal_kinds` (the default) is unaffected by the guard — the box starts
+/// with the contract sub-mode off, preserving prior behavior.
+#[test]
+fn empty_principal_kind_allowlist_without_contract_ok() {
+    let cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), None, false);
+    assert!(
+        cfg.check_exposure().is_ok(),
+        "the default empty allowlist imposes no contract requirement"
+    );
+}
+
+/// An `allowed_principal_kinds` entry outside the known kind set refuses to start (a typo is a boot
+/// error, not a silent runtime all-deny).
+#[test]
+fn principal_kind_allowlist_unknown_kind_fails_closed() {
+    let mut cfg = exposure_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), None, false);
+    with_valid_contract(&mut cfg);
+    cfg.trusted.allowed_principal_kinds = vec!["services".to_owned()];
+    assert!(
+        cfg.check_exposure().is_err(),
+        "an unknown kind name must refuse to start"
+    );
+}

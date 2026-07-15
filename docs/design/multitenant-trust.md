@@ -133,8 +133,23 @@ box-direct headers above, and the broker's `WireInit.principal_kind` / `WireInit
 so a present `principal_kind` on the wire is always a *verified* fact, never a bare-header assertion;
 `X-Runlet-Actor` / `WireInit.actor` stay stably equal to the bare subject. (Earlier this design forwarded
 neither, because the box verified no signed assertions — the signed-contract sub-mode changed that.)
-**Gating** on kind (admit a `service` writer vs a human) remains a separate, deferred concern. See
-`openspec/specs/tenant-egress/spec.md`.
+
+**Gating** on kind is now a **box-wide admission allowlist**, `trusted.allowed_principal_kinds`
+(`openspec/specs/tenant-identity/spec.md`). Empty (the default) admits every kind. When non-empty, a
+request is admitted only if its verified `principal_kind` is a member; any other kind — **including an
+absent one** — is rejected with `403 PRINCIPAL_KIND_FORBIDDEN`. The decision is a pure function of
+`principal_kind`: `on_behalf_of` never promotes an api-key to a human across the gate. The check runs
+once at caller admission (beside anonymous/suspended/tenant-required in `gates.rs::resolve_identity`),
+so `/execute` and `/batch` inherit it without a per-item cost; the capability path and `authz.rs` are
+untouched. Because kind is populated **only** by a verified contract, the design is *deploy a dedicated
+box per kind* (a user-box, a service-box) that scales and is routed independently — chosen over a
+per-capability map for its stronger isolation on a small fleet. Two rules keep it safe: it **fails
+closed** (an absent kind is never a member, mirroring `SUSPENDED_UNKNOWN → deny`), and a **boot guard**
+refuses to start when the allowlist is non-empty but `trusted.contract` is off (else the box would deny
+every request) or names a kind outside `{user, apikey, service}` (a typo becomes a startup error, not a
+silent runtime all-deny). It is **defense-in-depth** atop the contract `aud`-per-pool check: nexus scopes
+each token to one box pool, so a mis-routed token already fails the audience check; the allowlist is a
+fourth independent control alongside the NetworkPolicy, boot guard, and edge credential.
 
 ## Acting-org assurance (the N5 tripwire)
 
@@ -227,8 +242,11 @@ Non-sensitive gateway fields nexus carries as plain `x-runlet-*` headers (mode /
 crate (`jsonwebtoken`/`aws_lc_rs`) and the JWKS-cache build is in the change's `design.md` (D6/D7).
 
 Forwarding `principal_kind`/`on_behalf_of` downstream (broker `WireInit` + box-direct headers) is
-**done** — see "Identity on the egress paths" above. **Open (deferred):** *gating* on `principal_kind`
-(admit a `service` writer vs a human); whether `supported_ctr` should be a min-version range.
+**done** — see "Identity on the egress paths" above. *Gating* on `principal_kind` is now **done** too,
+as the box-wide `trusted.allowed_principal_kinds` admission allowlist (see "Identity on the egress paths"
+above and `openspec/specs/tenant-identity/spec.md`). **Open (deferred):** per-script kind requirements
+(a script declaring "I require a `service` principal"); whether `supported_ctr` should be a min-version
+range.
 
 ## Request pipeline (trusted mode)
 
