@@ -108,6 +108,11 @@ quinn = { version = "0.11", default-features = false, features = [
 # Self-signed cert generation for the QUIC transport tests only (a dev-dependency). `aws_lc_rs`
 # backend (not `ring`) to avoid pulling a second crypto stack even into tests.
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+# ES256 JWS verification for the trusted signed-identity contract (contract.rs). VERIFY-only —
+# the box never signs. `default-features = false` + `aws_lc_rs` reuses the process-wide aws-lc-rs
+# provider (the `ring`-free posture the whole workspace holds; `cargo tree -i ring` stays empty)
+# instead of the ring backend nexus's SIGNER uses. See docs/design/multitenant-trust.md.
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "blocking",

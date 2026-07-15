@@ -9,6 +9,7 @@ use axum::http::HeaderMap;
 use runlet_core::LogLevel;
 
 use crate::config::TrustedHeaders;
+use crate::contract::VerifiedClaims;
 
 /// The gateway-asserted execution mode (OQ1, Stripe's isolation model). A **live** run streams its
 /// logs to the tenant stream; a **test/playground** run is response-mirror-only and never enters the
@@ -44,6 +45,12 @@ pub(crate) struct TrustedIdentity {
     pub(crate) anonymous: bool,
     /// The tenant's plan (quota tier), if present.
     pub(crate) plan: Option<String>,
+    /// The principal kind (`user`/`apikey`/`service`) from a verified contract. `None` in the plain
+    /// header path (nexus authors it only inside the signed contract).
+    pub(crate) principal_kind: Option<String>,
+    /// The acted-for subject (`on_behalf_of`) from a verified contract — present only for an api-key
+    /// principal, so audit can attribute the action to the human behind the automation.
+    pub(crate) on_behalf_of: Option<String>,
     /// The acting-org assurance the edge asserts per request (nexus N5). Populated from the
     /// configured scope header; the gate requires `Some("acting")` for tenant-scoped work.
     pub(crate) scope: Option<String>,
@@ -76,7 +83,30 @@ impl TrustedIdentity {
             capture: header_flag(headers, &names.capture),
             log_level: header_value(headers, &names.log_level)
                 .and_then(|raw| LogLevel::parse(&raw.to_ascii_lowercase())),
+            // Contract-only fields — never read from a bare header (nexus authors them inside the
+            // signed contract). Populated by `apply_contract` in the sub-mode.
+            principal_kind: None,
+            on_behalf_of: None,
         }
+    }
+
+    /// Overlays a verified contract's claims onto this identity in the sub-mode: the sensitive fields
+    /// (tenant, user, roles, entitlements, plan, principal kind, on-behalf-of) become the verified
+    /// claims — authoritative over any bare header — while the non-sensitive gateway fields (mode /
+    /// capture / log level, which nexus carries as plain `x-runlet-*` headers, not claims) are left
+    /// as read. A verified contract is proof of authentication, so `anonymous` is cleared;
+    /// `suspended` is decided tri-state by the gate *before* this call, so it is set to the resolved
+    /// not-suspended state here.
+    pub(crate) fn apply_contract(&mut self, claims: VerifiedClaims) {
+        self.tenant = claims.tenant;
+        self.user = claims.user;
+        self.roles = claims.roles;
+        self.entitlements = claims.entitlements;
+        self.plan = claims.plan;
+        self.principal_kind = claims.principal_kind;
+        self.on_behalf_of = claims.on_behalf_of;
+        self.anonymous = false;
+        self.suspended = false;
     }
 
     /// `true` if the caller holds `needle` as either a role or an entitlement (the coarse gate
@@ -156,7 +186,7 @@ mod tests {
             ("x-user-entitlements", "db, mail"),
             ("x-user-suspended", "false"),
             ("x-auth-anonymous", "0"),
-            ("x-tenant-plan", "pro"),
+            ("x-workspace-plan", "pro"),
             ("x-tenant-scope", "acting"),
         ]);
         let id = TrustedIdentity::from_headers(&map, &TrustedHeaders::default());

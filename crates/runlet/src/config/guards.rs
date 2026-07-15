@@ -39,6 +39,41 @@ impl Config {
         self.check_trusted_isolation(exposed)?;
         self.check_ssrf_relaxation(exposed)?;
         self.check_local_resources()?;
+        self.check_contract_config()?;
+        Ok(())
+    }
+
+    /// Signed-contract sub-mode boot guard: when `trusted.contract.enabled`, the JWKS source, the
+    /// expected issuer, and the expected audience must all be configured — there is no safe default
+    /// for any of them (a blank issuer/audience would accept a mis-scoped or foreign token, a blank
+    /// JWKS URL cannot fetch a key). Refuse to start rather than silently degrade verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first missing field when the sub-mode is enabled.
+    fn check_contract_config(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let contract = &self.trusted.contract;
+        if !contract.enabled {
+            return Ok(());
+        }
+        let missing = if contract.jwks_url.trim().is_empty() {
+            Some("jwks_url")
+        } else if contract.issuer.trim().is_empty() {
+            Some("issuer")
+        } else if contract.audience.trim().is_empty() {
+            Some("audience")
+        } else {
+            None
+        };
+        if let Some(field) = missing {
+            return Err(format!(
+                "refusing to start: `trusted.contract.enabled` is set but \
+                 `trusted.contract.{field}` is empty. Signed-contract verification requires a JWKS \
+                 source, the expected issuer, and this box's audience (pool name) — set all three, \
+                 or disable the sub-mode to fall back to the plain trusted-header path.",
+            )
+            .into());
+        }
         Ok(())
     }
 

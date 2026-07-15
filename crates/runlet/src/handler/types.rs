@@ -20,6 +20,7 @@ use runlet_wire::wire::WireInit;
 
 use crate::broker::BrokerTransport;
 use crate::config::{BatchConfig, TrustedHeaders};
+use crate::contract::ContractVerifier;
 use crate::events::Sink;
 use crate::quota::TenantQuota;
 
@@ -128,6 +129,9 @@ pub(crate) struct TrustedRuntime {
     pub(crate) capability_entitlements: HashMap<String, String>,
     /// Per-tenant plan-gated quota accountant. `None` when quota is disabled.
     pub(crate) quota: Option<TenantQuota>,
+    /// Signed-contract verifier. `Some` only when the `trusted.contract` sub-mode is enabled; when
+    /// `None` the plain trusted-header path is used (a non-nexus edge can still stand in).
+    pub(crate) contract: Option<Arc<ContractVerifier>>,
 }
 
 /// Pre-allocated `Box<RawValue>` for `{}` — used as default context.

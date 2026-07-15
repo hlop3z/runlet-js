@@ -1427,6 +1427,115 @@ def test_trusted_acting_scope(t: Runner):
             proc.kill()
 
 
+def _start_contract_box(port: int = 3015):
+    """Start a `runlet` with the `trusted.contract` sub-mode enabled, pointed at an unreachable JWKS
+    endpoint. The fail-closed rejection paths (missing / malformed contract) fire before any JWKS
+    fetch, so an unreachable endpoint is fine for asserting them deterministically — no ES256 signer
+    is needed. Returns `(proc, base_url)` or `(None, None)` on build/start failure (caller self-skips).
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    run_dir = os.path.join(repo, ".test-run", "contract")
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {
+        "server": {"host": "127.0.0.1", "port": port},
+        "trusted": {
+            "enabled": True,
+            "contract": {
+                "enabled": True,
+                # Nothing listens here — the missing/malformed-contract rejections never reach it.
+                "jwks_url": "http://127.0.0.1:1/jwks.json",
+                "issuer": "https://identity.test",
+                "audience": "runlet-test",
+            },
+        },
+    }
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    try:
+        subprocess.run(["cargo", "build", "-p", "runlet"], cwd=repo, check=True)
+    except Exception:
+        return None, None
+    binpath = os.path.join(repo, "target", "debug", "runlet")
+    proc = subprocess.Popen(
+        [binpath], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    url = f"http://127.0.0.1:{port}/execute"
+    probe = h("return json(1, null);")
+    # With the sub-mode on, an un-contracted probe returns 403 (not None), which still proves the
+    # server is accepting connections — use that for readiness.
+    for _ in range(40):
+        st, _r = _post_status(url, probe, {"x-workspace-id": "ws_probe"})
+        if st is not None:
+            return proc, url
+        time.sleep(0.5)
+    proc.terminate()
+    return None, None
+
+
+def _contract_boot_rejects_incomplete(port: int) -> bool:
+    """Boot guard: `trusted.contract.enabled` with an empty `jwks_url` must refuse to start (there is
+    no safe default for the JWKS source / issuer / audience). Returns True if the process exits."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    run_dir = os.path.join(repo, ".test-run", "contract-incomplete")
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {
+        "server": {"host": "127.0.0.1", "port": port},
+        # Enabled but no jwks_url/issuer/audience — the boot guard must abort.
+        "trusted": {"enabled": True, "contract": {"enabled": True}},
+    }
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    binpath = os.path.join(repo, "target", "debug", "runlet")
+    if not os.path.exists(binpath):
+        return False
+    proc = subprocess.Popen(
+        [binpath], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        return proc.wait(timeout=10) != 0
+    except Exception:
+        proc.kill()
+        return False
+
+
+def test_contract_verification(t: Runner):
+    """`trusted.contract` sub-mode fail-closed behavior: with signed-contract verification enabled, an
+    identity-enriched request MUST carry a verifiable `x-identity-contract`. A missing or malformed
+    contract is rejected `403` before any execution — the acting-scope header alone no longer
+    suffices — and an incomplete sub-mode config refuses to boot. The ES256 happy-path (a validly
+    signed contract) is unit-tested in `contract.rs`; this section proves the box-side fail-closed
+    wiring end to end without needing a live signer."""
+    t.section("Trusted-mode signed-contract sub-mode (fail-closed)")
+    proc, url = _start_contract_box()
+    if proc is None:
+        print("  \033[33mSKIP\033[0m contract-mode box failed to build/start â€” asserts skipped\n")
+        # Still exercise the boot guard, which needs no running server.
+        t.check("boot guard refuses an incomplete contract config (fail closed)",
+                _contract_boot_rejects_incomplete(3016))
+        return
+    try:
+        script = h("return json(1, null);")
+        acting = {"x-workspace-id": "ws_a", "x-tenant-scope": "acting"}
+
+        # Even a well-formed plain-path request (tenant + acting scope) is refused: the sub-mode
+        # requires the signed contract, so the scope header no longer self-authorizes.
+        st, r = _post_status(url, script, acting)
+        t.check("missing contract rejected 403 CONTRACT_MISSING (scope header no longer suffices)",
+                st == 403 and _err_code(r) == "CONTRACT_MISSING")
+
+        # A garbage token fails at header decode (offline — no JWKS fetch), still fail-closed 403.
+        st, r = _post_status(url, script, {**acting, "x-identity-contract": "not.a.jwt"})
+        t.check("malformed contract rejected 403 CONTRACT_MALFORMED",
+                st == 403 and _err_code(r) == "CONTRACT_MALFORMED")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+    t.check("boot guard refuses an incomplete contract config (fail closed)",
+            _contract_boot_rejects_incomplete(3016))
+
+
 def _start_telemetry_box(port: int = 3011):
     """Start a dedicated `runlet` with tracing enabled, pointed at an OTLP endpoint nothing is
     listening on. Exercises three things at once: W3C `traceparent` propagation into
@@ -1650,6 +1759,7 @@ def main():
     if procs:
         test_box_direct_local(t)
         test_trusted_acting_scope(t)
+        test_contract_verification(t)
         test_telemetry_tracing(t)
         test_per_tenant_events(t)
     else:

@@ -61,6 +61,7 @@ fn state(gate: HashMap<String, String>, quota: Option<TenantQuota>) -> AppState 
             headers: TrustedHeaders::default(),
             capability_entitlements: gate,
             quota,
+            contract: None,
         })),
         events: None,
         event_dropped: None,

@@ -44,6 +44,9 @@ hex.workspace = true
 # envelope to an operator-declared co-located loopback endpoint. Reuses the same rustls/aws-lc-rs
 # client stack `runlet-core`'s `http`/`s3` already link — no new crypto stack (`ring` stays empty).
 reqwest.workspace = true
+# ES256 JWS verification of nexus's signed `x-identity-contract` (contract.rs, verify-only, aws-lc-rs
+# backend). Isolated to that module; the rest of the box sees only a typed verified-claims struct.
+jsonwebtoken.workspace = true
 
 [lints]
 workspace = true

@@ -15,12 +15,13 @@ use runlet_core::registry::ScriptRegistry;
 use runlet_wire::ct_eq;
 
 use crate::authz::authorize_capabilities;
+use crate::contract::ContractVerifier;
 use crate::identity::TrustedIdentity;
 use crate::quota::{QuotaExceeded, QuotaGuard};
 
 use super::{
-    AppState, Meta, RequestConfig, RespCfg, ScriptSource, emit_denied, projected_error_response,
-    system_error_response,
+    AppState, Meta, RequestConfig, RespCfg, ScriptSource, TrustedRuntime, emit_denied,
+    projected_error_response, system_error_response,
 };
 
 /// Resolves the script source for a request: exactly one of `script` / `key` must be
@@ -206,6 +207,17 @@ pub(crate) fn header_partition(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Reads a single named header as a trimmed, non-empty owned string (`None` if absent, non-UTF-8, or
+/// blank). Used to pull the signed contract token by its configured header name.
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 /// Resolves the trusted identity in trusted-header mode and applies the hard-reject gates before
 /// any body work: an anonymous caller, a suspended principal, or (for tenant-scoped work) a missing
 /// tenant id is refused with a `403`. Returns `Ok(None)` in single-tenant mode (no trusted headers
@@ -218,6 +230,15 @@ pub(crate) async fn resolve_identity(
     let Some(trusted) = state.trusted.as_ref() else {
         return Ok(None);
     };
+    // Contract sub-mode: verify the signed `x-identity-contract` and source the sensitive identity
+    // from its claims. A verified contract *is* the acting-org assurance (nexus mints it only for a
+    // resolved caller), so the plain-path scope-header tripwire is not consulted here.
+    if let Some(verifier) = trusted.contract.as_ref() {
+        return resolve_identity_contract(state, headers, trace_id, trusted, verifier)
+            .await
+            .map(Some);
+    }
+    // Plain trusted-header path (unchanged): a non-nexus edge that injects plain headers.
     let identity = TrustedIdentity::from_headers(headers, &trusted.headers);
     if identity.anonymous {
         emit_denied(
@@ -293,6 +314,95 @@ pub(crate) async fn resolve_identity(
 pub(crate) fn identity_rejected(trace_id: &str, code: &str, message: &str) -> AxumResponse {
     let meta = Meta::new(trace_id.to_owned(), 0, 0, 0);
     system_error_response(request_error(code, message.to_owned()), 403, meta)
+}
+
+/// Emits the `denied` audit event and builds the boxed `403` rejection in one step (the contract
+/// sub-mode's repeated fail-closed exits). Attribution uses whatever identity is known so far
+/// (`None` before the claims are verified).
+async fn deny_identity(
+    state: &AppState,
+    identity: Option<&TrustedIdentity>,
+    trace_id: &str,
+    code: &str,
+    message: &str,
+) -> Box<AxumResponse> {
+    emit_denied(state, identity, trace_id, code, None).await;
+    Box::new(identity_rejected(trace_id, code, message))
+}
+
+/// Resolves identity in the `trusted.contract` sub-mode: read the signed contract, verify it, apply
+/// the suspension tri-state (absent ⇒ unknown ⇒ deny), and overlay the verified claims. Every
+/// failure is a fail-closed `403` — a missing or unverifiable contract on this always-enriched route
+/// is never treated as an anonymous-but-allowed request.
+async fn resolve_identity_contract(
+    state: &AppState,
+    headers: &HeaderMap,
+    trace_id: &str,
+    trusted: &TrustedRuntime,
+    verifier: &ContractVerifier,
+) -> Result<TrustedIdentity, Box<AxumResponse>> {
+    let Some(token) = header_value(headers, &trusted.headers.contract) else {
+        return Err(deny_identity(
+            state,
+            None,
+            trace_id,
+            "CONTRACT_MISSING",
+            "a verifiable identity contract is required",
+        )
+        .await);
+    };
+    let claims = match verifier.verify(&token).await {
+        Ok(claims) => claims,
+        Err(err) => {
+            return Err(deny_identity(state, None, trace_id, err.code(), err.message()).await);
+        }
+    };
+    // Capture the tri-state suspension before the claims are moved into the identity: `Some(true)`
+    // blocks, `None` is unknown and fails safe (never treated as not-suspended), `Some(false)` runs.
+    let suspended = claims.suspended;
+    let mut identity = TrustedIdentity::from_headers(headers, &trusted.headers);
+    identity.apply_contract(claims);
+    match suspended {
+        Some(true) => {
+            return Err(deny_identity(
+                state,
+                Some(&identity),
+                trace_id,
+                "SUSPENDED_FORBIDDEN",
+                "a suspended principal may not execute code",
+            )
+            .await);
+        }
+        None => {
+            return Err(deny_identity(
+                state,
+                Some(&identity),
+                trace_id,
+                "SUSPENDED_UNKNOWN",
+                "suspension state is unknown; refusing fail-closed",
+            )
+            .await);
+        }
+        Some(false) => {}
+    }
+    if identity.tenant.is_none() {
+        return Err(deny_identity(
+            state,
+            Some(&identity),
+            trace_id,
+            "TENANT_REQUIRED",
+            "the identity contract carries no acting workspace",
+        )
+        .await);
+    }
+    tracing::debug!(
+        trace_id,
+        tenant = identity.tenant.as_deref(),
+        user = identity.user.as_deref(),
+        principal_kind = identity.principal_kind.as_deref(),
+        "verified identity contract accepted"
+    );
+    Ok(identity)
 }
 
 /// The fairness + cache key for a request. In trusted mode it is the trusted tenant id and the

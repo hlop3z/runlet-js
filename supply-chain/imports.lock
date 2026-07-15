@@ -1303,6 +1303,11 @@ who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 delta = "2.5.0 -> 2.6.1"
 
+[[audits.isrg.audits.untrusted]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+version = "0.7.1"
+
 [[audits.mozilla.wildcard-audits.unicode-xid]]
 who = "Manish Goregaokar <manishsmail@gmail.com>"
 criteria = "safe-to-deploy"
@@ -2041,6 +2046,22 @@ criteria = "safe-to-deploy"
 delta = "1.0.21 -> 1.0.22"
 notes = "Changes to generated code are to prepend a clippy annotation."
 aggregated-from = "https://raw.githubusercontent.com/zcash/wallet/main/supply-chain/audits.toml"
+
+[[audits.zcash.audits.signature]]
+who = "Daira Emma Hopwood <daira@jacaranda.org>"
+criteria = "safe-to-deploy"
+version = "2.1.0"
+notes = """
+This crate uses `#![forbid(unsafe_code)]`, has no build script, and only provides traits with some trivial default implementations.
+I did not review whether implementing these APIs would present any undocumented cryptographic hazards.
+"""
+aggregated-from = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
+
+[[audits.zcash.audits.signature]]
+who = "Jack Grigg <jack@electriccoin.co>"
+criteria = "safe-to-deploy"
+delta = "2.1.0 -> 2.2.0"
+aggregated-from = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
 
 [[audits.zcash.audits.thread_local]]
 who = "Jack Grigg <jack@z.cash>"

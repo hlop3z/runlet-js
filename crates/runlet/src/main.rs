@@ -3,6 +3,7 @@
 mod authz;
 mod broker;
 mod config;
+mod contract;
 mod events;
 mod handler;
 mod identity;
@@ -35,6 +36,7 @@ use runlet_core::registry::ScriptRegistry;
 
 use crate::broker::BrokerTransport;
 use crate::config::Config;
+use crate::contract::ContractVerifier;
 use crate::handler::{AppState, TrustedRuntime};
 use crate::quota::TenantQuota;
 
@@ -124,8 +126,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         "/execute bearer auth"
     );
 
-    // Build the trusted-identity runtime (header names, member-authz gate, per-tenant quota) when
-    // trusted-header mode is enabled; `None` keeps the single-tenant, caller-asserted behavior.
+    // Build the signed-contract verifier when the opt-in `trusted.contract` sub-mode is enabled (the
+    // boot guard already ensured its config is complete). Its own reqwest client reuses the process
+    // rustls/aws-lc-rs stack; the JWKS is fetched lazily on the first request, so boot never blocks
+    // on the identity plane.
+    let contract = if config.trusted.enabled && config.trusted.contract.enabled {
+        let jwks_client = reqwest::Client::builder().build()?;
+        Some(Arc::new(ContractVerifier::new(
+            &config.trusted.contract,
+            jwks_client,
+        )))
+    } else {
+        None
+    };
+
+    // Build the trusted-identity runtime (header names, member-authz gate, per-tenant quota, and the
+    // optional contract verifier) when trusted-header mode is enabled; `None` keeps the single-tenant,
+    // caller-asserted behavior.
     let trusted = config.trusted.enabled.then(|| {
         let quota = config
             .trusted
@@ -136,6 +153,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             headers: config.trusted.headers.clone(),
             capability_entitlements: config.trusted.capability_entitlements.clone(),
             quota,
+            contract,
         })
     });
     info!(
@@ -143,6 +161,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         quota = trusted
             .as_ref()
             .is_some_and(|runtime| runtime.quota.is_some()),
+        contract = trusted
+            .as_ref()
+            .is_some_and(|runtime| runtime.contract.is_some()),
         "trusted-identity mode"
     );
 

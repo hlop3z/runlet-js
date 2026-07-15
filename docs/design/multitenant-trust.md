@@ -22,7 +22,7 @@ trusted identity. `runlet` consumes that identity from operator-configured trust
 | member entitlements| `x-user-entitlements`  | `entitlements` (comma-sep)|
 | suspended flag     | `x-user-suspended`     | `suspended` → hard reject |
 | anonymous flag     | `x-auth-anonymous`     | `anonymous` → hard reject |
-| plan (quota tier)  | `x-tenant-plan`        | `plan`                    |
+| plan (quota tier)  | `x-workspace-plan`     | `plan`                    |
 | acting-org scope   | `x-tenant-scope`       | `scope` → must be `acting` (N5) |
 
 Every name is configurable (`trusted.headers.*`) so a drift between the edge contract and the box is
@@ -31,6 +31,15 @@ injects (`x-tenant-id` survives only as a legacy read-fallback *inside* nexus an
 toward boxes); the pinned contract is the "Downstream header contract" table in
 `nexus-upstream-requirements.md`. Trusted mode is **opt-in** (`trusted.enabled`); the default preserves the
 pre-change single-principal, loopback behavior.
+
+> **Drift note — the bare sensitive headers are the *plain-path* source only.** nexus's "B-floor trust
+> hardening" **retired** the bare `x-user-roles` / `x-user-entitlements` / `x-user-suspended` headers and
+> now carries those signals **only** inside the signed `x-identity-contract`, stripping the bare copies.
+> The table above describes the **plain trusted-header path** (a generic / pre-hardening edge). Behind
+> current nexus, enable the **[signed-contract sub-mode](#signed-contract-sub-mode-opt-in)** below, which
+> sources roles/entitlements/suspended/plan from the *verified claims* instead — otherwise `suspended`
+> reads a header nexus no longer sends and fails open. The plan header was also renamed
+> `x-tenant-plan` → `x-workspace-plan` to match what nexus emits.
 
 ## The trust invariant (and its safety net)
 
@@ -113,11 +122,11 @@ Both are sourced **only** from the trusted-identity extractor. A routing key lik
 ride the untrusted `payload`, but an actor is a *trust assertion* and therefore must be out-of-band —
 the payload path is off-limits for it.
 
-Principal **kind** (user/apikey/service) is deliberately **not** forwarded on either path: it lives only
-inside the signed `x-identity-contract`, and the box verifies no signed assertions (the "no crypto in the
-box" invariant — the same reason in-box JWT verification was rejected for the N5 tripwire below). Should a
-consumer ever require kind, it arrives as a *separate* trusted field (a nexus bare-header emission the box
-forwards as its own header / `WireInit` field), leaving the actor stably equal to the bare subject. See
+Principal **kind** (user/apikey/service) is **not forwarded** on either egress path: in the plain path it
+is not available (it lives only inside the signed contract), and forwarding it downstream is out of scope
+for the contract sub-mode too (an [open question](#signed-contract-sub-mode-opt-in)). The sub-mode does now
+**capture** `principal_kind`/`on_behalf_of` from the verified claims onto `TrustedIdentity` (for audit and
+future gating), leaving the forwarded actor stably equal to the bare subject. See
 `openspec/specs/tenant-egress/spec.md`.
 
 ## Acting-org assurance (the N5 tripwire)
@@ -137,9 +146,15 @@ for free (home == acting, so its edge always emits `acting`). Preserving D3, `ru
 scope *label*; it never interprets the org relationship. Honest scope: this is a **contract tripwire,
 not cryptographic proof** — the header rides the same trusted-edge boundary as `x-workspace-id`, so it is
 only as strong as the NetworkPolicy. It defends against the *accidental* hazard (an edge without N5),
-not a compromised edge, which the trust invariant already owns. In-box JWT verification was rejected:
-it re-litigates the "no crypto in the box" decision and puts a JWKS-refresh surface on every
-`/execute`. The header name is configurable (`trusted.headers.scope`, default `x-tenant-scope`).
+not a compromised edge, which the trust invariant already owns. The header name is configurable
+(`trusted.headers.scope`, default `x-tenant-scope`).
+
+In the **[signed-contract sub-mode](#signed-contract-sub-mode-opt-in)** a *verified* `x-identity-contract`
+**is** the acting-org assurance — nexus mints it only for a caller resolved to an authorized acting
+workspace — so the scope-header tripwire is **not** additionally required on that path (the plain path
+above keeps it). What was once a blanket "no crypto in the box" rule is now an **opt-in** verifier: the box
+still ships zero signing keys and adds no second crypto stack (ES256 verify rides the existing aws-lc-rs
+provider), and the JWKS-refresh surface exists only when an operator turns the sub-mode on.
 
 **Runbook — bring-up ordering (producer before consumer):** the edge must emit `x-tenant-scope:
 acting` **before** a box that enforces it is rolled out, or all trusted-mode traffic 403s. There is no
@@ -160,17 +175,60 @@ capability does.
 edge (Envoy per-`x-workspace-id` rate-limit). The quota engine (`quota.rs`) mirrors the nexus
 `routing-rs/plan.rs` shape — a data-driven `plan → limit` table, "at-or-above", **fail-closed**:
 
-- A tenant's plan (from `x-tenant-plan`) selects a `PlanLimit` (today: `max_concurrent` in-flight
-  executions per tenant).
+- A tenant's plan (from `x-workspace-plan`, or the verified contract's `plan` claim in the sub-mode)
+  selects a `PlanLimit` (today: `max_concurrent` in-flight executions per tenant).
 - An **unknown/unconfigured plan** resolves to the most restrictive configured limit.
 - An **empty** `plans` map (while `quota.enabled`) denies every request — a misconfiguration never
   grants unbounded usage.
 - Over-limit returns a structured `429 QUOTA_EXCEEDED` carrying the plan, limit, and current usage.
 
+## Signed-contract sub-mode (opt-in)
+
+nexus's B-floor hardening moved the revocation-sensitive signals (`roles`, `entitlements`, `suspended`)
+out of bare headers into a signed **`x-identity-contract`** (an ES256 JWS) and strips the bare copies. The
+plain trusted-header path above reads headers nexus no longer sends — so behind current nexus a box must
+verify the contract instead. That is the **`trusted.contract`** sub-mode: opt-in, layered *alongside* the
+plain path (a non-nexus / pre-hardening edge that injects plain headers keeps working when it is off).
+
+**What it does when enabled** (config: `trusted.contract.{enabled, jwks_url, issuer, audience,
+supported_ctr, leeway_secs, min_refresh_secs}`; a boot guard refuses to start with `jwks_url`/`issuer`/
+`audience` unset):
+
+- **Verify the JWS** (`contract.rs`, `ContractVerifier`): fetch the JWKS from `jwks_url` (nexus serves
+  `<identity-plane>/.well-known/jwks.json`), select the key by the token's `kid`, refresh on an unknown
+  `kid` (bounded by `min_refresh_secs`, last-good kept across a transient outage). ES256 verify reuses the
+  process aws-lc-rs provider (`jsonwebtoken`'s `aws_lc_rs` backend) — **no `ring`, no second crypto
+  stack, verify-only**, the box holds no signing key.
+- **Check the registered claims**: `iss` == configured issuer, `aud` == this box's pool name (nexus scopes
+  each token to one box — a token for another box is rejected), `exp` in the future (± `leeway_secs`). A
+  repeated `jti` is **not** a replay (nexus reuses one contract within a short window).
+- **`ctr` drift gate**: reject a contract whose version is outside `supported_ctr` (default `["v1"]`) — an
+  incompatible contract-shape change fails **loud** instead of being silently mis-read. This is the alarm
+  that would have caught the very drift this change fixes.
+- **Source identity from the verified claims** (authoritative over any bare header): tenant
+  (`workspace_id`), user (`sub`), roles, entitlements, plan, plus the newly-captured `principal_kind` and
+  `on_behalf_of`. **Absent `suspended` is treated as unknown → deny**, never `false` (the fail-open bug
+  this change closes). A verified contract is not reused past its `exp`.
+- **Acting-org**: a verified contract **replaces** the `x-tenant-scope: acting` tripwire (it is minted
+  only for a resolved acting workspace); the scope header is not additionally required on this path.
+- **Fail closed**: on this always-enriched route, a missing or unverifiable contract is a `403` (distinct
+  audit reasons: `CONTRACT_MISSING` / `CONTRACT_MALFORMED` / `CONTRACT_INVALID` / `CONTRACT_UNKNOWN_KEY` /
+  `CONTRACT_KEYS_UNAVAILABLE` / `CONTRACT_VERSION_UNSUPPORTED`), never an anonymous-but-allowed request.
+
+Non-sensitive gateway fields nexus carries as plain `x-runlet-*` headers (mode / capture / log-level) are
+**not** claims and are still read from headers in the sub-mode. The build-vs-adopt record for the verify
+crate (`jsonwebtoken`/`aws_lc_rs`) and the JWKS-cache build is in the change's `design.md` (D6/D7).
+
+**Open (deferred):** gating on `principal_kind` (admit a `service` writer vs a human) and forwarding
+`principal_kind`/`on_behalf_of` downstream; whether `supported_ctr` should be a min-version range.
+
 ## Request pipeline (trusted mode)
 
 ```
-edge service credential  →  trusted identity (reject anonymous/suspended/tenant-less/non-acting-scope)
+edge service credential  →  trusted identity
+     plain path:     reject anonymous / suspended / tenant-less / non-acting-scope (header reads)
+     contract path:  verify x-identity-contract (sig · iss · aud · exp · ctr) → claims;
+                     reject missing/invalid; suspended absent ⇒ deny; scope satisfied by the contract
   →  partition = trusted tenant (caller-asserted ignored)  →  member-capability authz
   →  per-tenant quota admit  →  fabricd session (tenant-scoped)  →  Tier 5 + bulkhead  →  execute
 ```

@@ -320,6 +320,57 @@ pub(crate) struct TrustedConfig {
     pub(crate) capability_entitlements: HashMap<String, String>,
     /// Per-tenant plan-gated quota (section 6). Off by default.
     pub(crate) quota: QuotaConfig,
+    /// Opt-in signed-contract verification (the `trusted.contract` sub-mode). Off by default; when
+    /// enabled the box verifies nexus's `x-identity-contract` (ES256 JWS) and sources the
+    /// revocation-sensitive identity from its claims instead of bare headers. When off, the generic
+    /// trusted-header path above is used unchanged (so a non-nexus edge can still stand in).
+    pub(crate) contract: ContractConfig,
+}
+
+/// Signed-identity-contract verification config (the `trusted.contract` block).
+///
+/// Off by default. When `enabled`, an identity-enriched request must carry a verifiable
+/// `x-identity-contract` (ES256 JWS): the box fetches the JWKS from `jwks_url`, checks the
+/// signature, then the `iss`/`aud`/`exp` registered claims and the `ctr` version, and sources
+/// roles/entitlements/suspended/plan/principal-kind from the verified claims. The boot guard
+/// ([`Config::check_contract_config`]) refuses to start when `enabled` but `jwks_url`/`issuer`/
+/// `audience` are unset. See `docs/design/multitenant-trust.md`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct ContractConfig {
+    /// Turn on signed-contract verification. When `false`, no JWKS is fetched and no contract is
+    /// read — the plain trusted-header path serves the request.
+    pub(crate) enabled: bool,
+    /// The JWKS endpoint to fetch verifying keys from (nexus serves
+    /// `<identity-plane>/.well-known/jwks.json`). Required when `enabled`.
+    pub(crate) jwks_url: String,
+    /// The expected `iss` claim — must equal the nexus issuer. Required when `enabled`.
+    pub(crate) issuer: String,
+    /// The expected `aud` claim — this box's pool name (nexus scopes each token to one box). A token
+    /// minted for another box is rejected. Required when `enabled`.
+    pub(crate) audience: String,
+    /// The contract-version (`ctr` claim) values this box understands. A contract whose `ctr` is not
+    /// in this set is rejected (the drift tripwire). Defaults to `["v1"]`.
+    pub(crate) supported_ctr: Vec<String>,
+    /// Clock-skew leeway (seconds) allowed on `exp`. Defaults to 60.
+    pub(crate) leeway_secs: u64,
+    /// Minimum seconds between JWKS refetches triggered by an unknown `kid`, bounding refresh churn
+    /// under a burst of unverifiable tokens. Defaults to 30.
+    pub(crate) min_refresh_secs: u64,
+}
+
+impl Default for ContractConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            jwks_url: String::new(),
+            issuer: String::new(),
+            audience: String::new(),
+            supported_ctr: vec!["v1".to_owned()],
+            leeway_secs: 60,
+            min_refresh_secs: 30,
+        }
+    }
 }
 
 /// The configurable trusted-header names. Defaults match the nexus edge contract; every name is
@@ -340,7 +391,9 @@ pub(crate) struct TrustedHeaders {
     pub(crate) suspended: String,
     /// Anonymous-caller flag header (default `x-auth-anonymous`).
     pub(crate) anonymous: String,
-    /// Tenant plan header, selecting the quota tier (default `x-tenant-plan`).
+    /// Tenant plan header, selecting the quota tier (default `x-workspace-plan` — the name the nexus
+    /// identity sidecar injects for the acting workspace's plan tier; also carried in the signed
+    /// contract's `plan` claim, which wins in the contract sub-mode).
     pub(crate) plan: String,
     /// Acting-org assurance header (default `x-tenant-scope`). The edge asserts, per request, that
     /// the tenant id is the caller's *authorized acting org* by setting this to `acting`; a
@@ -359,6 +412,10 @@ pub(crate) struct TrustedHeaders {
     /// lower the floor for a capture run so the playground gets `debug`/`trace` while production
     /// stays `info`+ (OQ2). Ignored when absent/unparseable.
     pub(crate) log_level: String,
+    /// Signed identity-contract header (default `x-identity-contract`): the ES256 JWS nexus mints for
+    /// a resolved caller. Read only in the `trusted.contract` sub-mode; the token is verified and its
+    /// claims override the bare headers above.
+    pub(crate) contract: String,
 }
 
 impl Default for TrustedHeaders {
@@ -370,11 +427,12 @@ impl Default for TrustedHeaders {
             entitlements: "x-user-entitlements".to_owned(),
             suspended: "x-user-suspended".to_owned(),
             anonymous: "x-auth-anonymous".to_owned(),
-            plan: "x-tenant-plan".to_owned(),
+            plan: "x-workspace-plan".to_owned(),
             scope: "x-tenant-scope".to_owned(),
             mode: "x-runlet-mode".to_owned(),
             capture: "x-runlet-capture".to_owned(),
             log_level: "x-runlet-log-level".to_owned(),
+            contract: "x-identity-contract".to_owned(),
         }
     }
 }
